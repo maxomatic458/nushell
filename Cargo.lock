@@ -587,7 +587,7 @@ dependencies = [
  "codepage",
  "encoding_rs",
  "log",
- "quick-xml 0.31.0",
+ "quick-xml",
  "serde",
  "zip",
 ]
@@ -2883,7 +2883,7 @@ dependencies = [
  "polars-plan",
  "polars-utils",
  "serde",
- "sqlparser 0.41.0",
+ "sqlparser 0.43.1",
 ]
 
 [[package]]
@@ -3004,7 +3004,7 @@ dependencies = [
  "percent-encoding",
  "print-positions",
  "procfs",
- "quick-xml 0.31.0",
+ "quick-xml",
  "quickcheck",
  "quickcheck_macros",
  "rand",
@@ -4490,15 +4490,6 @@ checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
 name = "quick-xml"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eff6510e86862b57b210fd8cbe8ed3f0d7d600b9c2863cd4549a2e033c66e956"
-dependencies = [
- "memchr",
-]
-
-[[package]]
-name = "quick-xml"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1004a344b30a54e2ee58d66a71b32d2db2feb0a31f9a2d302bf0536f15de2a33"
@@ -4650,7 +4641,7 @@ dependencies = [
 [[package]]
 name = "reedline"
 version = "0.28.0"
-source = "git+https://github.com/nushell/reedline?branch=main#c8a52a85f1e166d8ff0a95c6f114da7f40ba0df4"
+source = "git+https://github.com/maxomatic458/reedline?branch=match-text#42d0fe5969b153228c8438cfc83c4ea3894a4f37"
 dependencies = [
  "arboard",
  "chrono",
@@ -5104,6 +5095,7 @@ version = "1.0.112"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d1bd37ce2324cf3bf85e5a25f96eb4baf0d5aa6eba43e7ae8958870c4ec48ed"
 dependencies = [
+ "indexmap",
  "itoa",
  "ryu",
  "serde",
@@ -5359,9 +5351,9 @@ dependencies = [
 
 [[package]]
 name = "sqlparser"
-version = "0.41.0"
+version = "0.43.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cc2c25a6c66789625ef164b4c7d2e548d627902280c13710d33da8222169964"
+checksum = "f95c4bae5aba7cd30bd506f7140026ade63cff5afd778af8854026f9606bf5d4"
 dependencies = [
  "log",
 ]
@@ -6390,13 +6382,13 @@ dependencies = [
 
 [[package]]
 name = "wayland-backend"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19152ddd73f45f024ed4534d9ca2594e0ef252c1847695255dae47f34df9fbe4"
+checksum = "9d50fa61ce90d76474c87f5fc002828d81b32677340112b4ef08079a9d459a40"
 dependencies = [
  "cc",
  "downcast-rs",
- "nix 0.26.4",
+ "rustix",
  "scoped-tls",
  "smallvec",
  "wayland-sys",
@@ -6404,21 +6396,21 @@ dependencies = [
 
 [[package]]
 name = "wayland-client"
-version = "0.31.1"
+version = "0.31.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ca7d52347346f5473bf2f56705f360e8440873052e575e55890c4fa57843ed3"
+checksum = "82fb96ee935c2cea6668ccb470fb7771f6215d1691746c2d896b447a00ad3f1f"
 dependencies = [
  "bitflags 2.4.2",
- "nix 0.26.4",
+ "rustix",
  "wayland-backend",
  "wayland-scanner",
 ]
 
 [[package]]
 name = "wayland-protocols"
-version = "0.31.0"
+version = "0.31.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e253d7107ba913923dc253967f35e8561a3c65f914543e46843c88ddd729e21c"
+checksum = "8f81f365b8b4a97f422ac0e8737c438024b5951734506b0e1d775c73030561f4"
 dependencies = [
  "bitflags 2.4.2",
  "wayland-backend",
@@ -6441,12 +6433,12 @@ dependencies = [
 
 [[package]]
 name = "wayland-scanner"
-version = "0.31.0"
+version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb8e28403665c9f9513202b7e1ed71ec56fde5c107816843fb14057910b2c09c"
+checksum = "63b3a62929287001986fb58c789dce9b67604a397c15c611ad9f747300b6c283"
 dependencies = [
  "proc-macro2",
- "quick-xml 0.30.0",
+ "quick-xml",
  "quote",
 ]
 
