@@ -1700,16 +1700,18 @@ pub fn parse_brace_expr(
         parse_closure_expression(working_set, shape, span)
     } else if matches!(third_token, Some(b":")) {
         parse_full_cell_path(working_set, None, span)
-    } else if second_token.is_some_and(|c| {
-        c.len() > 3 && c.starts_with(b"...") && (c[3] == b'$' || c[3] == b'{' || c[3] == b'(')
-    }) {
-        parse_record(working_set, span)
-    } else if matches!(shape, SyntaxShape::Closure(_)) || matches!(shape, SyntaxShape::Any) {
+    } else if matches!(shape, SyntaxShape::Closure(_)) {
         parse_closure_expression(working_set, shape, span)
     } else if matches!(shape, SyntaxShape::Block) {
         parse_block_expression(working_set, span)
     } else if matches!(shape, SyntaxShape::MatchBlock) {
         parse_match_block_expression(working_set, span)
+    } else if second_token.is_some_and(|c| {
+        c.len() > 3 && c.starts_with(b"...") && (c[3] == b'$' || c[3] == b'{' || c[3] == b'(')
+    }) {
+        parse_record(working_set, span)
+    } else if matches!(shape, SyntaxShape::Any) {
+        parse_closure_expression(working_set, shape, span)
     } else {
         working_set.error(ParseError::ExpectedWithStringMsg(
             format!("non-block value: {shape}"),
@@ -3024,6 +3026,14 @@ pub fn expand_to_cell_path(
         let new_expression = parse_full_cell_path(working_set, Some(var_id), *span);
 
         *expression = new_expression;
+    }
+
+    if let Expression {
+        expr: Expr::UnaryNot(inner),
+        ..
+    } = expression
+    {
+        expand_to_cell_path(working_set, inner, var_id);
     }
 }
 
@@ -4846,6 +4856,8 @@ pub fn parse_math_expression(
 
     let first_span = working_set.get_span_contents(spans[0]);
 
+    let mut not_start_spans = vec![];
+
     if first_span == b"if" || first_span == b"match" {
         // If expression
         if spans.len() > 1 {
@@ -4858,24 +4870,40 @@ pub fn parse_math_expression(
             return garbage(spans[0]);
         }
     } else if first_span == b"not" {
-        if spans.len() > 1 {
-            let remainder = parse_math_expression(working_set, &spans[1..], lhs_row_var_id);
-            return Expression {
-                expr: Expr::UnaryNot(Box::new(remainder)),
-                span: span(spans),
-                ty: Type::Bool,
-                custom_completion: None,
-            };
-        } else {
+        not_start_spans.push(spans[idx].start);
+        idx += 1;
+        while idx < spans.len() {
+            let next_value = working_set.get_span_contents(spans[idx]);
+
+            if next_value == b"not" {
+                not_start_spans.push(spans[idx].start);
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+
+        if idx == spans.len() {
             working_set.error(ParseError::Expected(
                 "expression",
-                Span::new(spans[0].end, spans[0].end),
+                Span::new(spans[idx - 1].end, spans[idx - 1].end),
             ));
-            return garbage(spans[0]);
+            return garbage(spans[idx - 1]);
         }
     }
 
-    let mut lhs = parse_value(working_set, spans[0], &SyntaxShape::Any);
+    let mut lhs = parse_value(working_set, spans[idx], &SyntaxShape::Any);
+
+    for not_start_span in not_start_spans.iter().rev() {
+        lhs = Expression {
+            expr: Expr::UnaryNot(Box::new(lhs)),
+            span: Span::new(*not_start_span, spans[idx].end),
+            ty: Type::Bool,
+            custom_completion: None,
+        };
+    }
+    not_start_spans.clear();
+
     idx += 1;
 
     if idx >= spans.len() {
@@ -4906,13 +4934,45 @@ pub fn parse_math_expression(
 
         let content = working_set.get_span_contents(spans[idx]);
         // allow `if` to be a special value for assignment.
+
         if content == b"if" || content == b"match" {
             let rhs = parse_call(working_set, &spans[idx..], spans[0], false);
             expr_stack.push(op);
             expr_stack.push(rhs);
             break;
+        } else if content == b"not" {
+            not_start_spans.push(spans[idx].start);
+            idx += 1;
+            while idx < spans.len() {
+                let next_value = working_set.get_span_contents(spans[idx]);
+
+                if next_value == b"not" {
+                    not_start_spans.push(spans[idx].start);
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if idx == spans.len() {
+                working_set.error(ParseError::Expected(
+                    "expression",
+                    Span::new(spans[idx - 1].end, spans[idx - 1].end),
+                ));
+                return garbage(spans[idx - 1]);
+            }
         }
-        let rhs = parse_value(working_set, spans[idx], &SyntaxShape::Any);
+        let mut rhs = parse_value(working_set, spans[idx], &SyntaxShape::Any);
+
+        for not_start_span in not_start_spans.iter().rev() {
+            rhs = Expression {
+                expr: Expr::UnaryNot(Box::new(rhs)),
+                span: Span::new(*not_start_span, spans[idx].end),
+                ty: Type::Bool,
+                custom_completion: None,
+            };
+        }
+        not_start_spans.clear();
 
         while op_prec <= last_prec && expr_stack.len() > 1 {
             // Collapse the right associated operations first
