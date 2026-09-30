@@ -2,13 +2,13 @@
 # Usage: Just run `powershell install-all.ps1` in nushell root directory
 
 Write-Output "-----------------------------------------------------------------"
-Write-Output "Installing nushell (nu) with dataframes and all the plugins"
+Write-Output "Installing nushell (nu) and all the plugins"
 Write-Output "-----------------------------------------------------------------"
 Write-Output ""
 
 Write-Output "Install nushell from local..."
 Write-Output "----------------------------------------------"
-cargo install --force --path . --features=dataframe,extra --locked
+cargo install --force --path . --locked
 
 $NU_PLUGINS = @(
     'nu_plugin_example',
@@ -16,7 +16,8 @@ $NU_PLUGINS = @(
     'nu_plugin_inc',
     'nu_plugin_query',
     'nu_plugin_custom_values',
-    'nu_plugin_formats'
+    'nu_plugin_formats',
+    'nu_plugin_polars'
 )
 
 foreach ( $plugin in $NU_PLUGINS) {
@@ -28,4 +29,3 @@ foreach ( $plugin in $NU_PLUGINS) {
     cargo install --force --path .
     Set-Location ../../
 }
-

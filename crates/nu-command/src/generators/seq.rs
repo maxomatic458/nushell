@@ -1,10 +1,5 @@
-use nu_engine::CallExt;
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    Category, Example, PipelineData, ShellError, Signature, Span, Spanned, SyntaxShape, Type,
-    Value,
-};
+use nu_engine::command_prelude::*;
+use nu_protocol::{ListStream, shell_error::generic::GenericError};
 
 #[derive(Clone)]
 pub struct Seq;
@@ -21,7 +16,7 @@ impl Command for Seq {
             .category(Category::Generators)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Output sequences of numbers."
     }
 
@@ -35,7 +30,7 @@ impl Command for Seq {
         seq(engine_state, stack, call)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "sequence 1 to 10",
@@ -101,30 +96,28 @@ fn seq(
     let contains_decimals = rest_nums_check.is_err();
 
     if rest_nums.is_empty() {
-        return Err(ShellError::GenericError {
-            error: "seq requires some parameters".into(),
-            msg: "needs parameter".into(),
-            span: Some(call.head),
-            help: None,
-            inner: vec![],
+        return Err(ShellError::Generic(GenericError::new(
+            "seq requires some parameters",
+            "needs parameter",
+            call.head,
+        )));
+    }
+
+    // A zero increment never terminates (`seq 5 0 5` would emit `5` forever) or
+    // silently produces nothing, so reject it up front like GNU `seq` does.
+    // The increment is the middle argument; with fewer than three arguments it
+    // defaults to 1 and cannot be zero.
+    if rest_nums.len() > 2 && rest_nums[1].item == 0.0 {
+        return Err(ShellError::IncorrectValue {
+            msg: "increment cannot be 0".into(),
+            val_span: rest_nums[1].span,
+            call_span: span,
         });
     }
 
     let rest_nums: Vec<f64> = rest_nums.iter().map(|n| n.item).collect();
 
     run_seq(rest_nums, span, contains_decimals, engine_state)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Seq {})
-    }
 }
 
 pub fn run_seq(
@@ -137,36 +130,32 @@ pub fn run_seq(
     let step = if free.len() > 2 { free[1] } else { 1.0 };
     let last = { free[free.len() - 1] };
 
-    if !contains_decimals {
-        // integers only
-        Ok(PipelineData::ListStream(
-            nu_protocol::ListStream::from_stream(
-                IntSeq {
-                    count: first as i64,
-                    step: step as i64,
-                    last: last as i64,
-                    span,
-                },
-                engine_state.ctrlc.clone(),
-            ),
-            None,
-        ))
+    let stream = if !contains_decimals {
+        ListStream::new(
+            IntSeq {
+                count: Some(first as i64),
+                step: step as i64,
+                last: last as i64,
+                span,
+            },
+            span,
+            engine_state.signals().clone(),
+        )
     } else {
-        // floats
-        Ok(PipelineData::ListStream(
-            nu_protocol::ListStream::from_stream(
-                FloatSeq {
-                    first,
-                    step,
-                    last,
-                    index: 0,
-                    span,
-                },
-                engine_state.ctrlc.clone(),
-            ),
-            None,
-        ))
-    }
+        ListStream::new(
+            FloatSeq {
+                first,
+                step,
+                last,
+                index: 0,
+                span,
+            },
+            span,
+            engine_state.signals().clone(),
+        )
+    };
+
+    Ok(stream.into())
 }
 
 struct FloatSeq {
@@ -192,7 +181,7 @@ impl Iterator for FloatSeq {
 }
 
 struct IntSeq {
-    count: i64,
+    count: Option<i64>,
     step: i64,
     last: i64,
     span: Span,
@@ -201,12 +190,23 @@ struct IntSeq {
 impl Iterator for IntSeq {
     type Item = Value;
     fn next(&mut self) -> Option<Value> {
-        if (self.count > self.last && self.step >= 0) || (self.count < self.last && self.step <= 0)
-        {
+        let count = self.count?;
+        if (count > self.last && self.step >= 0) || (count < self.last && self.step <= 0) {
+            self.count = None;
             return None;
         }
-        let ret = Some(Value::int(self.count, self.span));
-        self.count += self.step;
-        ret
+        // None on overflow: emit this value, then end (avoids panic/wrap).
+        self.count = count.checked_add(self.step);
+        Some(Value::int(count, self.span))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Seq)
     }
 }

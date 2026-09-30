@@ -1,5 +1,91 @@
 use crate::{DeclId, ModuleId, OverlayId, VarId};
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Deref};
+
+/// Name → id map for declarations that remembers the longest name it has ever held.
+///
+/// Command resolution tries the longest possible command name first (`find_longest_decl`), so
+/// for a call like `each {|x| ... }` the first candidate is the whole call text, and every
+/// non-empty map on the scope chain would hash all of it just to say "no". Knowing the longest
+/// name lets [`DeclNameMap::get`] reject such candidates by length before hashing. The bound only
+/// grows (removals leave it alone), so it is always an upper bound on the keys present.
+///
+/// Reads go through `Deref` to the underlying `HashMap`; all mutation goes through the inherent
+/// methods so the bound stays valid.
+#[derive(Debug, Clone, Default)]
+pub struct DeclNameMap {
+    map: HashMap<Vec<u8>, DeclId>,
+    longest_name: usize,
+}
+
+impl DeclNameMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Look up a declaration by name; names longer than any key ever inserted are rejected
+    /// without hashing.
+    pub fn get(&self, name: &[u8]) -> Option<&DeclId> {
+        if name.len() > self.longest_name {
+            return None;
+        }
+        self.map.get(name)
+    }
+
+    pub fn insert(&mut self, name: Vec<u8>, decl_id: DeclId) -> Option<DeclId> {
+        self.longest_name = self.longest_name.max(name.len());
+        self.map.insert(name, decl_id)
+    }
+
+    pub fn remove(&mut self, name: &[u8]) -> Option<DeclId> {
+        self.map.remove(name)
+    }
+
+    pub fn remove_entry(&mut self, name: &[u8]) -> Option<(Vec<u8>, DeclId)> {
+        self.map.remove_entry(name)
+    }
+}
+
+impl Deref for DeclNameMap {
+    type Target = HashMap<Vec<u8>, DeclId>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl<'a> IntoIterator for &'a DeclNameMap {
+    type Item = (&'a Vec<u8>, &'a DeclId);
+    type IntoIter = std::collections::hash_map::Iter<'a, Vec<u8>, DeclId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.iter()
+    }
+}
+
+impl IntoIterator for DeclNameMap {
+    type Item = (Vec<u8>, DeclId);
+    type IntoIter = std::collections::hash_map::IntoIter<Vec<u8>, DeclId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.into_iter()
+    }
+}
+
+impl Extend<(Vec<u8>, DeclId)> for DeclNameMap {
+    fn extend<I: IntoIterator<Item = (Vec<u8>, DeclId)>>(&mut self, iter: I) {
+        for (name, decl_id) in iter {
+            self.insert(name, decl_id);
+        }
+    }
+}
+
+impl FromIterator<(Vec<u8>, DeclId)> for DeclNameMap {
+    fn from_iter<I: IntoIterator<Item = (Vec<u8>, DeclId)>>(iter: I) -> Self {
+        let mut map = Self::default();
+        map.extend(iter);
+        map
+    }
+}
 
 pub static DEFAULT_OVERLAY_NAME: &str = "zero";
 
@@ -7,6 +93,51 @@ pub static DEFAULT_OVERLAY_NAME: &str = "zero";
 #[derive(Debug, Clone)]
 pub struct Visibility {
     decl_ids: HashMap<DeclId, bool>,
+}
+
+/// Name bindings introduced while parsing a single block/closure scope.
+///
+/// Nested scopes discard their name maps on `exit_scope`; this snapshot is stored on the
+/// [`Block`](crate::ast::Block) so `scope` commands can report locals at runtime.
+///
+/// # Lifecycle
+///
+/// 1. **Parse**: [`StateWorkingSet::snapshot_scope_bindings`] copies decls/modules from the
+///    innermost scope frame into a `ScopeBindings` attached to the block, immediately before
+///    the matching `exit_scope`.
+/// 2. **Eval**: whole blocks push bindings on [`Stack::active_scope_bindings`] in
+///    `eval_ir_block`. Keyword bodies that are IR-inlined record
+///    [`ScopeRegion`](crate::ir::ScopeRegion)s on the parent [`IrBlock`](crate::ir::IrBlock);
+///    `scope` matches the current instruction index against those regions.
+#[derive(Debug, Clone, Default)]
+pub struct ScopeBindings {
+    pub decls: HashMap<Vec<u8>, DeclId>,
+    pub modules: HashMap<Vec<u8>, ModuleId>,
+    pub visibility: Visibility,
+}
+
+impl ScopeBindings {
+    pub fn is_empty(&self) -> bool {
+        self.decls.is_empty() && self.modules.is_empty() && self.visibility.decl_ids.is_empty()
+    }
+
+    /// Merge decls, modules, and visibility from an overlay frame (other wins on name clash).
+    pub fn extend_from_overlay(&mut self, overlay: &OverlayFrame) {
+        self.decls
+            .extend(overlay.decls.iter().map(|(k, v)| (k.clone(), *v)));
+        self.modules
+            .extend(overlay.modules.iter().map(|(k, v)| (k.clone(), *v)));
+        self.visibility.merge_with(overlay.visibility.clone());
+    }
+
+    /// Merge another bindings map on top of this one (other wins on name clash).
+    pub fn extend_from_bindings(&mut self, other: &ScopeBindings) {
+        self.decls
+            .extend(other.decls.iter().map(|(k, v)| (k.clone(), *v)));
+        self.modules
+            .extend(other.modules.iter().map(|(k, v)| (k.clone(), *v)));
+        self.visibility.merge_with(other.visibility.clone());
+    }
 }
 
 impl Visibility {
@@ -43,6 +174,40 @@ impl Visibility {
     }
 }
 
+/// Decl visibility resolved across the overlay frames walked so far, innermost frame first.
+///
+/// Name lookups walk the active overlays from the innermost one outwards. A decl is visible
+/// unless one of the frames walked so far has an explicit entry hiding it, and the innermost
+/// frame with an entry for the decl wins. This borrows each frame's [`Visibility`] instead of
+/// merging the maps: merging copied every entry of every frame on every lookup, which made
+/// `find_decl` (called for every command word the parser sees) cost as much as the maps were
+/// large.
+#[derive(Debug, Default)]
+pub struct VisibilityStack<'a> {
+    layers: Vec<&'a Visibility>,
+}
+
+impl<'a> VisibilityStack<'a> {
+    /// Add the visibility of the next (outer) frame. Frames pushed earlier take precedence.
+    ///
+    /// A frame that hides nothing can never answer a lookup, so it is not recorded; this keeps
+    /// the common lookup (no hidden declarations anywhere) free of allocation.
+    pub fn push(&mut self, visibility: &'a Visibility) {
+        if !visibility.decl_ids.is_empty() {
+            self.layers.push(visibility);
+        }
+    }
+
+    /// Whether `decl_id` is visible given the frames pushed so far.
+    pub fn is_decl_id_visible(&self, decl_id: &DeclId) -> bool {
+        self.layers
+            .iter()
+            .find_map(|visibility| visibility.decl_ids.get(decl_id))
+            .copied()
+            .unwrap_or(true) // by default it's visible
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ScopeFrame {
     /// List of both active and inactive overlays in this ScopeFrame.
@@ -60,7 +225,7 @@ pub struct ScopeFrame {
     pub removed_overlays: Vec<Vec<u8>>,
 
     /// temporary storage for predeclarations
-    pub predecls: HashMap<Vec<u8>, DeclId>,
+    pub predecls: DeclNameMap,
 }
 
 impl ScopeFrame {
@@ -69,16 +234,16 @@ impl ScopeFrame {
             overlays: vec![],
             active_overlays: vec![],
             removed_overlays: vec![],
-            predecls: HashMap::new(),
+            predecls: DeclNameMap::new(),
         }
     }
 
     pub fn with_empty_overlay(name: Vec<u8>, origin: ModuleId, prefixed: bool) -> Self {
         Self {
             overlays: vec![(name, OverlayFrame::from_origin(origin, prefixed))],
-            active_overlays: vec![0],
+            active_overlays: vec![OverlayId::new(0)],
             removed_overlays: vec![],
-            predecls: HashMap::new(),
+            predecls: DeclNameMap::new(),
         }
     }
 
@@ -86,7 +251,7 @@ impl ScopeFrame {
         for overlay_id in self.active_overlays.iter().rev() {
             if let Some(var_id) = self
                 .overlays
-                .get(*overlay_id)
+                .get(overlay_id.get())
                 .expect("internal error: missing overlay")
                 .1
                 .vars
@@ -120,13 +285,27 @@ impl ScopeFrame {
     pub fn active_overlays<'a, 'b>(
         &'b self,
         removed_overlays: &'a mut Vec<Vec<u8>>,
-    ) -> impl DoubleEndedIterator<Item = &OverlayFrame> + 'a
+    ) -> impl DoubleEndedIterator<Item = &'b OverlayFrame> + 'a
     where
         'b: 'a,
     {
-        self.active_overlay_ids(removed_overlays)
-            .into_iter()
-            .map(|id| self.get_overlay(id))
+        // Same filtering as `active_overlay_ids`, but iterated lazily: this runs for every scope
+        // frame on every declaration or variable lookup, so it must not allocate.
+        for name in &self.removed_overlays {
+            if !removed_overlays.contains(name) {
+                removed_overlays.push(name.clone());
+            }
+        }
+        let removed_overlays: &'a Vec<Vec<u8>> = removed_overlays;
+
+        self.active_overlays
+            .iter()
+            .filter(move |id| {
+                !removed_overlays
+                    .iter()
+                    .any(|name| name == self.get_overlay_name(**id))
+            })
+            .map(|id| self.get_overlay(*id))
     }
 
     pub fn active_overlay_names(&self, removed_overlays: &mut Vec<Vec<u8>>) -> Vec<&[u8]> {
@@ -139,7 +318,7 @@ impl ScopeFrame {
     pub fn get_overlay_name(&self, overlay_id: OverlayId) -> &[u8] {
         &self
             .overlays
-            .get(overlay_id)
+            .get(overlay_id.get())
             .expect("internal error: missing overlay")
             .0
     }
@@ -147,7 +326,7 @@ impl ScopeFrame {
     pub fn get_overlay(&self, overlay_id: OverlayId) -> &OverlayFrame {
         &self
             .overlays
-            .get(overlay_id)
+            .get(overlay_id.get())
             .expect("internal error: missing overlay")
             .1
     }
@@ -155,35 +334,34 @@ impl ScopeFrame {
     pub fn get_overlay_mut(&mut self, overlay_id: OverlayId) -> &mut OverlayFrame {
         &mut self
             .overlays
-            .get_mut(overlay_id)
+            .get_mut(overlay_id.get())
             .expect("internal error: missing overlay")
             .1
     }
 
     pub fn find_overlay(&self, name: &[u8]) -> Option<OverlayId> {
-        self.overlays.iter().position(|(n, _)| n == name)
+        self.overlays
+            .iter()
+            .position(|(n, _)| n == name)
+            .map(OverlayId::new)
     }
 
     pub fn find_active_overlay(&self, name: &[u8]) -> Option<OverlayId> {
         self.overlays
             .iter()
             .position(|(n, _)| n == name)
-            .and_then(|id| {
-                if self.active_overlays.contains(&id) {
-                    Some(id)
-                } else {
-                    None
-                }
-            })
+            .map(OverlayId::new)
+            .filter(|id| self.active_overlays.contains(id))
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct OverlayFrame {
     pub vars: HashMap<Vec<u8>, VarId>,
-    pub predecls: HashMap<Vec<u8>, DeclId>, // temporary storage for predeclarations
-    pub decls: HashMap<Vec<u8>, DeclId>,
+    pub predecls: DeclNameMap, // temporary storage for predeclarations
+    pub decls: DeclNameMap,
     pub modules: HashMap<Vec<u8>, ModuleId>,
+    pub shadowed_vars: Vec<VarId>,
     pub visibility: Visibility,
     pub origin: ModuleId, // The original module the overlay was created from
     pub prefixed: bool,   // Whether the overlay has definitions prefixed with its name
@@ -193,9 +371,10 @@ impl OverlayFrame {
     pub fn from_origin(origin: ModuleId, prefixed: bool) -> Self {
         Self {
             vars: HashMap::new(),
-            predecls: HashMap::new(),
-            decls: HashMap::new(),
+            predecls: DeclNameMap::new(),
+            decls: DeclNameMap::new(),
             modules: HashMap::new(),
+            shadowed_vars: Vec::new(),
             visibility: Visibility::new(),
             origin,
             prefixed,
@@ -211,7 +390,11 @@ impl OverlayFrame {
     }
 
     pub fn insert_variable(&mut self, name: Vec<u8>, variable_id: VarId) -> Option<VarId> {
-        self.vars.insert(name, variable_id)
+        let res = self.vars.insert(name, variable_id);
+        if let Some(old_id) = res {
+            self.shadowed_vars.push(old_id);
+        }
+        res
     }
 
     pub fn get_decl(&self, name: &[u8]) -> Option<DeclId> {

@@ -1,6 +1,10 @@
-mod example_test;
+#![doc = include_str!("../README.md")]
 pub mod extra;
 pub use extra::*;
 
 #[cfg(test)]
-pub use example_test::test_examples;
+#[macro_use]
+extern crate nu_test_support;
+
+#[cfg(test)]
+use nu_test_support::harness::main;

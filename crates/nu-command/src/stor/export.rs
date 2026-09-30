@@ -1,11 +1,6 @@
-use crate::database::{SQLiteDatabase, MEMORY_DB};
-use nu_engine::CallExt;
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    Category, Example, IntoPipelineData, PipelineData, ShellError, Signature, Span, SyntaxShape,
-    Type, Value,
-};
+use crate::database::{MEMORY_DB, SQLiteDatabase, get_shared_mem_conn};
+use nu_engine::command_prelude::*;
+use nu_protocol::shell_error::generic::GenericError;
 
 #[derive(Clone)]
 pub struct StorExport;
@@ -17,18 +12,18 @@ impl Command for StorExport {
 
     fn signature(&self) -> Signature {
         Signature::build("stor export")
-            .input_output_types(vec![(Type::Nothing, Type::Table(vec![]))])
+            .input_output_types(vec![(Type::Nothing, Type::table())])
             .required_named(
                 "file-name",
                 SyntaxShape::String,
-                "file name to export the sqlite in-memory database to",
+                "File name to export the sqlite in-memory database to.",
                 Some('f'),
             )
             .allow_variants_without_examples(true)
             .category(Category::Database)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Export the in-memory sqlite database to a sqlite database file."
     }
 
@@ -36,7 +31,7 @@ impl Command for StorExport {
         vec!["sqlite", "save", "database", "saving", "file"]
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
             description: "Export the in-memory sqlite database",
             example: "stor export --file-name nudb.sqlite",
@@ -59,27 +54,26 @@ impl Command for StorExport {
                 return Err(ShellError::MissingParameter {
                     param_name: "please supply a file name with the --file-name parameter".into(),
                     span,
-                })
+                });
             }
         };
 
-        // Open the in-mem database
-        let db = Box::new(SQLiteDatabase::new(std::path::Path::new(MEMORY_DB), None));
+        let conn = get_shared_mem_conn()?;
+        let db = Box::new(SQLiteDatabase::new(
+            std::path::Path::new(MEMORY_DB),
+            engine_state.signals().clone(),
+        ));
+        // This uses vacuum. I'm not really sure if this is the best way to do this.
+        // I also added backup in the sqlitedatabase impl. If we have problems, we could switch to that.
+        db.export_in_memory_database_to_file(&conn, file_name)
+            .map_err(|err| {
+                ShellError::Generic(GenericError::new_internal(
+                    "Failed to open SQLite connection to the in-memory database from export",
+                    err.to_string(),
+                ))
+            })?;
 
-        if let Ok(conn) = db.open_connection() {
-            // This uses vacuum. I'm not really sure if this is the best way to do this.
-            // I also added backup in the sqlitedatabase impl. If we have problems, we could switch to that.
-            db.export_in_memory_database_to_file(&conn, file_name)
-                .map_err(|err| ShellError::GenericError {
-                    error: "Failed to open SQLite connection in memory from export".into(),
-                    msg: err.to_string(),
-                    span: Some(Span::test_data()),
-                    help: None,
-                    inner: vec![],
-                })?;
-        }
-        // dbg!(db.clone());
-        Ok(Value::custom_value(db, span).into_pipeline_data())
+        Ok(Value::custom(db, span).into_pipeline_data())
     }
 }
 
@@ -88,9 +82,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(StorExport {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StorExport)
     }
 }

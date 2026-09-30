@@ -1,8 +1,8 @@
 #[cfg(not(feature = "preserve_order"))]
-use std::collections::{btree_map, BTreeMap};
+use std::collections::{BTreeMap, btree_map};
 
 #[cfg(feature = "preserve_order")]
-use linked_hash_map::{self, LinkedHashMap};
+use linked_hash_map::LinkedHashMap;
 
 use std::fmt;
 use std::io;
@@ -89,12 +89,8 @@ impl Value {
     pub fn find_path<'a>(&'a self, keys: &[&str]) -> Option<&'a Value> {
         let mut target = self;
         for key in keys {
-            match target.find(key) {
-                Some(t) => {
-                    target = t;
-                }
-                None => return None,
-            }
+            let t = target.find(key)?;
+            target = t;
         }
         Some(target)
     }
@@ -131,11 +127,7 @@ impl Value {
                 Value::Array(ref list) => parse_index(&token[..]).and_then(|x| list.get(x)),
                 _ => return None,
             };
-            if let Some(t) = target_opt {
-                target = t;
-            } else {
-                return None;
-            }
+            target = target_opt?;
         }
         Some(target)
     }
@@ -432,12 +424,12 @@ struct WriterFormatter<'a, 'b: 'a> {
     inner: &'a mut fmt::Formatter<'b>,
 }
 
-impl<'a, 'b> io::Write for WriterFormatter<'a, 'b> {
+impl io::Write for WriterFormatter<'_, '_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         fn io_error<E>(_: E) -> io::Error {
             // Value does not matter because fmt::Debug and fmt::Display impls
             // below just map it to fmt::Error
-            io::Error::new(io::ErrorKind::Other, "fmt error")
+            io::Error::other("fmt error")
         }
         let s = str::from_utf8(buf).map_err(io_error)?;
         self.inner.write_str(s).map_err(io_error)?;
@@ -924,7 +916,7 @@ impl<'de> de::Deserializer<'de> for Value {
                 return Err(de::Error::invalid_type(
                     val.as_unexpected(),
                     &"string or map",
-                ))
+                ));
             }
         };
 
@@ -1094,9 +1086,9 @@ impl<'de> de::MapAccess<'de> for MapDeserializer {
     }
 }
 
-pub fn to_value<T: ?Sized>(value: &T) -> Result<Value>
+pub fn to_value<T>(value: &T) -> Result<Value>
 where
-    T: ser::Serialize,
+    T: ser::Serialize + ?Sized,
 {
     value.serialize(Serializer)
 }
@@ -1141,18 +1133,18 @@ mod test {
 
         let v: Value = from_str("{\"a\":1.1}").unwrap();
         let vo = v.as_object().unwrap();
-        assert!(vo["a"].as_f64().unwrap() - 1.1 < std::f64::EPSILON);
+        assert!((vo["a"].as_f64().unwrap() - 1.1).abs() < f64::EPSILON);
 
         let v: Value = from_str("{\"a\":-1.1}").unwrap();
         let vo = v.as_object().unwrap();
-        assert!(vo["a"].as_f64().unwrap() + 1.1 > -(std::f64::EPSILON));
+        assert!((vo["a"].as_f64().unwrap() + 1.1).abs() < f64::EPSILON);
 
         let v: Value = from_str("{\"a\":1e6}").unwrap();
         let vo = v.as_object().unwrap();
-        assert!(vo["a"].as_f64().unwrap() - 1e6 < std::f64::EPSILON);
+        assert!((vo["a"].as_f64().unwrap() - 1e6).abs() < f64::EPSILON);
 
         let v: Value = from_str("{\"a\":-1e6}").unwrap();
         let vo = v.as_object().unwrap();
-        assert!(vo["a"].as_f64().unwrap() + 1e6 > -(std::f64::EPSILON));
+        assert!((vo["a"].as_f64().unwrap() + 1e6).abs() < f64::EPSILON);
     }
 }

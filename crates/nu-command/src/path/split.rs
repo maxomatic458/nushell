@@ -1,21 +1,16 @@
-use std::path::{Component, Path};
-
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{EngineState, Stack, StateWorkingSet};
-use nu_protocol::{
-    engine::Command, Category, Example, PipelineData, ShellError, Signature, Span, Type, Value,
-};
-
 use super::PathSubcommandArguments;
+use nu_engine::command_prelude::*;
+use nu_protocol::engine::StateWorkingSet;
+use std::path::{Component, Path};
 
 struct Arguments;
 
 impl PathSubcommandArguments for Arguments {}
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct PathSplit;
 
-impl Command for SubCommand {
+impl Command for PathSplit {
     fn name(&self) -> &str {
         "path split"
     }
@@ -32,7 +27,7 @@ impl Command for SubCommand {
             .category(Category::Path)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Split a path into a list based on the system's path separator."
     }
 
@@ -51,18 +46,19 @@ impl Command for SubCommand {
         let args = Arguments;
 
         // This doesn't match explicit nulls
-        if matches!(input, PipelineData::Empty) {
+        if let PipelineData::Empty = input {
             return Err(ShellError::PipelineEmpty { dst_span: head });
         }
         input.map(
             move |value| super::operate(&split, &args, value, head),
-            engine_state.ctrlc.clone(),
+            engine_state.signals(),
         )
     }
 
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        _stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
@@ -70,20 +66,20 @@ impl Command for SubCommand {
         let args = Arguments;
 
         // This doesn't match explicit nulls
-        if matches!(input, PipelineData::Empty) {
+        if let PipelineData::Empty = input {
             return Err(ShellError::PipelineEmpty { dst_span: head });
         }
         input.map(
             move |value| super::operate(&split, &args, value, head),
-            working_set.permanent().ctrlc.clone(),
+            working_set.permanent().signals(),
         )
     }
 
     #[cfg(windows)]
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Split a path into parts",
+                description: "Split a path into parts.",
                 example: r"'C:\Users\viking\spam.txt' | path split",
                 result: Some(Value::list(
                     vec![
@@ -96,7 +92,7 @@ impl Command for SubCommand {
                 )),
             },
             Example {
-                description: "Split paths in list into parts",
+                description: "Split paths in list into parts.",
                 example: r"[ C:\Users\viking\spam.txt C:\Users\viking\eggs.txt ] | path split",
                 result: Some(Value::list(
                     vec![
@@ -120,11 +116,11 @@ impl Command for SubCommand {
     }
 
     #[cfg(not(windows))]
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Split a path into parts",
-                example: r"'/home/viking/spam.txt' | path split",
+                description: "Split a path into parts.",
+                example: "'/home/viking/spam.txt' | path split",
                 result: Some(Value::list(
                     vec![
                         Value::test_string("/"),
@@ -136,8 +132,8 @@ impl Command for SubCommand {
                 )),
             },
             Example {
-                description: "Split paths in list into parts",
-                example: r"[ /home/viking/spam.txt /home/viking/eggs.txt ] | path split",
+                description: "Split paths in list into parts.",
+                example: "[ /home/viking/spam.txt /home/viking/eggs.txt ] | path split",
                 result: Some(Value::list(
                     vec![
                         Value::test_list(vec![
@@ -195,9 +191,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(PathSplit)
     }
 }

@@ -1,13 +1,105 @@
-use nu_engine::{eval_block_with_early_return, CallExt};
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Closure, Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, IntoInterruptiblePipelineData, IntoPipelineData, PipelineData, ShellError,
-    Signature, Span, SyntaxShape, Type, Value,
-};
-use rayon::prelude::*;
-
 use super::utils::chain_error_with_input;
+use nu_engine::{ClosureEval, ClosureEvalOnce, command_prelude::*};
+use nu_protocol::{Signals, engine::Closure, shell_error::generic::GenericError};
+use rayon::prelude::*;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex, OnceLock,
+        mpsc::{self, RecvTimeoutError},
+    },
+    time::Duration,
+};
+
+const STREAM_BUFFER_SIZE: usize = 64;
+const CTRL_C_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Cache of thread pools keyed by thread count.
+///
+/// The cache owns one `Arc` for each reusable pool. A pool is idle only while that is
+/// its sole strong reference; active calls hold another `Arc`. Streaming producers keep
+/// their reference until producer work finishes, so overlapping pipeline stages cannot
+/// reuse a pool that is still needed for upstream progress.
+///
+/// Key `0` means "default size" (`ThreadPoolBuilder::num_threads(0)` → logical CPUs).
+/// Distinct `-t` sizes are rare in practice, so the map is not bounded.
+///
+/// These pools are **dedicated to `par-each`**. We intentionally never use Rayon's
+/// process-wide global pool: other commands (`glob` with dc-glob, `ls`, …) also schedule
+/// work there, and sharing it with the streaming path can deadlock when pool workers
+/// block on channel receives while a producer waits for a free worker.
+static THREAD_POOLS: OnceLock<Mutex<HashMap<usize, Arc<rayon::ThreadPool>>>> = OnceLock::new();
+
+fn lock_pool_cache(
+    head: Span,
+) -> Result<std::sync::MutexGuard<'static, HashMap<usize, Arc<rayon::ThreadPool>>>, ShellError> {
+    let pools = THREAD_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    pools.lock().map_err(|e| {
+        ShellError::Generic(GenericError::new(
+            "Error locking thread pool cache",
+            e.to_string(),
+            head,
+        ))
+    })
+}
+
+fn build_pool(num_threads: usize, head: Span) -> Result<Arc<rayon::ThreadPool>, ShellError> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()
+        .map(Arc::new)
+        .map_err(|e| {
+            ShellError::Generic(GenericError::new(
+                "Error creating thread pool",
+                e.to_string(),
+                head,
+            ))
+        })
+}
+
+/// Get or create a thread pool for this `par-each` invocation.
+///
+/// - Top-level: reuse a cached pool only when it is idle. Overlapping calls with the
+///   same thread count use separate pools so streaming stages cannot starve each other.
+/// - **Nested** calls (already running on a Rayon worker): always build a **private,
+///   uncached** pool. Sharing the outer pool deadlocks because the streaming path
+///   blocks the caller on a channel while holding a worker of that same pool.
+///
+/// Pool construction for the cache path runs outside the cache lock so concurrent
+/// top-level callers are not blocked while OS threads are spawned. A second lookup
+/// after build handles races.
+fn create_pool(num_threads: usize, head: Span) -> Result<Arc<rayon::ThreadPool>, ShellError> {
+    // Nested: never share a pool with the outer `par-each` (or any other Rayon pool).
+    if rayon::current_thread_index().is_some() {
+        // `num_threads == 0` => Rayon default (logical CPU count), same as a fresh builder.
+        return build_pool(num_threads, head);
+    }
+
+    {
+        let pools = lock_pool_cache(head)?;
+        if let Some(pool) = pools.get(&num_threads) {
+            // The cache owns one Arc. Any additional strong reference means this pool is
+            // still active, possibly as an upstream streaming producer.
+            if Arc::strong_count(pool) == 1 {
+                return Ok(pool.clone());
+            }
+        }
+    }
+
+    let built = build_pool(num_threads, head)?;
+
+    let mut pools = lock_pool_cache(head)?;
+    match pools.get(&num_threads) {
+        Some(pool) if Arc::strong_count(pool) == 1 => Ok(pool.clone()),
+        // Another active invocation owns the cached pool. Keep this newly built pool
+        // private to the current call instead of sharing the active one.
+        Some(_) => Ok(built),
+        None => {
+            pools.insert(num_threads, built.clone());
+            Ok(built)
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ParEach;
@@ -17,8 +109,12 @@ impl Command for ParEach {
         "par-each"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Run a closure on each row of the input list in parallel, creating a new list with the results."
+    }
+
+    fn extra_description(&self) -> &str {
+        " Uses a dedicated thread pool (idle top-level pools are reused; nested or overlapping calls use separate pools)."
     }
 
     fn signature(&self) -> nu_protocol::Signature {
@@ -28,40 +124,39 @@ impl Command for ParEach {
                     Type::List(Box::new(Type::Any)),
                     Type::List(Box::new(Type::Any)),
                 ),
-                (Type::Table(vec![]), Type::List(Box::new(Type::Any))),
+                (Type::table(), Type::List(Box::new(Type::Any))),
                 (Type::Any, Type::Any),
             ])
             .named(
                 "threads",
                 SyntaxShape::Int,
-                "the number of threads to use",
+                "The number of threads to use.",
                 Some('t'),
             )
             .switch(
                 "keep-order",
-                "keep sequence of output same as the order of input",
+                "Keep sequence of output same as the order of input.",
                 Some('k'),
             )
             .required(
                 "closure",
-                SyntaxShape::Closure(Some(vec![SyntaxShape::Any, SyntaxShape::Int])),
+                SyntaxShape::Closure(Some(vec![SyntaxShape::Any])),
                 "The closure to run.",
             )
             .allow_variants_without_examples(true)
             .category(Category::Filters)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 example: "[1 2 3] | par-each {|e| $e * 2 }",
-                description:
-                    "Multiplies each number. Note that the list will become arbitrarily disordered.",
+                description: "Multiplies each number. Note that the list will become arbitrarily disordered.",
                 result: None,
             },
             Example {
-                example: r#"[1 2 3] | par-each --keep-order {|e| $e * 2 }"#,
-                description: "Multiplies each number, keeping an original order",
+                example: "[1 2 3] | par-each --keep-order {|e| $e * 2 }",
+                description: "Multiplies each number, keeping an original order.",
                 result: Some(Value::test_list(vec![
                     Value::test_int(2),
                     Value::test_int(4),
@@ -69,8 +164,8 @@ impl Command for ParEach {
                 ])),
             },
             Example {
-                example: r#"1..3 | enumerate | par-each {|p| update item ($p.item * 2)} | sort-by item | get item"#,
-                description: "Enumerate and sort-by can be used to reconstruct the original order",
+                example: "1..3 | enumerate | par-each {|p| update item ($p.item * 2)} | sort-by item | get item",
+                description: "Enumerate and sort-by can be used to reconstruct the original order.",
                 result: Some(Value::test_list(vec![
                     Value::test_int(2),
                     Value::test_int(4),
@@ -78,8 +173,8 @@ impl Command for ParEach {
                 ])),
             },
             Example {
-                example: r#"[foo bar baz] | par-each {|e| $e + '!' } | sort"#,
-                description: "Output can still be sorted afterward",
+                example: "[foo bar baz] | par-each {|e| $e + '!' } | sort",
+                description: "Output can still be sorted afterward.",
                 result: Some(Value::test_list(vec![
                     Value::test_string("bar!"),
                     Value::test_string("baz!"),
@@ -88,8 +183,7 @@ impl Command for ParEach {
             },
             Example {
                 example: r#"[1 2 3] | enumerate | par-each { |e| if $e.item == 2 { $"found 2 at ($e.index)!"} }"#,
-                description:
-                    "Iterate over each element, producing a list showing indexes of any 2s",
+                description: "Iterate over each element, producing a list showing indexes of any 2s.",
                 result: Some(Value::test_list(vec![Value::test_string("found 2 at 1!")])),
             },
         ]
@@ -102,39 +196,31 @@ impl Command for ParEach {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        fn create_pool(num_threads: usize) -> Result<rayon::ThreadPool, ShellError> {
-            match rayon::ThreadPoolBuilder::new()
-                .num_threads(num_threads)
-                .build()
-            {
-                Err(e) => Err(e).map_err(|e| ShellError::GenericError {
-                    error: "Error creating thread pool".into(),
-                    msg: e.to_string(),
-                    span: Some(Span::unknown()),
-                    help: None,
-                    inner: vec![],
-                }),
-                Ok(pool) => Ok(pool),
-            }
-        }
-
-        let capture_block: Closure = call.req(engine_state, stack, 0)?;
+        let head = call.head;
+        let closure: Closure = call.req(engine_state, stack, 0)?;
         let threads: Option<usize> = call.get_flag(engine_state, stack, "threads")?;
         let max_threads = threads.unwrap_or(0);
         let keep_order = call.has_flag(engine_state, stack, "keep-order")?;
-        let metadata = input.metadata();
-        let ctrlc = engine_state.ctrlc.clone();
-        let outer_ctrlc = engine_state.ctrlc.clone();
-        let block_id = capture_block.block_id;
-        let mut stack = stack.captures_to_stack(capture_block.captures);
-        let span = call.head;
-        let redirect_stdout = call.redirect_stdout;
-        let redirect_stderr = call.redirect_stderr;
+        let signals = engine_state.signals().clone();
+
+        if matches!(&input, PipelineData::Value(Value::Custom { val, .. }, _) if val.type_name() == "matrix")
+        {
+            return Err(ShellError::Generic(
+                nu_protocol::shell_error::generic::GenericError::new(
+                    "Unsupported type",
+                    "Use `matrix map` for element-wise operations.",
+                    call.head,
+                ),
+            ));
+        }
+
+        let mut input = input.into_stream_or_original(engine_state);
+        let metadata = input.take_metadata();
 
         // A helper function sorts the output if needed
         let apply_order = |mut vec: Vec<(usize, Value)>| {
             if keep_order {
-                // It runs inside the rayon's thread pool so parallel sorting can be used.
+                // Runs under Rayon (dedicated pool via install).
                 // There are no identical indexes, so unstable sorting can be used.
                 vec.par_sort_unstable_by_key(|(index, _)| *index);
             }
@@ -143,194 +229,237 @@ impl Command for ParEach {
         };
 
         match input {
-            PipelineData::Empty => Ok(PipelineData::Empty),
-            PipelineData::Value(Value::Range { val, .. }, ..) => Ok(create_pool(max_threads)?
-                .install(|| {
-                    let vec = val
-                        .into_range_iter(ctrlc.clone())
-                        .expect("unable to create a range iterator")
-                        .enumerate()
-                        .par_bridge()
-                        .map(move |(index, x)| {
-                            let block = engine_state.get_block(block_id);
-
-                            let mut stack = stack.clone();
-
-                            if let Some(var) = block.signature.get_positional(0) {
-                                if let Some(var_id) = &var.var_id {
-                                    stack.add_var(*var_id, x.clone());
-                                }
-                            }
-
-                            let val_span = x.span();
-                            let x_is_error = x.is_error();
-
-                            let val = match eval_block_with_early_return(
+            PipelineData::Empty => Ok(PipelineData::empty()),
+            PipelineData::Value(value, ..) => {
+                let span = value.span();
+                match value {
+                    Value::List { vals, .. } => {
+                        let pool = create_pool(max_threads, head)?;
+                        if keep_order {
+                            Ok(pool.install(|| {
+                                let par_iter = vals.into_owned().into_par_iter().enumerate();
+                                let mapped =
+                                    parallel_closure_map(engine_state, stack, &closure, par_iter);
+                                apply_order(mapped.collect())
+                                    .into_pipeline_data(span, signals.clone())
+                            }))
+                        } else {
+                            let par_iter = vals.into_owned().into_par_iter();
+                            Ok(stream_parallel_values(
                                 engine_state,
-                                &mut stack,
-                                block,
-                                x.into_pipeline_data(),
-                                redirect_stdout,
-                                redirect_stderr,
-                            ) {
-                                Ok(v) => v.into_value(span),
-                                Err(error) => Value::error(
-                                    chain_error_with_input(error, x_is_error, val_span),
-                                    val_span,
-                                ),
-                            };
-
-                            (index, val)
-                        })
-                        .collect::<Vec<_>>();
-
-                    apply_order(vec).into_pipeline_data(ctrlc)
-                })),
-            PipelineData::Value(Value::List { vals: val, .. }, ..) => Ok(create_pool(max_threads)?
-                .install(|| {
-                    let vec = val
-                        .par_iter()
-                        .enumerate()
-                        .map(move |(index, x)| {
-                            let block = engine_state.get_block(block_id);
-
-                            let mut stack = stack.clone();
-
-                            if let Some(var) = block.signature.get_positional(0) {
-                                if let Some(var_id) = &var.var_id {
-                                    stack.add_var(*var_id, x.clone());
-                                }
-                            }
-
-                            let val_span = x.span();
-                            let x_is_error = x.is_error();
-
-                            let val = match eval_block_with_early_return(
+                                stack,
+                                closure.clone(),
+                                pool,
+                                span,
+                                signals.clone(),
+                                par_iter,
+                            ))
+                        }
+                    }
+                    Value::Range { val, .. } => {
+                        let pool = create_pool(max_threads, head)?;
+                        if keep_order {
+                            Ok(pool.install(|| {
+                                let par_iter = val
+                                    .into_range_iter(span, signals.clone())
+                                    .enumerate()
+                                    .par_bridge();
+                                let mapped =
+                                    parallel_closure_map(engine_state, stack, &closure, par_iter);
+                                apply_order(mapped.collect())
+                                    .into_pipeline_data(span, signals.clone())
+                            }))
+                        } else {
+                            let par_iter = val.into_range_iter(span, signals.clone()).par_bridge();
+                            Ok(stream_parallel_values(
                                 engine_state,
-                                &mut stack,
-                                block,
-                                x.clone().into_pipeline_data(),
-                                redirect_stdout,
-                                redirect_stderr,
-                            ) {
-                                Ok(v) => v.into_value(span),
-                                Err(error) => Value::error(
-                                    chain_error_with_input(error, x_is_error, val_span),
-                                    val_span,
-                                ),
-                            };
-
-                            (index, val)
-                        })
-                        .collect::<Vec<_>>();
-
-                    apply_order(vec).into_pipeline_data(ctrlc)
-                })),
-            PipelineData::ListStream(stream, ..) => Ok(create_pool(max_threads)?.install(|| {
-                let vec = stream
-                    .enumerate()
-                    .par_bridge()
-                    .map(move |(index, x)| {
-                        let block = engine_state.get_block(block_id);
-
-                        let mut stack = stack.clone();
-
-                        if let Some(var) = block.signature.get_positional(0) {
-                            if let Some(var_id) = &var.var_id {
-                                stack.add_var(*var_id, x.clone());
-                            }
+                                stack,
+                                closure.clone(),
+                                pool,
+                                span,
+                                signals.clone(),
+                                par_iter,
+                            ))
                         }
-
-                        let val_span = x.span();
-                        let x_is_error = x.is_error();
-
-                        let val = match eval_block_with_early_return(
-                            engine_state,
-                            &mut stack,
-                            block,
-                            x.into_pipeline_data(),
-                            redirect_stdout,
-                            redirect_stderr,
-                        ) {
-                            Ok(v) => v.into_value(span),
-                            Err(error) => Value::error(
-                                chain_error_with_input(error, x_is_error, val_span),
-                                val_span,
-                            ),
-                        };
-
-                        (index, val)
-                    })
-                    .collect::<Vec<_>>();
-
-                apply_order(vec).into_pipeline_data(ctrlc)
-            })),
-            PipelineData::ExternalStream { stdout: None, .. } => Ok(PipelineData::empty()),
-            PipelineData::ExternalStream {
-                stdout: Some(stream),
-                ..
-            } => Ok(create_pool(max_threads)?.install(|| {
-                let vec = stream
-                    .enumerate()
-                    .par_bridge()
-                    .map(move |(index, x)| {
-                        let x = match x {
-                            Ok(x) => x,
-                            Err(err) => return (index, Value::error(err, span)),
-                        };
-
-                        let block = engine_state.get_block(block_id);
-
-                        let mut stack = stack.clone();
-
-                        if let Some(var) = block.signature.get_positional(0) {
-                            if let Some(var_id) = &var.var_id {
-                                stack.add_var(*var_id, x.clone());
-                            }
-                        }
-
-                        let val = match eval_block_with_early_return(
-                            engine_state,
-                            &mut stack,
-                            block,
-                            x.into_pipeline_data(),
-                            redirect_stdout,
-                            redirect_stderr,
-                        ) {
-                            Ok(v) => v.into_value(span),
-                            Err(error) => Value::error(error, span),
-                        };
-
-                        (index, val)
-                    })
-                    .collect::<Vec<_>>();
-
-                apply_order(vec).into_pipeline_data(ctrlc)
-            })),
-            // This match allows non-iterables to be accepted,
-            // which is currently considered undesirable (Nov 2022).
-            PipelineData::Value(x, ..) => {
-                let block = engine_state.get_block(block_id);
-
-                if let Some(var) = block.signature.get_positional(0) {
-                    if let Some(var_id) = &var.var_id {
-                        stack.add_var(*var_id, x.clone());
+                    }
+                    // This match allows non-iterables to be accepted,
+                    // which is currently considered undesirable (Nov 2022).
+                    value => {
+                        ClosureEvalOnce::new(engine_state, stack, closure).run_with_value(value)
                     }
                 }
-
-                eval_block_with_early_return(
-                    engine_state,
-                    &mut stack,
-                    block,
-                    x.into_pipeline_data(),
-                    redirect_stdout,
-                    redirect_stderr,
-                )
+            }
+            PipelineData::ListStream(stream, ..) => {
+                let pool = create_pool(max_threads, head)?;
+                if keep_order {
+                    Ok(pool.install(|| {
+                        let par_iter = stream.into_iter().enumerate().par_bridge();
+                        let mapped = parallel_closure_map(engine_state, stack, &closure, par_iter);
+                        apply_order(mapped.collect()).into_pipeline_data(head, signals.clone())
+                    }))
+                } else {
+                    let par_iter = stream.into_iter().par_bridge();
+                    Ok(stream_parallel_values(
+                        engine_state,
+                        stack,
+                        closure.clone(),
+                        pool,
+                        head,
+                        signals.clone(),
+                        par_iter,
+                    ))
+                }
+            }
+            PipelineData::ByteStream(stream, ..) => {
+                if let Some(chunks) = stream.chunks() {
+                    let pool = create_pool(max_threads, head)?;
+                    if keep_order {
+                        Ok(pool.install(|| {
+                            let par_iter = chunks
+                                .enumerate()
+                                .map(move |(idx, val)| {
+                                    (idx, val.unwrap_or_else(|err| Value::error(err, head)))
+                                })
+                                .par_bridge();
+                            let mapped =
+                                parallel_closure_map(engine_state, stack, &closure, par_iter);
+                            apply_order(mapped.collect()).into_pipeline_data(head, signals.clone())
+                        }))
+                    } else {
+                        let par_iter = chunks
+                            .map(move |val| val.unwrap_or_else(|err| Value::error(err, head)))
+                            .par_bridge();
+                        Ok(stream_parallel_values(
+                            engine_state,
+                            stack,
+                            closure.clone(),
+                            pool,
+                            head,
+                            signals.clone(),
+                            par_iter,
+                        ))
+                    }
+                } else {
+                    Ok(PipelineData::empty())
+                }
             }
         }
-        .and_then(|x| x.filter(|v| !v.is_nothing(), outer_ctrlc))
-        .map(|res| res.set_metadata(metadata))
+        .and_then(|x| x.filter(|v| !v.is_nothing(), engine_state.signals()))
+        .map(|data| data.set_metadata(metadata))
     }
+}
+
+fn stream_parallel_values(
+    engine_state: &EngineState,
+    stack: &Stack,
+    closure: Closure,
+    pool: Arc<rayon::ThreadPool>,
+    span: Span,
+    signals: Signals,
+    input: impl ParallelIterator<Item = Value> + 'static,
+) -> PipelineData {
+    let (tx, rx) = mpsc::sync_channel(STREAM_BUFFER_SIZE);
+    let worker_engine_state = engine_state.clone();
+    // Only clone the captured variables, not the entire stack.
+    // This avoids deep-copying all in-scope variables that the closure does not reference.
+    let worker_stack = stack.captures_to_stack(closure.captures.clone());
+    let worker_signals = signals.clone();
+
+    // Keep an Arc for the lifetime of the spawned producer. For cached pools this keeps
+    // `strong_count > 1`, marking the pool active until all producer work has finished.
+    let pool_keepalive = pool.clone();
+    pool.spawn(move || {
+        let map_signals = worker_signals.clone();
+        let send_signals = worker_signals.clone();
+
+        let _ = input
+            .map_init(
+                move || ClosureEval::new(&worker_engine_state, &worker_stack, closure.clone()),
+                move |closure_eval, value| {
+                    if map_signals.interrupted() {
+                        return Err(());
+                    }
+
+                    let value = run_closure_on_value(closure_eval, value);
+
+                    if map_signals.interrupted() {
+                        Err(())
+                    } else {
+                        Ok(value)
+                    }
+                },
+            )
+            .try_for_each(move |value| match value {
+                Ok(value) => {
+                    if send_signals.interrupted() {
+                        Err(())
+                    } else {
+                        tx.send(value).map_err(|_| ())
+                    }
+                }
+                Err(()) => Err(()),
+            });
+
+        drop(pool_keepalive);
+    });
+
+    ReceiverIter::new(rx, signals).into_pipeline_data(span, Signals::empty())
+}
+
+// Polls channel reads so Ctrl+C can stop blocked receives promptly.
+struct ReceiverIter {
+    receiver: mpsc::Receiver<Value>,
+    signals: Signals,
+}
+
+impl ReceiverIter {
+    fn new(receiver: mpsc::Receiver<Value>, signals: Signals) -> Self {
+        Self { receiver, signals }
+    }
+}
+
+impl Iterator for ReceiverIter {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.signals.interrupted() {
+                return None;
+            }
+
+            match self.receiver.recv_timeout(CTRL_C_CHECK_INTERVAL) {
+                Ok(value) => return Some(value),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+}
+
+fn run_closure_on_value(closure_eval: &mut ClosureEval, value: Value) -> Value {
+    let span = value.span();
+    let is_error = value.is_error();
+
+    closure_eval
+        .run_with_value(value)
+        .and_then(|data| data.into_value(span))
+        .unwrap_or_else(|err| Value::error(chain_error_with_input(err, is_error, span), span))
+}
+
+fn parallel_closure_map(
+    engine_state: &EngineState,
+    stack: &mut Stack,
+    closure: &Closure,
+    input: impl ParallelIterator<Item = (usize, Value)>,
+) -> impl ParallelIterator<Item = (usize, Value)> {
+    input.map_init(
+        move || ClosureEval::new(engine_state, stack, closure.clone()),
+        |closure_eval, (index, value)| {
+            let value = run_closure_on_value(closure_eval, value);
+
+            (index, value)
+        },
+    )
 }
 
 #[cfg(test)]
@@ -338,9 +467,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(ParEach {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(ParEach)
     }
 }

@@ -1,12 +1,6 @@
-use nu_engine::{eval_block, CallExt};
-use nu_protocol::ast::{Block, Call};
-use nu_protocol::engine::{Closure, Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, IntoInterruptiblePipelineData, IntoPipelineData, PipelineData,
-    PipelineIterator, ShellError, Signature, Span, SyntaxShape, Type, Value,
-};
+use nu_engine::{ClosureEval, command_prelude::*};
+use nu_protocol::{PipelineIterator, engine::Closure};
 use std::collections::HashSet;
-use std::iter::FromIterator;
 
 #[derive(Clone)]
 pub struct UpdateCells;
@@ -18,26 +12,39 @@ impl Command for UpdateCells {
 
     fn signature(&self) -> Signature {
         Signature::build("update cells")
-            .input_output_types(vec![(Type::Table(vec![]), Type::Table(vec![]))])
+            .input_output_types(vec![
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
+            ])
             .required(
                 "closure",
                 SyntaxShape::Closure(Some(vec![SyntaxShape::Any])),
-                "the closure to run an update for each cell",
+                "The closure to run an update for each cell.",
             )
             .named(
                 "columns",
                 SyntaxShape::List(Box::new(SyntaxShape::Any)),
-                "list of columns to update",
+                "List of columns to update.",
                 Some('c'),
+            )
+            .switch(
+                "recursive",
+                "Descend into nested records and lists, running the closure on every leaf value.",
+                Some('r'),
             )
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Update the table cells."
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn extra_description(&self) -> &str {
+        "By default the closure runs once per cell, so a cell holding a record or list is passed to the closure whole.
+With `--recursive`, nested records and lists are descended into instead and the closure runs on each leaf value inside them."
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "Update the zero value cells to empty strings.",
@@ -83,6 +90,26 @@ impl Command for UpdateCells {
                     "2021-11-18" => Value::test_string(""),
                 })])),
             },
+            Example {
+                example: "{a: 1, b: 2, c: 3} | update cells { $in + 10 }",
+                description: "Update each value in a record.",
+                result: Some(Value::test_record(record! {
+                    "a" => Value::test_int(11),
+                    "b" => Value::test_int(12),
+                    "c" => Value::test_int(13),
+                })),
+            },
+            Example {
+                example: "{a: 1, b: {c: 2, d: [3, 4]}} | update cells --recursive { $in * 10 }",
+                description: "Update every leaf value in a nested record.",
+                result: Some(Value::test_record(record! {
+                    "a" => Value::test_int(10),
+                    "b" => Value::test_record(record! {
+                        "c" => Value::test_int(20),
+                        "d" => Value::test_list(vec![Value::test_int(30), Value::test_int(40)]),
+                    }),
+                })),
+            },
         ]
     }
 
@@ -91,63 +118,97 @@ impl Command for UpdateCells {
         engine_state: &EngineState,
         stack: &mut Stack,
         call: &Call,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        // the block to run on each cell
-        let engine_state = engine_state.clone();
-        let block: Closure = call.req(&engine_state, stack, 0)?;
-        let mut stack = stack.captures_to_stack(block.captures);
-        let orig_env_vars = stack.env_vars.clone();
-        let orig_env_hidden = stack.env_hidden.clone();
-
-        let metadata = input.metadata();
-        let ctrlc = engine_state.ctrlc.clone();
-        let block: Block = engine_state.get_block(block.block_id).clone();
-
-        let redirect_stdout = call.redirect_stdout;
-        let redirect_stderr = call.redirect_stderr;
-
-        let span = call.head;
-
-        stack.with_env(&orig_env_vars, &orig_env_hidden);
-
-        // the columns to update
-        let columns: Option<Value> = call.get_flag(&engine_state, &mut stack, "columns")?;
+        let head = call.head;
+        let closure: Closure = call.req(engine_state, stack, 0)?;
+        let recursive = call.has_flag(engine_state, stack, "recursive")?;
+        let columns: Option<Value> = call.get_flag(engine_state, stack, "columns")?;
         let columns: Option<HashSet<String>> = match columns {
-            Some(val) => {
-                let cols = val
-                    .as_list()?
-                    .iter()
-                    .map(|val| val.as_string())
-                    .collect::<Result<Vec<String>, ShellError>>()?;
-                Some(HashSet::from_iter(cols))
-            }
+            Some(val) => Some(
+                val.into_list()?
+                    .into_iter()
+                    .map(Value::coerce_into_string)
+                    .collect::<Result<HashSet<String>, ShellError>>()?,
+            ),
             None => None,
         };
 
-        Ok(UpdateCellIterator {
-            input: input.into_iter(),
-            engine_state,
-            stack,
-            block,
-            columns,
-            redirect_stdout,
-            redirect_stderr,
-            span,
+        let span = input.span();
+        match input {
+            PipelineData::Value(Value::Record { ref mut val, .. }, ..) => {
+                // SAFETY: we have a value in the input, so we must have a span
+                let span = span.expect("value had no span");
+                let val = val.to_mut();
+                update_record(
+                    val,
+                    &mut ClosureEval::new(engine_state, stack, closure),
+                    span,
+                    columns.as_ref(),
+                    recursive,
+                );
+                Ok(input)
+            }
+            _ => {
+                let metadata = input.take_metadata();
+                Ok(UpdateCellIterator {
+                    iter: input.into_iter(),
+                    closure: ClosureEval::new(engine_state, stack, closure),
+                    columns,
+                    recursive,
+                    span: head,
+                }
+                .into_pipeline_data(head, engine_state.signals().clone())
+                .set_metadata(metadata))
+            }
         }
-        .into_pipeline_data(ctrlc)
-        .set_metadata(metadata))
+    }
+}
+
+/// Run the closure on the cells of `record`, optionally restricted to `cols`.
+///
+/// The `--columns` filter only applies to the top level; with `recursive`
+/// every leaf below a selected column is visited.
+fn update_record(
+    record: &mut Record,
+    closure: &mut ClosureEval,
+    span: Span,
+    cols: Option<&HashSet<String>>,
+    recursive: bool,
+) {
+    for (col, val) in record.iter_mut() {
+        if cols.is_none_or(|columns| columns.contains(col)) {
+            *val = update_cell(closure, span, std::mem::take(val), recursive);
+        }
+    }
+}
+
+/// Update a single cell: either run the closure on it directly, or (when `recursive`)
+/// descend through nested records and lists and run the closure on each leaf.
+fn update_cell(closure: &mut ClosureEval, span: Span, value: Value, recursive: bool) -> Value {
+    if !recursive {
+        return eval_value(closure, span, value);
+    }
+    match value {
+        Value::Record { mut val, .. } => {
+            update_record(val.to_mut(), closure, span, None, true);
+            Value::record(val.into_owned(), span)
+        }
+        Value::List { mut vals, .. } => {
+            for item in vals.to_mut() {
+                *item = update_cell(closure, span, std::mem::take(item), true);
+            }
+            Value::list(vals.into_owned(), span)
+        }
+        leaf => eval_value(closure, span, leaf),
     }
 }
 
 struct UpdateCellIterator {
-    input: PipelineIterator,
+    iter: PipelineIterator,
+    closure: ClosureEval,
     columns: Option<HashSet<String>>,
-    engine_state: EngineState,
-    stack: Stack,
-    block: Block,
-    redirect_stdout: bool,
-    redirect_stderr: bool,
+    recursive: bool,
     span: Span,
 }
 
@@ -155,77 +216,31 @@ impl Iterator for UpdateCellIterator {
     type Item = Value;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.input.next() {
-            Some(val) => {
-                if let Some(ref cols) = self.columns {
-                    if !val.columns().any(|c| cols.contains(c)) {
-                        return Some(val);
-                    }
-                }
+        let mut value = self.iter.next()?;
 
-                let span = val.span();
-                match val {
-                    Value::Record { val, .. } => Some(Value::record(
-                        val.into_iter()
-                            .map(|(col, val)| match &self.columns {
-                                Some(cols) if !cols.contains(&col) => (col, val),
-                                _ => (
-                                    col,
-                                    process_cell(
-                                        val,
-                                        &self.engine_state,
-                                        &mut self.stack,
-                                        &self.block,
-                                        self.redirect_stdout,
-                                        self.redirect_stderr,
-                                        span,
-                                    ),
-                                ),
-                            })
-                            .collect(),
-                        span,
-                    )),
-                    val => Some(process_cell(
-                        val,
-                        &self.engine_state,
-                        &mut self.stack,
-                        &self.block,
-                        self.redirect_stdout,
-                        self.redirect_stderr,
-                        self.span,
-                    )),
-                }
-            }
-            None => None,
-        }
+        let value = if let Value::Record { val, .. } = &mut value {
+            let val = val.to_mut();
+            update_record(
+                val,
+                &mut self.closure,
+                self.span,
+                self.columns.as_ref(),
+                self.recursive,
+            );
+            value
+        } else {
+            update_cell(&mut self.closure, self.span, value, self.recursive)
+        };
+
+        Some(value)
     }
 }
 
-fn process_cell(
-    val: Value,
-    engine_state: &EngineState,
-    stack: &mut Stack,
-    block: &Block,
-    redirect_stdout: bool,
-    redirect_stderr: bool,
-    span: Span,
-) -> Value {
-    if let Some(var) = block.signature.get_positional(0) {
-        if let Some(var_id) = &var.var_id {
-            stack.add_var(*var_id, val.clone());
-        }
-    }
-    match eval_block(
-        engine_state,
-        stack,
-        block,
-        val.into_pipeline_data(),
-        redirect_stdout,
-        redirect_stderr,
-    ) {
-        Ok(pd) => pd.into_value(span),
-        Err(e) => Value::error(e, span),
-    }
+fn eval_value(closure: &mut ClosureEval, span: Span, value: Value) -> Value {
+    closure
+        .run_with_value(value)
+        .and_then(|data| data.into_value(span))
+        .unwrap_or_else(|err| Value::error(err, span))
 }
 
 #[cfg(test)]
@@ -233,9 +248,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(UpdateCells {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(UpdateCells)
     }
 }

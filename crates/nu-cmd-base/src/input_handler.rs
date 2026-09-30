@@ -1,6 +1,4 @@
-use nu_protocol::ast::CellPath;
-use nu_protocol::{PipelineData, ShellError, Span, Value};
-use std::sync::atomic::AtomicBool;
+use nu_protocol::{PipelineData, ShellError, Signals, Span, Value, ast::CellPath};
 use std::sync::Arc;
 
 pub trait CmdArgument {
@@ -13,6 +11,12 @@ pub trait CmdArgument {
 /// Using this to simplify code.
 pub struct CellPathOnlyArgs {
     cell_paths: Option<Vec<CellPath>>,
+}
+
+impl CellPathOnlyArgs {
+    pub const fn empty() -> Self {
+        CellPathOnlyArgs { cell_paths: None }
+    }
 }
 
 impl CmdArgument for CellPathOnlyArgs {
@@ -42,7 +46,7 @@ pub fn operate<C, A>(
     mut arg: A,
     input: PipelineData,
     span: Span,
-    ctrlc: Option<Arc<AtomicBool>>,
+    signals: &Signals,
 ) -> Result<PipelineData, ShellError>
 where
     A: CmdArgument + Send + Sync + 'static,
@@ -57,7 +61,7 @@ where
                     _ => cmd(&v, &arg, span),
                 }
             },
-            ctrlc,
+            signals,
         ),
         Some(column_paths) => {
             let arg = Arc::new(arg);
@@ -81,7 +85,7 @@ where
                     }
                     v
                 },
-                ctrlc,
+                signals,
             )
         }
     }

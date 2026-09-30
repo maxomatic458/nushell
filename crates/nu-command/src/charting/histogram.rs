@@ -1,12 +1,7 @@
 use super::hashable_value::HashableValue;
 use itertools::Itertools;
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, IntoPipelineData, PipelineData, Record, ShellError, Signature, Span,
-    Spanned, SyntaxShape, Type, Value,
-};
+use nu_engine::command_prelude::*;
+
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -24,18 +19,35 @@ impl Command for Histogram {
 
     fn signature(&self) -> Signature {
         Signature::build("histogram")
-            .input_output_types(vec![(Type::List(Box::new(Type::Any)), Type::Table(vec![])),])
-            .optional("column-name", SyntaxShape::String, "Column name to calc frequency, no need to provide if input is a list.")
-            .optional("frequency-column-name", SyntaxShape::String, "Histogram's frequency column, default to be frequency column output.")
-            .named("percentage-type", SyntaxShape::String, "percentage calculate method, can be 'normalize' or 'relative', in 'normalize', defaults to be 'normalize'", Some('t'))
+            .input_output_types(vec![(Type::List(Box::new(Type::Any)), Type::table())])
+            .optional(
+                "column-name",
+                SyntaxShape::String,
+                "Column name to calc frequency, no need to provide if input is a list.",
+            )
+            .optional(
+                "frequency-column-name",
+                SyntaxShape::String,
+                "Histogram's frequency column, default to be frequency column output.",
+            )
+            .param(
+                Flag::new("percentage-type")
+                    .short('t')
+                    .arg(SyntaxShape::String)
+                    .desc(
+                        "percentage calculate method, can be 'normalize' or 'relative', in \
+                         'normalize', defaults to be 'normalize'",
+                    )
+                    .completion(Completion::new_list(&["normalize", "relative"])),
+            )
             .category(Category::Chart)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Creates a new table with a histogram based on the column name passed in."
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "Compute a histogram of file types",
@@ -43,37 +55,37 @@ impl Command for Histogram {
                 result: None,
             },
             Example {
-                description:
-                    "Compute a histogram for the types of files, with frequency column named freq",
+                description: "Compute a histogram for the types of files, with frequency column \
+                              named freq",
                 example: "ls | histogram type freq",
                 result: None,
             },
             Example {
                 description: "Compute a histogram for a list of numbers",
                 example: "[1 2 1] | histogram",
-                result: Some(Value::test_list (
-                        vec![Value::test_record(record! {
-                            "value" =>      Value::test_int(1),
-                            "count" =>      Value::test_int(2),
-                            "quantile" =>   Value::test_float(0.6666666666666666),
-                            "percentage" => Value::test_string("66.67%"),
-                            "frequency" =>  Value::test_string("******************************************************************"),
-                        }),
-                        Value::test_record(record! {
-                            "value" =>      Value::test_int(2),
-                            "count" =>      Value::test_int(1),
-                            "quantile" =>   Value::test_float(0.3333333333333333),
-                            "percentage" => Value::test_string("33.33%"),
-                            "frequency" =>  Value::test_string("*********************************"),
-                        })],
-                    )
-                 ),
+                result: Some(Value::test_list(vec![
+                    Value::test_record(record! {
+                        "value" =>      Value::test_int(1),
+                        "count" =>      Value::test_int(2),
+                        "quantile" =>   Value::test_float(0.6666666666666666),
+                        "percentage" => Value::test_string("66.67%"),
+                        "frequency" =>  Value::test_string("******************************************************************"),
+                    }),
+                    Value::test_record(record! {
+                        "value" =>      Value::test_int(2),
+                        "count" =>      Value::test_int(1),
+                        "quantile" =>   Value::test_float(0.3333333333333333),
+                        "percentage" => Value::test_string("33.33%"),
+                        "frequency" =>  Value::test_string("*********************************"),
+                    }),
+                ])),
             },
             Example {
-                description: "Compute a histogram for a list of numbers, and percentage is based on the maximum value",
+                description: "Compute a histogram for a list of numbers, and percentage is based \
+                              on the maximum value",
                 example: "[1 2 3 1 1 1 2 2 1 1] | histogram --percentage-type relative",
                 result: None,
-            }
+            },
         ]
     }
 
@@ -96,7 +108,7 @@ impl Command for Histogram {
                             "frequency-column-name can't be {}",
                             forbidden_column_names
                                 .iter()
-                                .map(|val| format!("'{}'", val))
+                                .map(|val| format!("'{val}'"))
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         ),
@@ -120,22 +132,23 @@ impl Command for Histogram {
                         err_message: "calc method can only be 'normalize' or 'relative'"
                             .to_string(),
                         span: inner.span,
-                    })
+                    });
                 }
             },
         };
 
         let span = call.head;
-        let data_as_value = input.into_value(span);
+        let data_as_value = input.into_value(span)?;
+        let value_span = data_as_value.span();
         // `input` is not a list, here we can return an error.
         run_histogram(
-            data_as_value.as_list()?.to_vec(),
+            data_as_value.into_list()?,
             column_name,
             frequency_column_name,
             calc_method,
             span,
             // Note that as_list() filters out Value::Error here.
-            data_as_value.span(),
+            value_span,
         )
     }
 }
@@ -162,10 +175,15 @@ fn run_histogram(
                         let t = v.get_type();
                         let span = v.span();
                         inputs.push(HashableValue::from_value(v, head_span).map_err(|_| {
-                        ShellError::UnsupportedInput { msg: "Since --column-name was not provided, only lists of hashable values are supported.".to_string(), input: format!(
-                                "input type: {t:?}"
-                            ), msg_span: head_span, input_span: span }
-                    })?)
+                            ShellError::UnsupportedInput {
+                                msg: "Since column-name was not provided, only lists of hashable \
+                                      values are supported."
+                                    .to_string(),
+                                input: format!("input type: {t:?}"),
+                                msg_span: head_span,
+                                input_span: span,
+                            }
+                        })?)
                     }
                 }
             }
@@ -181,12 +199,10 @@ fn run_histogram(
                 match v {
                     // parse record, and fill valid value to actual input.
                     Value::Record { val, .. } => {
-                        for (c, v) in val {
-                            if &c == col_name {
-                                if let Ok(v) = HashableValue::from_value(v, head_span) {
-                                    inputs.push(v);
-                                }
-                            }
+                        if let Some(v) = val.get(col_name)
+                            && let Ok(v) = HashableValue::from_value(v.clone(), head_span)
+                        {
+                            inputs.push(v);
                         }
                     }
                     // Propagate existing errors.
@@ -198,16 +214,25 @@ fn run_histogram(
             if inputs.is_empty() {
                 return Err(ShellError::CantFindColumn {
                     col_name: col_name.clone(),
-                    span: head_span,
+                    span: Some(head_span),
                     src_span: list_span,
                 });
             }
         }
     }
 
+    let forbidden_colun_names = ["count", "quantile", "percentage", freq_column.as_str()];
     let value_column_name = column_name
         .map(|x| x.item)
+        .map(|name| {
+            if forbidden_colun_names.contains(&name.as_str()) {
+                "value".to_string()
+            } else {
+                name
+            }
+        })
         .unwrap_or_else(|| "value".to_string());
+
     Ok(histogram_impl(
         inputs,
         &value_column_name,
@@ -238,13 +263,6 @@ fn histogram_impl(
     }
 
     let mut result = vec![];
-    let result_cols = vec![
-        value_column_name.to_string(),
-        "count".to_string(),
-        "quantile".to_string(),
-        "percentage".to_string(),
-        freq_column.to_string(),
-    ];
     const MAX_FREQ_COUNT: f64 = 100.0;
     for (val, count) in counter.into_iter().sorted() {
         let quantile = match calc_method {
@@ -258,21 +276,18 @@ fn histogram_impl(
         result.push((
             count, // attach count first for easily sorting.
             Value::record(
-                Record::from_raw_cols_vals_unchecked(
-                    result_cols.clone(),
-                    vec![
-                        val.into_value(),
-                        Value::int(count, span),
-                        Value::float(quantile, span),
-                        Value::string(percentage, span),
-                        Value::string(freq, span),
-                    ],
-                ),
+                record! {
+                    value_column_name => val.into_value(),
+                    "count" => Value::int(count, span),
+                    "quantile" => Value::float(quantile, span),
+                    "percentage" => Value::string(percentage, span),
+                    freq_column => Value::string(freq, span),
+                },
                 span,
             ),
         ));
     }
-    result.sort_by(|a, b| b.0.cmp(&a.0));
+    result.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     Value::list(result.into_iter().map(|x| x.1).collect(), span).into_pipeline_data()
 }
 
@@ -281,9 +296,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Histogram)
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Histogram)
     }
 }

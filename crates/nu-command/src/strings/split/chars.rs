@@ -1,15 +1,12 @@
-use crate::grapheme_flags;
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    Category, Example, PipelineData, ShellError, Signature, Span, Type, Value,
-};
+use crate::{grapheme_flags, grapheme_flags_const};
+use nu_engine::command_prelude::*;
+
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct SplitChars;
 
-impl Command for SubCommand {
+impl Command for SplitChars {
     fn name(&self) -> &str {
         "split chars"
     }
@@ -24,16 +21,20 @@ impl Command for SubCommand {
                 ),
             ])
             .allow_variants_without_examples(true)
-            .switch("grapheme-clusters", "split on grapheme clusters", Some('g'))
+            .switch(
+                "grapheme-clusters",
+                "Split on grapheme clusters.",
+                Some('g'),
+            )
             .switch(
                 "code-points",
-                "split on code points (default; splits combined characters)",
+                "Split on code points (default; splits combined characters).",
                 Some('c'),
             )
             .category(Category::Strings)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Split a string into a list of characters."
     }
 
@@ -41,10 +42,10 @@ impl Command for SubCommand {
         vec!["character", "separate", "divide"]
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Split the string into a list of characters",
+                description: "Split the string into a list of characters.",
                 example: "'hello' | split chars",
                 result: Some(Value::list(
                     vec![
@@ -58,7 +59,7 @@ impl Command for SubCommand {
                 )),
             },
             Example {
-                description: "Split on grapheme clusters",
+                description: "Split on grapheme clusters.",
                 example: "'🇯🇵ほげ' | split chars --grapheme-clusters",
                 result: Some(Value::list(
                     vec![
@@ -70,7 +71,7 @@ impl Command for SubCommand {
                 )),
             },
             Example {
-                description: "Split multiple strings into lists of characters",
+                description: "Split multiple strings into lists of characters.",
                 example: "['hello', 'world'] | split chars",
                 result: Some(Value::test_list(vec![
                     Value::test_list(vec![
@@ -92,6 +93,10 @@ impl Command for SubCommand {
         ]
     }
 
+    fn is_const(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
         engine_state: &EngineState,
@@ -99,22 +104,32 @@ impl Command for SubCommand {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        split_chars(engine_state, stack, call, input)
+        let graphemes = grapheme_flags(engine_state, stack, call)?;
+        split_chars(engine_state, call, input, graphemes)
+    }
+
+    fn run_const(
+        &self,
+        working_set: &StateWorkingSet,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let graphemes = grapheme_flags_const(working_set, stack, call)?;
+        split_chars(working_set.permanent(), call, input, graphemes)
     }
 }
 
 fn split_chars(
     engine_state: &EngineState,
-    stack: &mut Stack,
     call: &Call,
     input: PipelineData,
+    graphemes: bool,
 ) -> Result<PipelineData, ShellError> {
     let span = call.head;
-
-    let graphemes = grapheme_flags(engine_state, stack, call)?;
     input.map(
         move |x| split_chars_helper(&x, span, graphemes),
-        engine_state.ctrlc.clone(),
+        engine_state.signals(),
     )
 }
 
@@ -124,7 +139,7 @@ fn split_chars_helper(v: &Value, name: Span, graphemes: bool) -> Value {
         Value::Error { error, .. } => Value::error(*error.clone(), span),
         v => {
             let v_span = v.span();
-            if let Ok(s) = v.as_string() {
+            if let Ok(s) = v.as_str() {
                 Value::list(
                     if graphemes {
                         s.graphemes(true)
@@ -143,8 +158,9 @@ fn split_chars_helper(v: &Value, name: Span, graphemes: bool) -> Value {
                 )
             } else {
                 Value::error(
-                    ShellError::PipelineMismatch {
+                    ShellError::OnlySupportsThisInputType {
                         exp_input_type: "string".into(),
+                        wrong_type: v.get_type().to_string(),
                         dst_span: name,
                         src_span: v_span,
                     },
@@ -160,9 +176,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(SplitChars)
     }
 }

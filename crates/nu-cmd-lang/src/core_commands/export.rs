@@ -1,9 +1,5 @@
-use nu_engine::get_full_help;
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    Category, Example, IntoPipelineData, PipelineData, ShellError, Signature, Type, Value,
-};
+use nu_engine::{command_prelude::*, get_full_help};
+use nu_protocol::engine::CommandType;
 
 #[derive(Clone)]
 pub struct ExportCommand;
@@ -19,17 +15,17 @@ impl Command for ExportCommand {
             .category(Category::Core)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Export definitions or environment variables from a module."
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"This command is a parser keyword. For details, check:
-  https://www.nushell.sh/book/thinking_in_nu.html"#
+    fn extra_description(&self) -> &str {
+        "This command is a parser keyword. For details, check:
+  https://www.nushell.sh/book/thinking_in_nu.html"
     }
 
-    fn is_parser_keyword(&self) -> bool {
-        true
+    fn command_type(&self) -> CommandType {
+        CommandType::Keyword
     }
 
     fn run(
@@ -40,21 +36,15 @@ impl Command for ExportCommand {
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         Ok(Value::string(
-            get_full_help(
-                &ExportCommand.signature(),
-                &ExportCommand.examples(),
-                engine_state,
-                stack,
-                self.is_parser_keyword(),
-            ),
+            get_full_help(self, engine_state, stack, call.head),
             call.head,
         )
         .into_pipeline_data())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
-            description: "Export a definition from a module",
+            description: "Export a definition from a module.",
             example: r#"module utils { export def my-command [] { "hello" } }; use utils my-command; my-command"#,
             result: Some(Value::test_string("hello")),
         }]

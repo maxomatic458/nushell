@@ -6,20 +6,16 @@ mod snake_case;
 mod str_;
 mod title_case;
 
-pub use camel_case::SubCommand as StrCamelCase;
-pub use kebab_case::SubCommand as StrKebabCase;
-pub use pascal_case::SubCommand as StrPascalCase;
-pub use screaming_snake_case::SubCommand as StrScreamingSnakeCase;
-pub use snake_case::SubCommand as StrSnakeCase;
+pub use camel_case::StrCamelCase;
+pub use kebab_case::StrKebabCase;
+pub use pascal_case::StrPascalCase;
+pub use screaming_snake_case::StrScreamingSnakeCase;
+pub use snake_case::StrSnakeCase;
 pub use str_::Str;
-pub use title_case::SubCommand as StrTitleCase;
+pub use title_case::StrTitleCase;
 
-use nu_engine::CallExt;
-
-use nu_cmd_base::input_handler::{operate as general_operate, CmdArgument};
-use nu_protocol::ast::{Call, CellPath};
-use nu_protocol::engine::{EngineState, Stack};
-use nu_protocol::{PipelineData, ShellError, Span, Value};
+use nu_cmd_base::input_handler::{CmdArgument, operate as general_operate};
+use nu_engine::command_prelude::*;
 
 struct Arguments<F: Fn(&str) -> String + Send + Sync + 'static> {
     case_operation: &'static F,
@@ -48,7 +44,7 @@ where
         case_operation,
         cell_paths,
     };
-    general_operate(action, args, input, call.head, engine_state.ctrlc.clone())
+    general_operate(action, args, input, call.head, engine_state.signals())
 }
 
 fn action<F>(input: &Value, args: &Arguments<F>, head: Span) -> Value

@@ -1,7 +1,4 @@
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{Category, Example, PipelineData, ShellError, Signature, SyntaxShape, Type};
+use nu_engine::{command_prelude::*, exit::cleanup};
 
 #[derive(Clone)]
 pub struct Exit;
@@ -19,10 +16,11 @@ impl Command for Exit {
                 SyntaxShape::Int,
                 "Exit code to return immediately with.",
             )
+            .switch("abort", "Exit by abort.", None)
             .category(Category::Shells)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Exit Nu."
     }
 
@@ -39,14 +37,29 @@ impl Command for Exit {
     ) -> Result<PipelineData, ShellError> {
         let exit_code: Option<i64> = call.opt(engine_state, stack, 0)?;
 
-        if let Some(exit_code) = exit_code {
-            std::process::exit(exit_code as i32);
-        }
+        let abort = call.has_flag(engine_state, stack, "abort")?;
+        let exit_code = exit_code.map_or(0, |it| it as i32);
 
-        std::process::exit(0);
+        if abort {
+            if cleanup((), engine_state).is_some() {
+                Ok(Value::nothing(call.head).into_pipeline_data())
+            } else {
+                Err(ShellError::Exit {
+                    code: exit_code,
+                    abort: true,
+                })
+            }
+        } else if cleanup((), engine_state).is_some() {
+            Ok(Value::nothing(call.head).into_pipeline_data())
+        } else {
+            Err(ShellError::Exit {
+                code: exit_code,
+                abort: false,
+            })
+        }
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
             description: "Exit the current shell",
             example: "exit",

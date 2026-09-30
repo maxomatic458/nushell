@@ -1,391 +1,542 @@
-use nu_test_support::nu;
+use nu_protocol::{Type, record};
+use nu_test_support::prelude::*;
 use pretty_assertions::assert_eq;
 use rstest::rstest;
 
-const MODULE_SETUP: &str = r#"
+const MODULE_SETUP: &str = "
     module spam {
         export const X = 'x'
         export module eggs {
             export const E = 'e'
             export module bacon {
                 export const viking = 'eats'
-                export module none {}
+                export module none {}; export use none
+            }; export use bacon
+        }; export use eggs
+    }
+";
+
+#[test]
+fn const_bool() -> Result {
+    let code = "
+        const x = false
+        $x
+    ";
+
+    test().run(code).expect_value_eq(false)
+}
+
+#[test]
+fn const_int() -> Result {
+    let code = "
+        const x = 10
+        $x
+    ";
+
+    test().run(code).expect_value_eq(10)
+}
+
+#[test]
+fn const_float() -> Result {
+    let code = "
+        const x = 1.234
+        $x
+    ";
+
+    test().run(code).expect_value_eq(1.234)
+}
+
+#[test]
+fn const_binary() -> Result {
+    let code = "
+        const x = 0x[12]
+        $x
+    ";
+
+    test().run(code).expect_value_eq(Value::test_binary([0x12]))
+}
+
+#[test]
+fn const_datetime() -> Result {
+    let code = "
+        const x = 2021-02-27T13:55:40+00:00
+        $x
+    ";
+
+    let outcome: Value = test().run(code)?;
+    let date = outcome.as_date()?.to_rfc3339();
+    assert_eq!(date, "2021-02-27T13:55:40+00:00");
+    Ok(())
+}
+
+#[test]
+fn const_list() -> Result {
+    let code = "
+        const x = [ a b c ]
+        $x
+    ";
+
+    test().run(code).expect_value_eq(["a", "b", "c"])
+}
+
+#[test]
+fn const_record() -> Result {
+    let code = "
+        const x = { a: 10, b: 20, c: 30 }
+        $x
+    ";
+
+    let expected = record! {
+        "a" => Value::test_int(10),
+        "b" => Value::test_int(20),
+        "c" => Value::test_int(30),
+    };
+
+    test().run(code).expect_value_eq(expected)
+}
+
+#[test]
+fn const_table() -> Result {
+    let code = "
+        const x = [[a b c]; [10 20 30] [100 200 300]]
+        $x | describe
+    ";
+
+    test()
+        .run(code)
+        .expect_value_eq("table<a: int, b: int, c: int>")
+}
+
+#[test]
+fn const_invalid_table() -> Result {
+    let code = "
+        const x = [[a b a]; [10 20 30] [100 200 300]]
+    ";
+
+    let err = test().run(code).expect_parse_error()?.to_string();
+    assert_contains("Record field or table column used twice: a", err);
+    Ok(())
+}
+
+#[test]
+fn const_string() -> Result {
+    let code = r#"
+        const x = "abc"
+        $x
+    "#;
+
+    test().run(code).expect_value_eq("abc")
+}
+
+#[test]
+fn const_string_interpolation_var() -> Result {
+    let code = r#"
+        const x = 2
+        const s = $"($x)"
+        $s
+    "#;
+
+    test().run(code).expect_value_eq("2")
+}
+
+#[test]
+fn const_string_interpolation_date() -> Result {
+    let code = r#"
+        const s = $"(2021-02-27T13:55:40+00:00)"
+        $s
+    "#;
+
+    let outcome: String = test().locale_en().run(code)?;
+    assert_contains("Sat, 27 Feb 2021 13:55:40 +0000", outcome);
+    Ok(())
+}
+
+#[test]
+#[env(NU_TEST_LOCALE_OVERRIDE = "en_US.UTF-8")]
+fn const_string_interpolation_filesize() -> Result {
+    let code = r#"
+        const s = $"(2kB)"
+        $s
+    "#;
+
+    test().run(code).expect_value_eq("2.0 kB")
+}
+
+#[test]
+fn const_nothing() -> Result {
+    let code = "
+      const x = null
+      $x | describe
+    ";
+
+    test().run(code).expect_value_eq("nothing")
+}
+
+#[rstest]
+#[case("const x = not false; $x", true)]
+#[case("const x = false; const y = not $x; $y", true)]
+#[case("const x = not false; const y = not $x; $y", false)]
+fn const_unary_operator(#[case] code: &str, #[case] expect: bool) -> Result {
+    test().run(code).expect_value_eq(expect)
+}
+
+#[rstest]
+#[case("const x = 1 + 2; $x", 3)]
+#[case("const x = 1 * 2; $x", 2)]
+#[case("const x = 4 / 2; $x", 2.0)]
+#[case("const x = 4 mod 3; $x", 1)]
+#[case("const x = 5.0 / 2.0; $x", 2.5)]
+#[case(r#"const x = "a" + "b"; $x"#, "ab")]
+#[case(r#"const x = "a" ++ "b"; $x"#, "ab")]
+#[case("const x = [1,2] ++ [3]; $x", [1_i64, 2, 3])]
+#[case("const x = 0x[1,2] ++ 0x[3]; $x", Value::test_binary([0x12_u8, 0x03]))]
+#[case("const x = 1 < 2; $x", true)]
+#[case("const x = (3 * 200) > (2 * 100); $x", true)]
+#[case("const x = (3 * 200) < (2 * 100); $x", false)]
+#[case("const x = (3 * 200) == (2 * 300); $x", true)]
+fn const_binary_operator(#[case] code: &str, #[case] expect: impl IntoValue) -> Result {
+    test().run(code).expect_value_eq(expect)
+}
+
+#[rstest]
+#[case("const x = 1 / 0; $x", "division by zero")]
+#[case("const x = 10 ** 10000000; $x", "pow operation overflowed")]
+#[case("const x = 2 ** 62 * 2; $x", "multiply operation overflowed")]
+#[case("const x = 1 ++ 0; $x", "operator does not work on values of type")]
+fn const_operator_error(#[case] code: &str, #[case] expect: &str) -> Result {
+    let err = test().run(code).expect_parse_error()?.to_string();
+    assert_contains(expect, err);
+    Ok(())
+}
+
+#[rstest]
+#[case("const x = (1..3); $x | math sum", 6)]
+#[case("const x = (1..3); $x | describe", "range")]
+fn const_range(#[case] code: &str, #[case] expect: impl IntoValue) -> Result {
+    test().run(code).expect_value_eq(expect)
+}
+
+#[test]
+fn const_subexpression_supported() -> Result {
+    let code = "
+        const x = ('spam')
+        $x
+    ";
+
+    test().run(code).expect_value_eq("spam")
+}
+
+#[test]
+fn const_command_supported() -> Result {
+    let code = "
+      const x = ('spam' | str length)
+      $x
+    ";
+
+    test().run(code).expect_value_eq(4)
+}
+
+#[test]
+fn const_command_unsupported() -> Result {
+    let code = "
+      const x = (loop { break })
+    ";
+
+    let outcome = test().run(code).expect_parse_error()?.to_string();
+    assert_contains("not_a_const_command", outcome);
+    Ok(())
+}
+
+#[test]
+fn const_in_scope() -> Result {
+    let code = "
+      do { const x = 'x'; $x }
+    ";
+
+    test().run(code).expect_value_eq("x")
+}
+
+#[test]
+fn not_a_const_help() -> Result {
+    let code = "const x = ('abc' | str length -h)";
+
+    let outcome = test().run(code).expect_parse_error()?.to_string();
+    assert_contains("not_a_const_help", outcome);
+    Ok(())
+}
+
+#[rstest]
+#[case("$spam.X", "x")]
+#[case("$spam.eggs.E", "e")]
+#[case("$spam.eggs.bacon.viking", "eats")]
+#[case("'none' in $spam.eggs.bacon", false)]
+fn complex_const_export(#[case] code: &str, #[case] expect: impl IntoValue) -> Result {
+    let mut tester = test();
+
+    let () = tester.run(MODULE_SETUP)?;
+    let () = tester.run("use spam")?;
+    tester.run(code).expect_value_eq(expect)
+}
+
+#[rstest]
+#[case("$X", "x")]
+#[case("$eggs.E", "e")]
+#[case("$eggs.bacon.viking", "eats")]
+#[case("'none' in $eggs.bacon", false)]
+fn complex_const_glob_export(#[case] code: &str, #[case] expect: impl IntoValue) -> Result {
+    let mut tester = test();
+
+    let () = tester.run(MODULE_SETUP)?;
+    let () = tester.run("use spam *")?;
+    tester.run(code).expect_value_eq(expect)
+}
+
+#[test]
+fn complex_const_drill_export() -> Result {
+    let mut tester = test();
+
+    let () = tester.run(MODULE_SETUP)?;
+    let () = tester.run("use spam eggs bacon none")?;
+    let err = tester.run("$none").expect_parse_error()?.to_string();
+    assert_contains("Variable not found", err);
+    Ok(())
+}
+
+#[test]
+fn complex_const_list_export() -> Result {
+    let mut tester = test();
+
+    let () = tester.run(MODULE_SETUP)?;
+    let () = tester.run("use spam [X eggs]")?;
+    tester
+        .run("[$X $eggs.E] | str join ''")
+        .expect_value_eq("xe")
+}
+
+#[test]
+fn exported_const_is_const() -> Result {
+    let code = "
+        module foo {
+            export def main [] { 'foo' }
+        }
+        module spam {
+            export const MOD_NAME = 'foo'
+        }
+
+        use spam
+        use $spam.MOD_NAME
+
+        foo
+    ";
+
+    test().run(code).expect_value_eq("foo")
+}
+
+#[rstest]
+#[case("$env.SPAM", "xy")]
+#[case("spam", "xy")]
+fn const_captures_work(#[case] code: &str, #[case] expect: impl IntoValue) -> Result {
+    let module = "
+        module spam {
+            export const X = 'x'
+            const Y = 'y'
+
+            export-env { $env.SPAM = $X + $Y }
+            export def main [] { $X + $Y }
+        }
+    ";
+
+    let mut tester = test();
+
+    let () = tester.run(module)?;
+    let () = tester.run("use spam")?;
+    tester.run(code).expect_value_eq(expect)
+}
+
+#[test]
+fn const_captures_in_closures_work() -> Result {
+    let code = "
+        module foo {
+            const a = 'world'
+            export def bar [] {
+                'hello ' + $a
             }
         }
-    }
-"#;
 
-#[test]
-fn const_bool() {
-    let inp = &["const x = false", "$x"];
+        use foo
 
-    let actual = nu!(&inp.join("; "));
+        do { foo bar }
+    ";
 
-    assert_eq!(actual.out, "false");
+    test().run(code).expect_value_eq("hello world")
+}
+
+#[rstest]
+#[case("$X", "x")]
+#[case("$eggs.E", "e")]
+#[case("$eggs.bacon.viking", "eats")]
+#[case("($eggs.bacon not-has 'none')", true)]
+fn complex_const_overlay_use(#[case] code: &str, #[case] expect: impl IntoValue) -> Result {
+    let mut tester = test();
+
+    let () = tester.run(MODULE_SETUP)?;
+    let () = tester.run("use spam *")?;
+    tester.run(code).expect_value_eq(expect)
 }
 
 #[test]
-fn const_int() {
-    let inp = &["const x = 10", "$x"];
+#[should_panic(expected = "Expected \"Variable not found.\", got \"Cannot hide default overlay.\"")]
+// #[ignore = "TODO: `overlay hide` should be possible to use after `overlay use` in the same source unit."]
+fn overlay_use_hide_in_single_source_unit() -> Result {
+    let mut tester = test();
 
-    let actual = nu!(&inp.join("; "));
-
-    assert_eq!(actual.out, "10");
-}
-
-#[test]
-fn const_float() {
-    let inp = &["const x = 1.234", "$x"];
-
-    let actual = nu!(&inp.join("; "));
-
-    assert_eq!(actual.out, "1.234");
-}
-
-#[test]
-fn const_binary() {
-    let inp = &["const x = 0x[12]", "$x"];
-
-    let actual = nu!(&inp.join("; "));
-
-    assert!(actual.out.contains("12"));
-}
-
-#[test]
-fn const_datetime() {
-    let inp = &["const x = 2021-02-27T13:55:40+00:00", "$x"];
-
-    let actual = nu!(&inp.join("; "));
-
-    assert!(actual.out.contains("Sat, 27 Feb 2021 13:55:40"));
-}
-
-#[test]
-fn const_list() {
-    let inp = &["const x = [ a b c ]", "$x | describe"];
-
-    let actual = nu!(&inp.join("; "));
-
-    assert_eq!(actual.out, "list<string>");
-}
-
-#[test]
-fn const_record() {
-    let inp = &["const x = { a: 10, b: 20, c: 30 }", "$x | describe"];
-
-    let actual = nu!(&inp.join("; "));
-
-    assert_eq!(actual.out, "record<a: int, b: int, c: int>");
-}
-
-#[test]
-fn const_table() {
-    let inp = &[
-        "const x = [[a b c]; [10 20 30] [100 200 300]]",
-        "$x | describe",
-    ];
-
-    let actual = nu!(&inp.join("; "));
-
-    assert_eq!(actual.out, "table<a: int, b: int, c: int>");
-}
-
-#[test]
-fn const_invalid_table() {
-    let inp = &["const x = [[a b a]; [10 20 30] [100 200 300]]"];
-
-    let actual = nu!(&inp.join("; "));
-
-    assert!(actual.err.contains("column_defined_twice"));
-}
-
-#[test]
-fn const_string() {
-    let inp = &[r#"const x = "abc""#, "$x"];
-
-    let actual = nu!(&inp.join("; "));
-
-    assert_eq!(actual.out, "abc");
-}
-
-#[test]
-fn const_string_interpolation() {
-    let actual = nu!(r#"
-        const x = 2
-        const s = $"var: ($x), date: (2021-02-27T13:55:40+00:00), file size: (2kb)"
-        $s
-    "#);
-    assert_eq!(
-        actual.out,
-        "var: 2, date: Sat, 27 Feb 2021 13:55:40 +0000 (2 years ago), file size: 2.0 KiB"
+    let () = tester.run(MODULE_SETUP)?;
+    let code = "
+        overlay use spam
+        overlay hide
+        $eggs
+    ";
+    let err = tester.run(code).expect_parse_error()?;
+    assert!(
+        matches!(err, ParseError::VariableNotFound(..)),
+        "Expected \"Variable not found.\", got \"{err}\""
     );
-}
 
-#[test]
-fn const_nothing() {
-    let inp = &["const x = null", "$x | describe"];
-
-    let actual = nu!(&inp.join("; "));
-
-    assert_eq!(actual.out, "nothing");
-}
-
-#[rstest]
-#[case(&["const x = not false", "$x"], "true")]
-#[case(&["const x = false", "const y = not $x", "$y"], "true")]
-#[case(&["const x = not false", "const y = not $x", "$y"], "false")]
-fn const_unary_operator(#[case] inp: &[&str], #[case] expect: &str) {
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, expect);
-}
-
-#[rstest]
-#[case(&["const x = 1 + 2", "$x"], "3")]
-#[case(&["const x = 1 * 2", "$x"], "2")]
-#[case(&["const x = 4 / 2", "$x"], "2")]
-#[case(&["const x = 4 mod 3", "$x"], "1")]
-#[case(&["const x = 5.0 / 2.0", "$x"], "2.5")]
-#[case(&[r#"const x = "a" + "b" "#, "$x"], "ab")]
-#[case(&[r#"const x = "a" ++ "b" "#, "$x"], "ab")]
-#[case(&[r#"const x = [1,2] ++ [3]"#, "$x | describe"], "list<int>")]
-#[case(&[r#"const x = 0x[1,2] ++ 0x[3]"#, "$x | describe"], "binary")]
-#[case(&[r#"const x = 0x[1,2] ++ [3]"#, "$x | describe"], "list<any>")]
-#[case(&["const x = 1 < 2", "$x"], "true")]
-#[case(&["const x = (3 * 200) > (2 * 100)", "$x"], "true")]
-#[case(&["const x = (3 * 200) < (2 * 100)", "$x"], "false")]
-#[case(&["const x = (3 * 200) == (2 * 300)", "$x"], "true")]
-fn const_binary_operator(#[case] inp: &[&str], #[case] expect: &str) {
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, expect);
-}
-
-#[rstest]
-#[case(&["const x = 1 / 0", "$x"], "division by zero")]
-#[case(&["const x = 10 ** 10000000", "$x"], "pow operation overflowed")]
-#[case(&["const x = 2 ** 62 * 2", "$x"], "multiply operation overflowed")]
-#[case(&["const x = 1 ++ 0", "$x"], "doesn't support this value")]
-fn const_operator_error(#[case] inp: &[&str], #[case] expect: &str) {
-    let actual = nu!(&inp.join("; "));
-    assert!(actual.err.contains(expect));
-}
-
-#[rstest]
-#[case(&["const x = (1..3)", "$x | math sum"], "6")]
-#[case(&["const x = (1..3)", "$x | describe"], "range")]
-fn const_range(#[case] inp: &[&str], #[case] expect: &str) {
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, expect);
-}
-
-#[test]
-fn const_subexpression_supported() {
-    let inp = &["const x = ('spam')", "$x"];
-
-    let actual = nu!(&inp.join("; "));
-
-    assert_eq!(actual.out, "spam");
-}
-
-#[test]
-fn const_command_supported() {
-    let inp = &["const x = ('spam' | str length)", "$x"];
-
-    let actual = nu!(&inp.join("; "));
-
-    assert_eq!(actual.out, "4");
-}
-
-#[test]
-fn const_command_unsupported() {
-    let inp = &["const x = (loop { break })"];
-
-    let actual = nu!(&inp.join("; "));
-
-    assert!(actual.err.contains("not_a_const_command"));
-}
-
-#[test]
-fn const_in_scope() {
-    let inp = &["do { const x = 'x'; $x }"];
-
-    let actual = nu!(&inp.join("; "));
-
-    assert_eq!(actual.out, "x");
-}
-
-#[test]
-fn not_a_const_help() {
-    let actual = nu!("const x = ('abc' | str length -h)");
-    assert!(actual.err.contains("not_a_const_help"));
-}
-
-#[test]
-fn complex_const_export() {
-    let inp = &[MODULE_SETUP, "use spam", "$spam.X"];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "x");
-
-    let inp = &[MODULE_SETUP, "use spam", "$spam.eggs.E"];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "e");
-
-    let inp = &[MODULE_SETUP, "use spam", "$spam.eggs.bacon.viking"];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "eats");
-
-    let inp = &[
-        MODULE_SETUP,
-        "use spam",
-        "($spam.eggs.bacon.none | is-empty)",
-    ];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "true");
-}
-
-#[test]
-fn complex_const_glob_export() {
-    let inp = &[MODULE_SETUP, "use spam *", "$X"];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "x");
-
-    let inp = &[MODULE_SETUP, "use spam *", "$eggs.E"];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "e");
-
-    let inp = &[MODULE_SETUP, "use spam *", "$eggs.bacon.viking"];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "eats");
-
-    let inp = &[MODULE_SETUP, "use spam *", "($eggs.bacon.none | is-empty)"];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "true");
-}
-
-#[test]
-fn complex_const_drill_export() {
-    let inp = &[
-        MODULE_SETUP,
-        "use spam eggs bacon none",
-        "($none | is-empty)",
-    ];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "true");
-}
-
-#[test]
-fn complex_const_list_export() {
-    let inp = &[
-        MODULE_SETUP,
-        "use spam [X eggs]",
-        "[$X $eggs.E] | str join ''",
-    ];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "xe");
-}
-
-#[test]
-fn exported_const_is_const() {
-    let module1 = "module foo {
-        export def main [] { 'foo' }
-    }";
-
-    let module2 = "module spam {
-        export const MOD_NAME = 'foo'
-    }";
-
-    let inp = &[module1, module2, "use spam", "use $spam.MOD_NAME", "foo"];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "foo");
-}
-
-#[test]
-fn const_captures_work() {
-    let module = "module spam {
-        export const X = 'x'
-        const Y = 'y'
-
-        export-env { $env.SPAM = $X + $Y }
-        export def main [] { $X + $Y }
-    }";
-
-    let inp = &[module, "use spam", "$env.SPAM"];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "xy");
-
-    let inp = &[module, "use spam", "spam"];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "xy");
-}
-
-#[test]
-fn const_captures_in_closures_work() {
-    let module = "module foo {
-        const a = 'world'
-        export def bar [] {
-            'hello ' + $a
-        }
-    }";
-    let inp = &[module, "use foo", "do { foo bar }"];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "hello world");
-}
-
-#[ignore = "TODO: Need to fix `overlay hide` to hide the constants brough by `overlay use`"]
-#[test]
-fn complex_const_overlay_use_hide() {
-    let inp = &[MODULE_SETUP, "overlay use spam", "$X"];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "x");
-
-    let inp = &[MODULE_SETUP, "overlay use spam", "$eggs.E"];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "e");
-
-    let inp = &[MODULE_SETUP, "overlay use spam", "$eggs.bacon.viking"];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "eats");
-
-    let inp = &[
-        MODULE_SETUP,
-        "overlay use spam",
-        "($eggs.bacon.none | is-empty)",
-    ];
-    let actual = nu!(&inp.join("; "));
-    assert_eq!(actual.out, "true");
-
-    let inp = &[MODULE_SETUP, "overlay use spam", "overlay hide", "$eggs"];
-    let actual = nu!(&inp.join("; "));
-    assert!(actual.err.contains("nu::parser::variable_not_found"));
+    Ok(())
 }
 
 // const implementations of commands without dedicated tests
 #[test]
-fn describe_const() {
-    let actual = nu!("const x = ('abc' | describe); $x");
-    assert_eq!(actual.out, "string");
+fn describe_const() -> Result {
+    let code = "
+        const x = 'abc' | describe
+        $x
+    ";
+
+    test().run(code).expect_value_eq("string")
 }
 
 #[test]
-fn ignore_const() {
-    let actual = nu!(r#"const x = ("spam" | ignore); $x == null"#);
-    assert_eq!(actual.out, "true");
+fn ignore_const() -> Result {
+    let code = r#"
+        const x = "spam" | ignore
+        $x
+    "#;
+
+    test().run(code).expect_value_eq(())
 }
 
 #[test]
-fn version_const() {
-    let actual = nu!("const x = (version); $x");
-    assert!(actual.err.is_empty());
+fn version_const() -> Result {
+    let code = "
+        const x = version
+        $x
+    ";
+
+    let _: Value = test().run(code)?;
+    Ok(())
+}
+
+#[rstest]
+#[case("const x = (if 2 < 3 { 'yes!' }); $x", "yes!")]
+#[case("const x = (if 5 < 3 { 'yes!' } else { 'no!' }); $x", "no!")]
+#[case(
+    "const x = (if 5 < 3 { 'yes!' } else if 4 < 5 { 'no!' } else { 'okay!' }); $x",
+    "no!"
+)]
+fn if_const(#[case] code: &str, #[case] expect: impl IntoValue) -> Result {
+    test().run(code).expect_value_eq(expect)
 }
 
 #[test]
-fn if_const() {
-    let actual = nu!("const x = (if 2 < 3 { 'yes!' }); $x");
-    assert_eq!(actual.out, "yes!");
+fn if_const_error() -> Result {
+    let err = test().run("const x = if true ()").expect_parse_error()?;
+    assert!(matches!(
+        err,
+        ParseError::TypeMismatch(Type::Block, Type::Nothing, _)
+            | ParseError::TypeMismatchHelp(Type::Block, Type::Nothing, _, _)
+    ));
 
-    let actual = nu!("const x = (if 5 < 3 { 'yes!' } else { 'no!' }); $x");
-    assert_eq!(actual.out, "no!");
+    let err = test()
+        .run("const x = if true {foo: bar}")
+        .expect_parse_error()?;
+    assert!(matches!(
+        err,
+        ParseError::TypeMismatch(Type::Block, Type::Record(_), _)
+            | ParseError::TypeMismatchHelp(Type::Block, Type::Record(_), _, _)
+    ));
 
-    let actual =
-        nu!("const x = (if 5 < 3 { 'yes!' } else if 4 < 5 { 'no!' } else { 'okay!' }); $x");
-    assert_eq!(actual.out, "no!");
+    let err = test()
+        .run("const x = if true {1: 2}")
+        .expect_parse_error()?;
+    assert!(matches!(
+        err,
+        ParseError::TypeMismatch(Type::Block, Type::Record(_), _)
+            | ParseError::TypeMismatchHelp(Type::Block, Type::Record(_), _, _)
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn const_glob_type() -> Result {
+    let code = "
+        const x: glob = 'aa'
+        $x | describe
+    ";
+
+    test().run(code).expect_value_eq("glob")
+}
+
+#[rstest]
+#[case(
+    r####"const x = r#'abcde""fghi"''''jkl'#; $x"####,
+    r####"abcde""fghi"''''jkl"####
+)]
+#[case(
+    r####"const x = r##'abcde""fghi"''''#jkl'##; $x"####,
+    r####"abcde""fghi"''''#jkl"####
+)]
+#[case(
+    r####"const x = r###'abcde""fghi"'''##'#jkl'###; $x"####,
+    r####"abcde""fghi"'''##'#jkl"####
+)]
+#[case("const x = r#'abc'#; $x", "abc")]
+fn const_raw_string(#[case] code: &str, #[case] expect: &str) -> Result {
+    test().run(code).expect_value_eq(expect)
+}
+
+#[test]
+fn const_takes_pipeline() -> Result {
+    let code = "
+        const list = 'bar_baz_quux' | split row '_'
+        $list | length
+    ";
+
+    test().run(code).expect_value_eq(3)
+}
+
+#[test]
+fn const_const() -> Result {
+    let code = r#"
+        const y = (
+            const x = "foo";
+            $x + $x
+        )
+        $y
+    "#;
+
+    test().run(code).expect_value_eq("foofoo")?;
+
+    let code = r#"
+        const y = (
+            const x = "foo";
+            $x + $x
+        )
+        $x
+    "#;
+    let err = test().run(code).expect_parse_error()?;
+    assert!(matches!(err, ParseError::VariableNotFound(..)));
+
+    Ok(())
 }

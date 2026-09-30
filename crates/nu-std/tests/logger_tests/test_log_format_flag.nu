@@ -1,4 +1,7 @@
+use std/testing *
 use std *
+use std/log *
+use std/assert
 use commons.nu *
 
 def run-command [
@@ -6,15 +9,23 @@ def run-command [
     message_level,
     message,
     --format: string,
+    --context :record
     --short
 ] {
-    do {
-        if $short {
-            ^$nu.current-exe --commands $'use std; NU_LOG_LEVEL=($system_level) std log ($message_level) --format "($format)" --short "($message)"'
-        } else {
-            ^$nu.current-exe --commands $'use std; NU_LOG_LEVEL=($system_level) std log ($message_level) --format "($format)" "($message)"'
-        }
-    } | complete | get --ignore-errors stderr
+    mut args = []
+
+    if $short {
+      $args = $args | append ["--short"]
+    }
+
+    if $context != null {
+      $args = $args | append ["--context" ($context | to nuon)]
+    }
+
+    let args = $args | str join ' '
+
+    ^$nu.current-exe --no-config-file --commands $'use std; use std/log; NU_LOG_LEVEL=($system_level) log ($message_level) --format "($format)" ($args) "($message)"'
+    | complete | get --optional stderr
 }
 
 
@@ -22,24 +33,35 @@ def "assert formatted" [
     message: string,
     format: string,
     command_level: string
+    --context :record
     --short
 ] {
-    let output = (run-command "debug" $command_level $message --format $format)
+
     let prefix = if $short {
-            ($env.LOG_SHORT_PREFIX | get ($command_level | str upcase))
+            (log-short-prefix | get ($command_level | str uppercase))
         } else {
-            ($env.LOG_PREFIX | get ($command_level | str upcase))
+            (log-prefix | get ($command_level | str uppercase))
         }
     let ansi = if $short {
-            ($env.LOG_ANSI | get ($command_level | str upcase))
+            (log-ansi | get ($command_level | str uppercase))
         } else {
-            ($env.LOG_ANSI | get ($command_level | str upcase))
+            (log-ansi | get ($command_level | str uppercase))
         }
 
-    assert equal ($output | str trim --right) (format-message $message $format $prefix $ansi)
+    let output = if ($context | is-empty) {
+      (run-command "debug" $command_level $message --format $format)
+    } else {
+      (run-command "debug" $command_level $message --context $context --format $format)
+    }
+
+    if $context == null {
+      assert equal ($output | str trim --right) (format-message $message $format $prefix $ansi)
+    } else {
+      assert equal ($output | str trim --right) (format-message --context $context $message $format $prefix $ansi)
+    }
 }
 
-#[test]
+@test
 def format_flag [] {
     assert formatted "test" "25 %MSG% %ANSI_START% %LEVEL%%ANSI_STOP%" critical
     assert formatted "test" "25 %MSG% %ANSI_START% %LEVEL%%ANSI_STOP%" error
@@ -51,4 +73,9 @@ def format_flag [] {
     assert formatted --short "test" "TEST %ANSI_START% %MSG%%ANSI_STOP%" warning
     assert formatted --short "test" "TEST %ANSI_START% %MSG%%ANSI_STOP%" info
     assert formatted --short "test" "TEST %ANSI_START% %MSG%%ANSI_STOP%" debug
+    assert formatted "test" --context {var: value} "TEST %ANSI_START% %MSG%%ANSI_STOP%" critical
+    assert formatted "test" --context {var: value} "TEST %ANSI_START% %MSG%%ANSI_STOP%" error
+    assert formatted "test" --context {var: value} "TEST %ANSI_START% %MSG%%ANSI_STOP%" warning
+    assert formatted "test" --context {var: value} "TEST %ANSI_START% %MSG%%ANSI_STOP%" info
+    assert formatted "test" --context {var: value} "TEST %ANSI_START% %MSG%%ANSI_STOP%" debug
 }

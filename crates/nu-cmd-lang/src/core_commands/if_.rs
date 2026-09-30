@@ -1,10 +1,5 @@
-use nu_engine::{eval_block, eval_expression, eval_expression_with_input, CallExt};
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Block, Command, EngineState, Stack, StateWorkingSet};
-use nu_protocol::eval_const::{eval_const_subexpression, eval_constant, eval_constant_with_input};
-use nu_protocol::{
-    Category, Example, PipelineData, ShellError, Signature, SyntaxShape, Type, Value,
-};
+use nu_engine::command_prelude::*;
+use nu_protocol::engine::CommandType;
 
 #[derive(Clone)]
 pub struct If;
@@ -14,7 +9,7 @@ impl Command for If {
         "if"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Conditionally run a block."
     }
 
@@ -41,145 +36,67 @@ impl Command for If {
             .category(Category::Core)
     }
 
+    fn extra_description(&self) -> &str {
+        "This command is a parser keyword. For details, check:
+  https://www.nushell.sh/book/thinking_in_nu.html"
+    }
+
+    fn command_type(&self) -> CommandType {
+        CommandType::Keyword
+    }
+
     fn is_const(&self) -> bool {
         true
     }
 
     fn run_const(
         &self,
-        working_set: &StateWorkingSet,
+        _working_set: &StateWorkingSet,
+        _stack: &mut Stack,
         call: &Call,
-        input: PipelineData,
+        _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let cond = call.positional_nth(0).expect("checked through parser");
-        let then_block: Block = call.req_const(working_set, 1)?;
-        let else_case = call.positional_nth(2);
-
-        let result = eval_constant(working_set, cond)?;
-        match &result {
-            Value::Bool { val, .. } => {
-                if *val {
-                    let block = working_set.get_block(then_block.block_id);
-                    eval_const_subexpression(
-                        working_set,
-                        block,
-                        input,
-                        block.span.unwrap_or(call.head),
-                    )
-                } else if let Some(else_case) = else_case {
-                    if let Some(else_expr) = else_case.as_keyword() {
-                        if let Some(block_id) = else_expr.as_block() {
-                            let block = working_set.get_block(block_id);
-                            eval_const_subexpression(
-                                working_set,
-                                block,
-                                input,
-                                block.span.unwrap_or(call.head),
-                            )
-                        } else {
-                            eval_constant_with_input(working_set, else_expr, input)
-                        }
-                    } else {
-                        eval_constant_with_input(working_set, else_case, input)
-                    }
-                } else {
-                    Ok(PipelineData::empty())
-                }
-            }
-            x => Err(ShellError::CantConvert {
-                to_type: "bool".into(),
-                from_type: x.get_type().to_string(),
-                span: result.span(),
-                help: None,
-            }),
-        }
+        // Unreachable: const `if` is dispatched through `eval_const_if`, not `run_const`.
+        Err(ShellError::NushellFailedSpanned {
+            msg: "const `if` must be evaluated via eval_const_if".into(),
+            label: "internal error: unexpected const if run_const".into(),
+            span: call.head,
+        })
     }
 
     fn run(
         &self,
-        engine_state: &EngineState,
-        stack: &mut Stack,
-        call: &Call,
-        input: PipelineData,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        _call: &Call,
+        _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let cond = call.positional_nth(0).expect("checked through parser");
-        let then_block: Block = call.req(engine_state, stack, 1)?;
-        let else_case = call.positional_nth(2);
-
-        let result = eval_expression(engine_state, stack, cond)?;
-        match &result {
-            Value::Bool { val, .. } => {
-                if *val {
-                    let block = engine_state.get_block(then_block.block_id);
-                    eval_block(
-                        engine_state,
-                        stack,
-                        block,
-                        input,
-                        call.redirect_stdout,
-                        call.redirect_stderr,
-                    )
-                } else if let Some(else_case) = else_case {
-                    if let Some(else_expr) = else_case.as_keyword() {
-                        if let Some(block_id) = else_expr.as_block() {
-                            let block = engine_state.get_block(block_id);
-                            eval_block(
-                                engine_state,
-                                stack,
-                                block,
-                                input,
-                                call.redirect_stdout,
-                                call.redirect_stderr,
-                            )
-                        } else {
-                            eval_expression_with_input(
-                                engine_state,
-                                stack,
-                                else_expr,
-                                input,
-                                call.redirect_stdout,
-                                call.redirect_stderr,
-                            )
-                            .map(|res| res.0)
-                        }
-                    } else {
-                        eval_expression_with_input(
-                            engine_state,
-                            stack,
-                            else_case,
-                            input,
-                            call.redirect_stdout,
-                            call.redirect_stderr,
-                        )
-                        .map(|res| res.0)
-                    }
-                } else {
-                    Ok(PipelineData::empty())
-                }
-            }
-            x => Err(ShellError::CantConvert {
-                to_type: "bool".into(),
-                from_type: x.get_type().to_string(),
-                span: result.span(),
-                help: None,
-            }),
-        }
+        // This is compiled specially by the IR compiler. The code here is never used when
+        // running in IR mode.
+        eprintln!(
+            "Tried to execute 'run' for the 'if' command: this code path should never be reached in IR mode"
+        );
+        unreachable!()
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn search_terms(&self) -> Vec<&str> {
+        vec!["else", "conditional"]
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Output a value if a condition matches, otherwise return nothing",
+                description: "Output a value if a condition matches, otherwise return nothing.",
                 example: "if 2 < 3 { 'yes!' }",
                 result: Some(Value::test_string("yes!")),
             },
             Example {
-                description: "Output a value if a condition matches, else return another value",
+                description: "Output a value if a condition matches, else return another value.",
                 example: "if 5 < 3 { 'yes!' } else { 'no!' }",
                 result: Some(Value::test_string("no!")),
             },
             Example {
-                description: "Chain multiple if's together",
+                description: "Chain multiple if's together.",
                 example: "if 5 < 3 { 'yes!' } else if 4 < 5 { 'no!' } else { 'okay!' }",
                 result: Some(Value::test_string("no!")),
             },
@@ -192,9 +109,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(If {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(If)
     }
 }

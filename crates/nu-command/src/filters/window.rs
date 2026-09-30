@@ -1,10 +1,6 @@
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, IntoInterruptiblePipelineData, PipelineData, ShellError, Signature, Span,
-    Spanned, SyntaxShape, Type, Value,
-};
+use nu_engine::command_prelude::*;
+use nu_protocol::ListStream;
+use std::num::NonZeroUsize;
 
 #[derive(Clone)]
 pub struct Window;
@@ -17,94 +13,63 @@ impl Command for Window {
     fn signature(&self) -> Signature {
         Signature::build("window")
             .input_output_types(vec![(
-                Type::List(Box::new(Type::Any)),
-                Type::List(Box::new(Type::List(Box::new(Type::Any)))),
+                Type::list(Type::Any),
+                Type::list(Type::list(Type::Any)),
             )])
             .required("window_size", SyntaxShape::Int, "The size of each window.")
             .named(
                 "stride",
                 SyntaxShape::Int,
-                "the number of rows to slide over between windows",
+                "The number of rows to slide over between windows.",
                 Some('s'),
             )
             .switch(
                 "remainder",
-                "yield last chunks even if they have fewer elements than size",
+                "Yield last chunks even if they have fewer elements than size.",
                 Some('r'),
             )
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Creates a sliding window of `window_size` that slide by n rows/elements across input."
     }
 
-    fn examples(&self) -> Vec<Example> {
-        let stream_test_1 = vec![
-            Value::list(
-                vec![Value::test_int(1), Value::test_int(2)],
-                Span::test_data(),
-            ),
-            Value::list(
-                vec![Value::test_int(2), Value::test_int(3)],
-                Span::test_data(),
-            ),
-            Value::list(
-                vec![Value::test_int(3), Value::test_int(4)],
-                Span::test_data(),
-            ),
-        ];
+    fn extra_description(&self) -> &str {
+        "This command will error if `window_size` or `stride` are negative or zero."
+    }
 
-        let stream_test_2 = vec![
-            Value::list(
-                vec![Value::test_int(1), Value::test_int(2)],
-                Span::test_data(),
-            ),
-            Value::list(
-                vec![Value::test_int(4), Value::test_int(5)],
-                Span::test_data(),
-            ),
-            Value::list(
-                vec![Value::test_int(7), Value::test_int(8)],
-                Span::test_data(),
-            ),
-        ];
-
-        let stream_test_3 = vec![
-            Value::list(
-                vec![Value::test_int(1), Value::test_int(2), Value::test_int(3)],
-                Span::test_data(),
-            ),
-            Value::list(
-                vec![Value::test_int(4), Value::test_int(5)],
-                Span::test_data(),
-            ),
-        ];
-
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 example: "[1 2 3 4] | window 2",
-                description: "A sliding window of two elements",
-                result: Some(Value::list(
-                    stream_test_1,
-                    Span::test_data(),
-                )),
+                description: "A sliding window of two elements.",
+                result: Some(Value::test_list(vec![
+                    Value::test_list(vec![Value::test_int(1), Value::test_int(2)]),
+                    Value::test_list(vec![Value::test_int(2), Value::test_int(3)]),
+                    Value::test_list(vec![Value::test_int(3), Value::test_int(4)]),
+                ])),
             },
             Example {
                 example: "[1, 2, 3, 4, 5, 6, 7, 8] | window 2 --stride 3",
-                description: "A sliding window of two elements, with a stride of 3",
-                result: Some(Value::list(
-                    stream_test_2,
-                    Span::test_data(),
-                )),
+                description: "A sliding window of two elements, with a stride of 3.",
+                result: Some(Value::test_list(vec![
+                    Value::test_list(vec![Value::test_int(1), Value::test_int(2)]),
+                    Value::test_list(vec![Value::test_int(4), Value::test_int(5)]),
+                    Value::test_list(vec![Value::test_int(7), Value::test_int(8)]),
+                ])),
             },
             Example {
                 example: "[1, 2, 3, 4, 5] | window 3 --stride 3 --remainder",
-                description: "A sliding window of equal stride that includes remainder. Equivalent to chunking",
-                result: Some(Value::list(
-                    stream_test_3,
-                    Span::test_data(),
-                )),
+                description: "A sliding window of equal stride that includes remainder. Equivalent to chunking.",
+                result: Some(Value::test_list(vec![
+                    Value::test_list(vec![
+                        Value::test_int(1),
+                        Value::test_int(2),
+                        Value::test_int(3),
+                    ]),
+                    Value::test_list(vec![Value::test_int(4), Value::test_int(5)]),
+                ])),
             },
         ]
     }
@@ -116,113 +81,157 @@ impl Command for Window {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let group_size: Spanned<usize> = call.req(engine_state, stack, 0)?;
-        let ctrlc = engine_state.ctrlc.clone();
-        let metadata = input.metadata();
-        let stride: Option<usize> = call.get_flag(engine_state, stack, "stride")?;
-        let remainder = call.has_flag(engine_state, stack, "remainder")?;
+        let input = input.into_stream_or_original(engine_state);
+        let head = call.head;
 
-        let stride = stride.unwrap_or(1);
-
-        //FIXME: add in support for external redirection when engine-q supports it generally
-
-        let each_group_iterator = EachWindowIterator {
-            group_size: group_size.item,
-            input: Box::new(input.into_iter()),
-            span: call.head,
-            previous: None,
-            stride,
-            remainder,
+        let fix_call_span = |err: ShellError| match err {
+            ShellError::IncorrectValue { msg, val_span, .. } => ShellError::IncorrectValue {
+                msg,
+                val_span,
+                call_span: call.head,
+            },
+            _ => err,
         };
 
-        Ok(each_group_iterator.into_pipeline_data_with_metadata(metadata, ctrlc))
+        let size: NonZeroUsize = call.req(engine_state, stack, 0).map_err(fix_call_span)?;
+        let stride: NonZeroUsize = call
+            .get_flag(engine_state, stack, "stride")
+            .map_err(fix_call_span)?
+            .unwrap_or(NonZeroUsize::MIN);
+        let remainder = call.has_flag(engine_state, stack, "remainder")?;
+
+        if remainder && size == stride {
+            super::chunks::chunks(engine_state, input, size, head, false)
+        } else if stride >= size {
+            match input {
+                PipelineData::Value(Value::List { vals, .. }, metadata) => {
+                    let chunks = WindowGapIter::new(vals, size, stride, remainder, head);
+                    let stream = ListStream::new(chunks, head, engine_state.signals().clone());
+                    Ok(PipelineData::list_stream(stream, metadata))
+                }
+                PipelineData::ListStream(stream, metadata) => {
+                    let stream = stream
+                        .modify(|iter| WindowGapIter::new(iter, size, stride, remainder, head));
+                    Ok(PipelineData::list_stream(stream, metadata))
+                }
+                input => Err(input.unsupported_input_error("list", head)),
+            }
+        } else {
+            match input {
+                PipelineData::Value(Value::List { vals, .. }, metadata) => {
+                    let chunks = WindowOverlapIter::new(vals, size, stride, remainder, head);
+                    let stream = ListStream::new(chunks, head, engine_state.signals().clone());
+                    Ok(PipelineData::list_stream(stream, metadata))
+                }
+                PipelineData::ListStream(stream, metadata) => {
+                    let stream = stream
+                        .modify(|iter| WindowOverlapIter::new(iter, size, stride, remainder, head));
+                    Ok(PipelineData::list_stream(stream, metadata))
+                }
+                input => Err(input.unsupported_input_error("list", head)),
+            }
+        }
     }
 }
 
-struct EachWindowIterator {
-    group_size: usize,
-    input: Box<dyn Iterator<Item = Value> + Send>,
-    span: Span,
-    previous: Option<Vec<Value>>,
+struct WindowOverlapIter<I: Iterator<Item = Value>> {
+    iter: I,
+    window: Vec<Value>,
     stride: usize,
     remainder: bool,
+    span: Span,
 }
 
-impl Iterator for EachWindowIterator {
+impl<I: Iterator<Item = Value>> WindowOverlapIter<I> {
+    fn new(
+        iter: impl IntoIterator<IntoIter = I>,
+        size: NonZeroUsize,
+        stride: NonZeroUsize,
+        remainder: bool,
+        span: Span,
+    ) -> Self {
+        Self {
+            iter: iter.into_iter(),
+            window: Vec::with_capacity(size.into()),
+            stride: stride.into(),
+            remainder,
+            span,
+        }
+    }
+}
+
+impl<I: Iterator<Item = Value>> Iterator for WindowOverlapIter<I> {
     type Item = Value;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut group = self.previous.take().unwrap_or_else(|| {
-            let mut vec = Vec::new();
-
-            // We default to a Vec of capacity size + stride as striding pushes n extra elements to the end
-            vec.try_reserve(self.group_size + self.stride).ok();
-
-            vec
-        });
-        let mut current_count = 0;
-
-        if group.is_empty() {
-            loop {
-                let item = self.input.next();
-
-                match item {
-                    Some(v) => {
-                        group.push(v);
-
-                        current_count += 1;
-                        if current_count >= self.group_size {
-                            break;
-                        }
-                    }
-                    None => {
-                        if self.remainder {
-                            break;
-                        } else {
-                            return None;
-                        }
-                    }
-                }
-            }
+        let len = if self.window.is_empty() {
+            self.window.capacity()
         } else {
-            // our historic buffer is already full, so stride instead
+            self.stride
+        };
 
-            loop {
-                let item = self.input.next();
+        self.window.extend((&mut self.iter).take(len));
 
-                match item {
-                    Some(v) => {
-                        group.push(v);
-
-                        current_count += 1;
-                        if current_count >= self.stride {
-                            break;
-                        }
-                    }
-                    None => {
-                        if self.remainder {
-                            break;
-                        } else {
-                            return None;
-                        }
-                    }
-                }
-            }
-
-            // We now have elements + stride in our group, and need to
-            // drop the skipped elements. Drain to preserve allocation and capacity
-            // Dropping this iterator consumes it.
-            group.drain(..self.stride.min(group.len()));
+        if self.window.len() == self.window.capacity()
+            || (self.remainder && !self.window.is_empty())
+        {
+            let mut next = Vec::with_capacity(self.window.len());
+            next.extend(self.window.iter().skip(self.stride).cloned());
+            let window = std::mem::replace(&mut self.window, next);
+            Some(Value::list(window, self.span))
+        } else {
+            None
         }
+    }
+}
 
-        if group.is_empty() {
-            return None;
+struct WindowGapIter<I: Iterator<Item = Value>> {
+    iter: I,
+    size: usize,
+    skip: usize,
+    first: bool,
+    remainder: bool,
+    span: Span,
+}
+
+impl<I: Iterator<Item = Value>> WindowGapIter<I> {
+    fn new(
+        iter: impl IntoIterator<IntoIter = I>,
+        size: NonZeroUsize,
+        stride: NonZeroUsize,
+        remainder: bool,
+        span: Span,
+    ) -> Self {
+        let size = size.into();
+        Self {
+            iter: iter.into_iter(),
+            size,
+            skip: stride.get() - size,
+            first: true,
+            remainder,
+            span,
         }
+    }
+}
 
-        let return_group = group.clone();
-        self.previous = Some(group);
+impl<I: Iterator<Item = Value>> Iterator for WindowGapIter<I> {
+    type Item = Value;
 
-        Some(Value::list(return_group, self.span))
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut window = Vec::with_capacity(self.size);
+        window.extend(
+            (&mut self.iter)
+                .skip(if self.first { 0 } else { self.skip })
+                .take(self.size),
+        );
+
+        self.first = false;
+
+        if window.len() == self.size || (self.remainder && !window.is_empty()) {
+            Some(Value::list(window, self.span))
+        } else {
+            None
+        }
     }
 }
 
@@ -231,9 +240,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Window {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Window)
     }
 }

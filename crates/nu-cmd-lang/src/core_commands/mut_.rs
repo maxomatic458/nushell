@@ -1,7 +1,5 @@
-use nu_engine::eval_block;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{Category, Example, PipelineData, ShellError, Signature, SyntaxShape, Type};
+use nu_engine::command_prelude::*;
+use nu_protocol::engine::CommandType;
 
 #[derive(Clone)]
 pub struct Mut;
@@ -11,7 +9,7 @@ impl Command for Mut {
         "mut"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Create a mutable variable and give it a value."
     }
 
@@ -19,7 +17,11 @@ impl Command for Mut {
         Signature::build("mut")
             .input_output_types(vec![(Type::Any, Type::Nothing)])
             .allow_variants_without_examples(true)
-            .required("var_name", SyntaxShape::VarWithOptType, "Variable name.")
+            .required(
+                "var_name",
+                SyntaxShape::VarWithOptType,
+                "The mutable variable name to create.",
+            )
             .required(
                 "initial_value",
                 SyntaxShape::Keyword(b"=".to_vec(), Box::new(SyntaxShape::MathExpression)),
@@ -28,13 +30,13 @@ impl Command for Mut {
             .category(Category::Core)
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"This command is a parser keyword. For details, check:
-  https://www.nushell.sh/book/thinking_in_nu.html"#
+    fn extra_description(&self) -> &str {
+        "This command is a parser keyword. For details, check:
+  https://www.nushell.sh/book/thinking_in_nu.html"
     }
 
-    fn is_parser_keyword(&self) -> bool {
-        true
+    fn command_type(&self) -> CommandType {
+        CommandType::Keyword
     }
 
     fn search_terms(&self) -> Vec<&str> {
@@ -43,58 +45,38 @@ impl Command for Mut {
 
     fn run(
         &self,
-        engine_state: &EngineState,
-        stack: &mut Stack,
-        call: &Call,
-        input: PipelineData,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        _call: &Call,
+        _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let var_id = call
-            .positional_nth(0)
-            .expect("checked through parser")
-            .as_var()
-            .expect("internal error: missing variable");
-
-        let block_id = call
-            .positional_nth(1)
-            .expect("checked through parser")
-            .as_block()
-            .expect("internal error: missing right hand side");
-
-        let block = engine_state.get_block(block_id);
-        let pipeline_data = eval_block(
-            engine_state,
-            stack,
-            block,
-            input,
-            call.redirect_stdout,
-            call.redirect_stderr,
-        )?;
-
-        //println!("Adding: {:?} to {}", rhs, var_id);
-
-        stack.add_var(var_id, pipeline_data.into_value(call.head));
-        Ok(PipelineData::empty())
+        // This is compiled specially by the IR compiler. The code here is never used when
+        // running in IR mode.
+        eprintln!(
+            "Tried to execute 'run' for the 'mut' command: this code path should never be reached in IR mode"
+        );
+        unreachable!()
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Set a mutable variable to a value, then update it",
+                description: "Set a mutable variable to a value, then update it.",
                 example: "mut x = 10; $x = 12",
                 result: None,
             },
             Example {
-                description: "Upsert a value inside a mutable data structure",
+                description: "Upsert a value inside a mutable data structure.",
                 example: "mut a = {b:{c:1}}; $a.b.c = 2",
                 result: None,
             },
             Example {
-                description: "Set a mutable variable to the result of an expression",
+                description: "Set a mutable variable to the result of an expression.",
                 example: "mut x = 10 + 100",
                 result: None,
             },
             Example {
-                description: "Set a mutable variable based on the condition",
+                description: "Set a mutable variable based on the condition.",
                 example: "mut x = if false { -1 } else { 1 }",
                 result: None,
             },
@@ -109,10 +91,8 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Mut {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Mut)
     }
 
     #[test]

@@ -1,17 +1,47 @@
-use nu_protocol::{
-    ast::Expr,
-    engine::{Command, EngineState, Stack, Visibility},
-    record, ModuleId, Record, Signature, Span, SyntaxShape, Type, Value,
-};
-use std::cmp::Ordering;
-use std::collections::HashMap;
+//! Helpers for the `scope` family of commands (`scope variables`, `scope commands`, …).
+//!
+//! # How “what’s in scope” is collected
+//!
+//! Permanent (global) bindings live on [`EngineState`] overlays. Nested parse scopes throw
+//! away their name maps on `exit_scope`, so two additional mechanisms recover locals:
+//!
+//! 1. **Variables** — each [`Variable`](nu_protocol::engine::Variable) may store its `name`.
+//!    [`ScopeData::collect_vars`] builds a name→id map from permanent overlays, then overwrites
+//!    with stack-resident VarIds (outer→inner so the live binding wins). Non-const entries
+//!    without a stack value are skipped (supports `unlet`). Permanent names without
+//!    `Variable.name` still appear via overlays.
+//!
+//! 2. **Commands / aliases / externs / modules** — parse snapshots
+//!    [`ScopeBindings`](nu_protocol::engine::ScopeBindings) onto [`Block`](nu_protocol::ast::Block).
+//!    At runtime:
+//!    - Whole blocks (closures, custom commands) push bindings on
+//!      [`Stack::active_scope_bindings`] in `eval_ir_block`.
+//!    - Keyword bodies inlined into parent IR record
+//!      [`ScopeRegion`](nu_protocol::ir::ScopeRegion)s; `scope` includes regions that contain
+//!      the current instruction index.
+//!
+//!    [`ScopeData::populate_decls`] / [`ScopeData::populate_modules`] merge permanent overlays,
+//!    then active whole-block bindings, then matching IR regions.
+//!
+//! [`scope engine-stats`](crate) intentionally reports only engine-wide counts and ignores locals.
 
+use nu_protocol::{
+    CommandWideCompleter, DeclId, ModuleId, Signature, Span, Type, Value, VarId,
+    ast::Expr,
+    engine::{Command, CommandType, EngineState, ScopeBindings, Stack, Visibility},
+    record,
+};
+use std::{cmp::Ordering, collections::HashMap};
+
+/// Collects name→id maps for the `scope` subcommands.
+///
+/// Call `populate_*` before the matching `collect_*` (except variables: collection is
+/// self-contained; `populate_vars` is a no-op retained only for call-site uniformity).
 pub struct ScopeData<'e, 's> {
     engine_state: &'e EngineState,
     stack: &'s Stack,
-    vars_map: HashMap<&'e Vec<u8>, &'e usize>,
-    decls_map: HashMap<&'e Vec<u8>, &'e usize>,
-    modules_map: HashMap<&'e Vec<u8>, &'e usize>,
+    decls_map: HashMap<Vec<u8>, DeclId>,
+    modules_map: HashMap<Vec<u8>, ModuleId>,
     visibility: Visibility,
 }
 
@@ -20,58 +50,114 @@ impl<'e, 's> ScopeData<'e, 's> {
         Self {
             engine_state,
             stack,
-            vars_map: HashMap::new(),
             decls_map: HashMap::new(),
             modules_map: HashMap::new(),
             visibility: Visibility::new(),
         }
     }
 
-    pub fn populate_vars(&mut self) {
-        for overlay_frame in self.engine_state.active_overlays(&[]) {
-            self.vars_map.extend(&overlay_frame.vars);
-        }
-    }
+    /// No-op retained so all `scope` commands share the same populate-then-collect pattern.
+    /// Variable listing is implemented entirely in [`Self::collect_vars`].
+    pub fn populate_vars(&mut self) {}
 
     // decls include all commands, i.e., normal commands, aliases, and externals
     pub fn populate_decls(&mut self) {
-        for overlay_frame in self.engine_state.active_overlays(&[]) {
-            self.decls_map.extend(&overlay_frame.decls);
-            self.visibility.merge_with(overlay_frame.visibility.clone());
-        }
+        let bindings = self.collect_local_and_global_bindings();
+        self.decls_map = bindings.decls;
+        self.visibility = bindings.visibility;
     }
 
     pub fn populate_modules(&mut self) {
-        for overlay_frame in self.engine_state.active_overlays(&[]) {
-            self.modules_map.extend(&overlay_frame.modules);
-        }
+        let bindings = self.collect_local_and_global_bindings();
+        self.modules_map = bindings.modules;
     }
 
+    /// Permanent overlays, then whole-block active bindings, then IR regions covering the PC.
+    fn collect_local_and_global_bindings(&self) -> ScopeBindings {
+        let mut bindings = ScopeBindings::default();
+        for overlay_frame in self.engine_state.active_overlays(&[]) {
+            bindings.extend_from_overlay(overlay_frame);
+        }
+        for local in &self.stack.active_scope_bindings {
+            bindings.extend_from_bindings(local);
+        }
+        if let Some(pc) = self.stack.ir_instruction_index {
+            // Regions are recorded outer→inner by construction; later extends win on name clash.
+            for region in &self.stack.ir_scope_regions {
+                if region.contains(pc) {
+                    bindings.extend_from_bindings(&region.bindings);
+                }
+            }
+        }
+        bindings
+    }
+
+    /// List variables currently nameable at this stack depth (local ∪ global).
+    ///
+    /// Permanent overlay names are the baseline (global scope). Stack VarIds with
+    /// [`Variable::name`] overwrite so locals and shadowed `let` bindings report the live
+    /// binding. Values are read through the stack parent chain (capture stacks keep the caller
+    /// as parent) so outer/`let` globals remain visible inside `do`/closures. Entries removed
+    /// with `unlet` are omitted.
     pub fn collect_vars(&self, span: Span) -> Vec<Value> {
+        let mut name_to_id: HashMap<Vec<u8>, VarId> = HashMap::new();
+
+        for overlay_frame in self.engine_state.active_overlays(&[]) {
+            for (name, var_id) in &overlay_frame.vars {
+                name_to_id.insert(name.clone(), *var_id);
+            }
+        }
+
+        // Outer → inner so innermost same-name binding wins.
+        for var_id in stack_var_ids(self.stack) {
+            if let Some(name) = &self.engine_state.get_var(var_id).name {
+                name_to_id.insert(name.clone(), var_id);
+            }
+        }
+
         let mut vars = vec![];
 
-        for (var_name, var_id) in &self.vars_map {
-            let var_name = Value::string(String::from_utf8_lossy(var_name).to_string(), span);
+        for (var_name, var_id) in &name_to_id {
+            if is_unlet(self.stack, *var_id) {
+                continue;
+            }
 
-            let var = self.engine_state.get_var(**var_id);
+            let var = self.engine_state.get_var(*var_id);
             let var_type = Value::string(var.ty.to_string(), span);
             let is_const = Value::bool(var.const_val.is_some(), span);
 
-            let var_value = if let Ok(val) = self.stack.get_var(**var_id, span) {
-                val
-            } else {
-                Value::nothing(span)
-            };
+            let var_value_result = self.stack.get_var(*var_id, span);
 
-            let var_id_val = Value::int(**var_id as i64, span);
+            // Prefer stack (including parent chain) value, then const, else nothing so global
+            // names still appear when not captured into the current closure frame.
+            if var_value_result.is_err() && var.const_val.is_none() {
+                // Name is in permanent overlays (global) or only on stack with no value yet.
+                // Keep listing overlay globals; skip pure stack placeholders without a value.
+                let in_permanent_overlay = self
+                    .engine_state
+                    .active_overlays(&[])
+                    .any(|overlay| overlay.vars.values().any(|id| *id == *var_id));
+                if !in_permanent_overlay {
+                    continue;
+                }
+            }
+
+            let var_value = var_value_result
+                .ok()
+                .or(var.const_val.clone())
+                .unwrap_or(Value::nothing(span));
+
+            let var_id_val = Value::int(var_id.get() as i64, span);
+            let memory_size = Value::int(var_value.memory_size() as i64, span);
 
             vars.push(Value::record(
                 record! {
-                    "name" => var_name,
+                    "name" => Value::string(String::from_utf8_lossy(var_name).to_string(), span),
                     "type" => var_type,
                     "value" => var_value,
                     "is_const" => is_const,
                     "var_id" => var_id_val,
+                    "mem_size" => memory_size,
                 },
                 span,
             ));
@@ -86,9 +172,10 @@ impl<'e, 's> ScopeData<'e, 's> {
 
         for (command_name, decl_id) in &self.decls_map {
             if self.visibility.is_decl_id_visible(decl_id)
-                && !self.engine_state.get_decl(**decl_id).is_alias()
+                && !self.engine_state.get_decl(*decl_id).is_alias()
             {
-                let decl = self.engine_state.get_decl(**decl_id);
+                let command_name = String::from_utf8_lossy(command_name);
+                let decl = self.engine_state.get_decl(*decl_id);
                 let signature = decl.signature();
 
                 let examples = decl
@@ -99,30 +186,53 @@ impl<'e, 's> ScopeData<'e, 's> {
                             record! {
                                 "description" => Value::string(x.description, span),
                                 "example" => Value::string(x.example, span),
-                                "result" => x.result.unwrap_or(Value::nothing(span)),
+                                "result" => x.result.unwrap_or(Value::nothing(span)).with_span(span),
                             },
                             span,
                         )
                     })
                     .collect();
 
+                let attributes = decl
+                    .attributes()
+                    .into_iter()
+                    .map(|(name, value)| {
+                        Value::record(
+                            record! {
+                                "name" => Value::string(name, span),
+                                "value" => value,
+                            },
+                            span,
+                        )
+                    })
+                    .collect();
+
+                let deprecations = decl
+                    .deprecation_info()
+                    .into_iter()
+                    .map(|entry| entry.into_value(&command_name, span))
+                    .collect();
+
                 let record = record! {
-                    "name" => Value::string(String::from_utf8_lossy(command_name), span),
+                    "name" => Value::string(command_name, span),
                     "category" => Value::string(signature.category.to_string(), span),
                     "signatures" => self.collect_signatures(&signature, span),
-                    "usage" => Value::string(decl.usage(), span),
+                    "description" => Value::string(decl.description(), span),
                     "examples" => Value::list(examples, span),
-                    // we can only be a is_builtin or is_custom, not both
-                    "is_builtin" => Value::bool(!decl.is_custom_command(), span),
+                    "attributes" => Value::list(attributes, span),
+                    "type" => Value::string(decl.command_type().to_string(), span),
                     "is_sub" => Value::bool(decl.is_sub(), span),
-                    "is_plugin" => Value::bool(decl.is_plugin().is_some(), span),
-                    "is_custom" => Value::bool(decl.is_custom_command(), span),
-                    "is_keyword" => Value::bool(decl.is_parser_keyword(), span),
-                    "is_extern" => Value::bool(decl.is_known_external(), span),
+                    "is_const" => Value::bool(decl.is_const(), span),
                     "creates_scope" => Value::bool(signature.creates_scope, span),
-                    "extra_usage" => Value::string(decl.extra_usage(), span),
+                    "extra_description" => Value::string(decl.extra_description(), span),
                     "search_terms" => Value::string(decl.search_terms().join(", "), span),
-                    "decl_id" => Value::int(**decl_id as i64, span),
+                    "complete" => match signature.complete {
+                        Some(CommandWideCompleter::Command(decl_id)) => Value::int(decl_id.get() as i64, span),
+                        Some(CommandWideCompleter::External) => Value::string("external", span),
+                        None => Value::nothing(span),
+                    },
+                    "deprecation_info" => Value::list(deprecations, span),
+                    "decl_id" => Value::int(decl_id.get() as i64, span),
                 };
 
                 commands.push(Value::record(record, span))
@@ -185,101 +295,94 @@ impl<'e, 's> ScopeData<'e, 's> {
     ) -> Vec<Value> {
         let mut sig_records = vec![];
 
-        let sig_cols = vec![
-            "parameter_name".to_string(),
-            "parameter_type".to_string(),
-            "syntax_shape".to_string(),
-            "is_optional".to_string(),
-            "short_flag".to_string(),
-            "description".to_string(),
-            "custom_completion".to_string(),
-            "parameter_default".to_string(),
-        ];
-
         // input
         sig_records.push(Value::record(
-            Record::from_raw_cols_vals_unchecked(
-                sig_cols.clone(),
-                vec![
-                    Value::nothing(span),
-                    Value::string("input", span),
-                    Value::string(input_type.to_shape().to_string(), span),
-                    Value::bool(false, span),
-                    Value::nothing(span),
-                    Value::nothing(span),
-                    Value::nothing(span),
-                    Value::nothing(span),
-                ],
-            ),
+            record! {
+                "parameter_name" => Value::nothing(span),
+                "parameter_type" => Value::string("input", span),
+                "syntax_shape" => Value::string(input_type.to_shape().to_string(), span),
+                "is_optional" => Value::bool(false, span),
+                "short_flag" => Value::nothing(span),
+                "description" => Value::nothing(span),
+                "completion" => Value::nothing(span),
+                "parameter_default" => Value::nothing(span),
+            },
             span,
         ));
 
         // required_positional
         for req in &signature.required_positional {
-            let sig_vals = vec![
-                Value::string(&req.name, span),
-                Value::string("positional", span),
-                Value::string(req.shape.to_string(), span),
-                Value::bool(false, span),
-                Value::nothing(span),
-                Value::string(&req.desc, span),
-                Value::string(
-                    extract_custom_completion_from_arg(self.engine_state, &req.shape),
-                    span,
-                ),
-                Value::nothing(span),
-            ];
+            let completion = req
+                .completion
+                .as_ref()
+                .map(|compl| compl.to_value(self.engine_state, span))
+                .unwrap_or(Value::nothing(span));
 
             sig_records.push(Value::record(
-                Record::from_raw_cols_vals_unchecked(sig_cols.clone(), sig_vals),
+                record! {
+                    "parameter_name" => Value::string(&req.name, span),
+                    "parameter_type" => Value::string("positional", span),
+                    "syntax_shape" => Value::string(req.shape.to_string(), span),
+                    "is_optional" => Value::bool(false, span),
+                    "short_flag" => Value::nothing(span),
+                    "description" => Value::string(&req.desc, span),
+                    "completion" => completion,
+                    "parameter_default" => Value::nothing(span),
+                },
                 span,
             ));
         }
 
         // optional_positional
         for opt in &signature.optional_positional {
-            let sig_vals = vec![
-                Value::string(&opt.name, span),
-                Value::string("positional", span),
-                Value::string(opt.shape.to_string(), span),
-                Value::bool(true, span),
-                Value::nothing(span),
-                Value::string(&opt.desc, span),
-                Value::string(
-                    extract_custom_completion_from_arg(self.engine_state, &opt.shape),
-                    span,
-                ),
-                if let Some(val) = &opt.default_value {
-                    val.clone()
-                } else {
-                    Value::nothing(span)
-                },
-            ];
+            let completion = opt
+                .completion
+                .as_ref()
+                .map(|compl| compl.to_value(self.engine_state, span))
+                .unwrap_or(Value::nothing(span));
+
+            let default = if let Some(val) = &opt.default_value {
+                val.clone()
+            } else {
+                Value::nothing(span)
+            };
 
             sig_records.push(Value::record(
-                Record::from_raw_cols_vals_unchecked(sig_cols.clone(), sig_vals),
+                record! {
+                    "parameter_name" => Value::string(&opt.name, span),
+                    "parameter_type" => Value::string("positional", span),
+                    "syntax_shape" => Value::string(opt.shape.to_string(), span),
+                    "is_optional" => Value::bool(true, span),
+                    "short_flag" => Value::nothing(span),
+                    "description" => Value::string(&opt.desc, span),
+                    "completion" => completion,
+                    "parameter_default" => default,
+                },
                 span,
             ));
         }
 
         // rest_positional
         if let Some(rest) = &signature.rest_positional {
-            let sig_vals = vec![
-                Value::string(if rest.name == "rest" { "" } else { &rest.name }, span),
-                Value::string("rest", span),
-                Value::string(rest.shape.to_string(), span),
-                Value::bool(true, span),
-                Value::nothing(span),
-                Value::string(&rest.desc, span),
-                Value::string(
-                    extract_custom_completion_from_arg(self.engine_state, &rest.shape),
-                    span,
-                ),
-                Value::nothing(span), // rest_positional does have default, but parser prohibits specifying it?!
-            ];
+            let name = if rest.name == "rest" { "" } else { &rest.name };
+            let completion = rest
+                .completion
+                .as_ref()
+                .map(|compl| compl.to_value(self.engine_state, span))
+                .unwrap_or(Value::nothing(span));
 
             sig_records.push(Value::record(
-                Record::from_raw_cols_vals_unchecked(sig_cols.clone(), sig_vals),
+                record! {
+                    "parameter_name" => Value::string(name, span),
+                    "parameter_type" => Value::string("rest", span),
+                    "syntax_shape" => Value::string(rest.shape.to_string(), span),
+                    "is_optional" => Value::bool(true, span),
+                    "short_flag" => Value::nothing(span),
+                    "description" => Value::string(&rest.desc, span),
+                    "completion" => completion,
+                    // rest_positional does have default, but parser prohibits specifying it?!
+                    "parameter_default" => Value::nothing(span),
+                },
                 span,
             ));
         }
@@ -293,11 +396,14 @@ impl<'e, 's> ScopeData<'e, 's> {
                 continue;
             }
 
-            let mut custom_completion_command_name: String = "".to_string();
+            let completion = named
+                .completion
+                .as_ref()
+                .map(|compl| compl.to_value(self.engine_state, span))
+                .unwrap_or(Value::nothing(span));
+
             let shape = if let Some(arg) = &named.arg {
                 flag_type = Value::string("named", span);
-                custom_completion_command_name =
-                    extract_custom_completion_from_arg(self.engine_state, arg);
                 Value::string(arg.to_string(), span)
             } else {
                 flag_type = Value::string("switch", span);
@@ -310,42 +416,39 @@ impl<'e, 's> ScopeData<'e, 's> {
                 Value::nothing(span)
             };
 
-            let sig_vals = vec![
-                Value::string(&named.long, span),
-                flag_type,
-                shape,
-                Value::bool(!named.required, span),
-                short_flag,
-                Value::string(&named.desc, span),
-                Value::string(custom_completion_command_name, span),
-                if let Some(val) = &named.default_value {
-                    val.clone()
-                } else {
-                    Value::nothing(span)
-                },
-            ];
+            let default = if let Some(val) = &named.default_value {
+                val.clone()
+            } else {
+                Value::nothing(span)
+            };
 
             sig_records.push(Value::record(
-                Record::from_raw_cols_vals_unchecked(sig_cols.clone(), sig_vals),
+                record! {
+                    "parameter_name" => Value::string(&named.long, span),
+                    "parameter_type" => flag_type,
+                    "syntax_shape" => shape,
+                    "is_optional" => Value::bool(!named.required, span),
+                    "short_flag" => short_flag,
+                    "description" => Value::string(&named.desc, span),
+                    "completion" => completion,
+                    "parameter_default" => default,
+                },
                 span,
             ));
         }
 
         // output
         sig_records.push(Value::record(
-            Record::from_raw_cols_vals_unchecked(
-                sig_cols,
-                vec![
-                    Value::nothing(span),
-                    Value::string("output", span),
-                    Value::string(output_type.to_shape().to_string(), span),
-                    Value::bool(false, span),
-                    Value::nothing(span),
-                    Value::nothing(span),
-                    Value::nothing(span),
-                    Value::nothing(span),
-                ],
-            ),
+            record! {
+                "parameter_name" => Value::nothing(span),
+                "parameter_type" => Value::string("output", span),
+                "syntax_shape" => Value::string(output_type.to_shape().to_string(), span),
+                "is_optional" => Value::bool(false, span),
+                "short_flag" => Value::nothing(span),
+                "description" => Value::nothing(span),
+                "completion" => Value::nothing(span),
+                "parameter_default" => Value::nothing(span),
+            },
             span,
         ));
 
@@ -356,13 +459,13 @@ impl<'e, 's> ScopeData<'e, 's> {
         let mut externals = vec![];
 
         for (command_name, decl_id) in &self.decls_map {
-            let decl = self.engine_state.get_decl(**decl_id);
+            let decl = self.engine_state.get_decl(*decl_id);
 
             if decl.is_known_external() {
                 let record = record! {
                     "name" => Value::string(String::from_utf8_lossy(command_name), span),
-                    "usage" => Value::string(decl.usage(), span),
-                    "decl_id" => Value::int(**decl_id as i64, span),
+                    "description" => Value::string(decl.description(), span),
+                    "decl_id" => Value::int(decl_id.get() as i64, span),
                 };
 
                 externals.push(Value::record(record, span))
@@ -376,13 +479,13 @@ impl<'e, 's> ScopeData<'e, 's> {
     pub fn collect_aliases(&self, span: Span) -> Vec<Value> {
         let mut aliases = vec![];
 
-        for (decl_name, decl_id) in self.engine_state.get_decls_sorted(false) {
-            if self.visibility.is_decl_id_visible(&decl_id) {
-                let decl = self.engine_state.get_decl(decl_id);
+        for (decl_name, decl_id) in &self.decls_map {
+            if self.visibility.is_decl_id_visible(decl_id) {
+                let decl = self.engine_state.get_decl(*decl_id);
                 if let Some(alias) = decl.as_alias() {
                     let aliased_decl_id = if let Expr::Call(wrapped_call) = &alias.wrapped_call.expr
                     {
-                        Value::int(wrapped_call.decl_id as i64, span)
+                        Value::int(wrapped_call.decl_id.get() as i64, span)
                     } else {
                         Value::nothing(span)
                     };
@@ -393,10 +496,10 @@ impl<'e, 's> ScopeData<'e, 's> {
 
                     aliases.push(Value::record(
                         record! {
-                            "name" => Value::string(String::from_utf8_lossy(&decl_name), span),
+                            "name" => Value::string(String::from_utf8_lossy(decl_name), span),
                             "expansion" => Value::string(expansion, span),
-                            "usage" => Value::string(alias.usage(), span),
-                            "decl_id" => Value::int(decl_id as i64, span),
+                            "description" => Value::string(alias.description(), span),
+                            "decl_id" => Value::int(decl_id.get() as i64, span),
                             "aliased_decl_id" => aliased_decl_id,
                         },
                         span,
@@ -406,7 +509,6 @@ impl<'e, 's> ScopeData<'e, 's> {
         }
 
         sort_rows(&mut aliases);
-        // aliases.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
         aliases
     }
 
@@ -424,7 +526,7 @@ impl<'e, 's> ScopeData<'e, 's> {
                     Some(Value::record(
                         record! {
                             "name" => Value::string(String::from_utf8_lossy(name_bytes), span),
-                            "decl_id" => Value::int(*decl_id as i64, span),
+                            "decl_id" => Value::int(decl_id.get() as i64, span),
                         },
                         span,
                     ))
@@ -443,7 +545,7 @@ impl<'e, 's> ScopeData<'e, 's> {
                     Some(Value::record(
                         record! {
                             "name" => Value::string(String::from_utf8_lossy(name_bytes), span),
-                            "decl_id" => Value::int(*decl_id as i64, span),
+                            "decl_id" => Value::int(decl_id.get() as i64, span),
                         },
                         span,
                     ))
@@ -462,7 +564,7 @@ impl<'e, 's> ScopeData<'e, 's> {
                     Some(Value::record(
                         record! {
                             "name" => Value::string(String::from_utf8_lossy(name_bytes), span),
-                            "decl_id" => Value::int(*decl_id as i64, span),
+                            "decl_id" => Value::int(decl_id.get() as i64, span),
                         },
                         span,
                     ))
@@ -486,7 +588,7 @@ impl<'e, 's> ScopeData<'e, 's> {
                     record! {
                         "name" => Value::string(String::from_utf8_lossy(name_bytes), span),
                         "type" => Value::string(self.engine_state.get_var(*var_id).ty.to_string(), span),
-                        "var_id" => Value::int(*var_id as i64, span),
+                        "var_id" => Value::int(var_id.get() as i64, span),
                     },
                     span,
                 )
@@ -499,14 +601,9 @@ impl<'e, 's> ScopeData<'e, 's> {
         sort_rows(&mut export_submodules);
         sort_rows(&mut export_consts);
 
-        let export_env_block = module.env_block.map_or_else(
-            || Value::nothing(span),
-            |block_id| Value::block(block_id, span),
-        );
-
-        let (module_usage, module_extra_usage) = self
+        let (module_desc, module_extra_desc) = self
             .engine_state
-            .build_module_usage(*module_id)
+            .build_module_desc(*module_id)
             .unwrap_or_default();
 
         Value::record(
@@ -517,10 +614,11 @@ impl<'e, 's> ScopeData<'e, 's> {
                 "externs" => Value::list(export_externs, span),
                 "submodules" => Value::list(export_submodules, span),
                 "constants" => Value::list(export_consts, span),
-                "env_block" => export_env_block,
-                "usage" => Value::string(module_usage, span),
-                "extra_usage" => Value::string(module_extra_usage, span),
-                "module_id" => Value::int(*module_id as i64, span),
+                "has_env_block" => Value::bool(module.env_block.is_some(), span),
+                "description" => Value::string(module_desc, span),
+                "extra_description" => Value::string(module_extra_desc, span),
+                "module_id" => Value::int(module_id.get() as i64, span),
+                "file" => Value::string(module.file.clone().map_or("unknown".to_string(), |(p, _)| p.path().to_string_lossy().to_string()), span),
             },
             span,
         )
@@ -545,6 +643,27 @@ impl<'e, 's> ScopeData<'e, 's> {
             .map(|overlay| overlay.len() as i64)
             .sum();
 
+        let config = self.stack.get_config(self.engine_state);
+        let last_result = Value::record(
+            record! {
+                "name" => Value::string(
+                    format!("${}", nu_protocol::LAST_RESULT_VAR_NAME),
+                    span,
+                ),
+                "size_limit" => Value::filesize(config.max_last_result_size, span),
+                "memory_size" => Value::filesize(
+                    nu_protocol::Filesize::new(self.stack.last_result_memory_size() as i64),
+                    span,
+                ),
+                "truncated" => Value::bool(self.stack.last_result_was_truncated(), span),
+                "has_metadata" => Value::bool(
+                    self.stack.last_result_metadata().is_some(),
+                    span,
+                ),
+            },
+            span,
+        );
+
         Value::record(
             record! {
                 "source_bytes" => Value::int(self.engine_state.next_span_start() as i64, span),
@@ -553,21 +672,45 @@ impl<'e, 's> ScopeData<'e, 's> {
                 "num_blocks" => Value::int(self.engine_state.num_blocks() as i64, span),
                 "num_modules" => Value::int(self.engine_state.num_modules() as i64, span),
                 "num_env_vars" => Value::int(num_env_vars, span),
+                "last_result" => last_result,
             },
             span,
         )
     }
 }
 
-fn extract_custom_completion_from_arg(engine_state: &EngineState, shape: &SyntaxShape) -> String {
-    return match shape {
-        SyntaxShape::CompleterWrapper(_, custom_completion_decl_id) => {
-            let custom_completion_command = engine_state.get_decl(*custom_completion_decl_id);
-            let custom_completion_command_name: &str = custom_completion_command.name();
-            custom_completion_command_name.to_string()
+/// Collect VarIds present on the stack (parents first, then current frame).
+///
+/// Mirrors [`Stack`] lookup: walk parents first (skipping `parent_deletions`), then append
+/// current-frame vars. Same-name shadowing is resolved later when building the name→id map
+/// in [`ScopeData::collect_vars`].
+fn stack_var_ids(stack: &Stack) -> Vec<VarId> {
+    let mut ids = Vec::new();
+    collect_stack_var_ids(stack, &mut ids);
+    ids
+}
+
+fn collect_stack_var_ids(stack: &Stack, ids: &mut Vec<VarId>) {
+    if let Some(parent) = &stack.parent_stack {
+        collect_stack_var_ids(parent, ids);
+        ids.retain(|id| !stack.parent_deletions.contains(id));
+    }
+    // `remove_var` already drops entries from `vars`; no need to consult `deletions`.
+    for (var_id, _) in &stack.vars {
+        ids.push(*var_id);
+    }
+}
+
+/// True if `unlet` removed this variable on this stack or any parent.
+fn is_unlet(stack: &Stack, var_id: VarId) -> bool {
+    let mut current = Some(stack);
+    while let Some(s) = current {
+        if s.deletions.contains(&var_id) || s.parent_deletions.contains(&var_id) {
+            return true;
         }
-        _ => "".to_string(),
-    };
+        current = s.parent_stack.as_deref();
+    }
+    false
 }
 
 fn sort_rows(decls: &mut [Value]) {
@@ -587,4 +730,20 @@ fn sort_rows(decls: &mut [Value]) {
         }
         _ => Ordering::Equal,
     });
+}
+
+/// Find the first declaration with `CommandType::Builtin` whose name matches `name`,
+/// scanning from the most-recently registered declaration backwards.
+///
+/// This mirrors the static `%name` parser behavior: `%` always resolves to a built-in,
+/// even when a custom declaration shadows the same name in the current scope.
+pub fn find_builtin_decl(engine_state: &EngineState, name: &str) -> Option<DeclId> {
+    for idx in (0..engine_state.num_decls()).rev() {
+        let decl_id = DeclId::new(idx);
+        let decl = engine_state.get_decl(decl_id);
+        if decl.command_type() == CommandType::Builtin && decl.name() == name {
+            return Some(decl_id);
+        }
+    }
+    None
 }

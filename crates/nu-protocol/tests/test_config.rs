@@ -1,112 +1,107 @@
-use nu_test_support::{nu, nu_repl_code};
+use nu_test_support::prelude::*;
+use rstest::rstest;
 
-#[test]
-fn filesize_metric_true() {
-    let code = &[
-        r#"$env.config = { filesize: { metric: true, format:"mb" } }"#,
-        r#"20mib | into string"#,
-    ];
-    let actual = nu!(nu_repl_code(code));
-    assert_eq!(actual.out, "21.0 MB");
+#[rstest]
+#[case::mb("MB")]
+#[case::mib("MiB")]
+#[nu_test_support::test]
+#[env(NU_TEST_LOCALE_OVERRIDE = "en_US.UTF-8")]
+fn filesize(#[case] unit: &str) -> Result {
+    let mut tester = test();
+    let () = tester.run_with_data("$env.config.filesize.unit = $in", unit)?;
+    tester
+        .run(format!("20{unit} | into string"))
+        .expect_value_eq(format!("20.0 {unit}"))
+}
+
+#[rstest]
+#[case::metric("metric", "[2MB, 2GB, 2TB]", &["2.0 MB", "2.0 GB", "2.0 TB"])]
+#[case::binary("binary", "[2MiB, 2GiB, 2TiB]", &["2.0 MiB", "2.0 GiB", "2.0 TiB"])]
+#[nu_test_support::test]
+#[env(NU_TEST_LOCALE_OVERRIDE = "en_US.UTF-8")]
+fn filesize_format(#[case] unit: &str, #[case] input: &str, #[case] expected: &[&str]) -> Result {
+    let mut tester = test();
+    let () = tester.run_with_data("$env.config.filesize.unit = $in", unit)?;
+    let val: Value = tester.run(input)?;
+    tester
+        .run_with_data("into string", val)
+        .expect_value_eq(expected.to_vec())
 }
 
 #[test]
-fn filesize_metric_false() {
-    let code = &[
-        r#"$env.config = { filesize: { metric: false, format:"mib" } }"#,
-        r#"20mib | into string"#,
-    ];
-    let actual = nu!(nu_repl_code(code));
-    assert_eq!(actual.out, "20.0 MiB");
-}
-
-#[test]
-fn filesize_metric_overrides_format() {
-    let code = &[
-        r#"$env.config = { filesize: { metric: false, format:"mb" } }"#,
-        r#"20mib | into string"#,
-    ];
-    let actual = nu!(nu_repl_code(code));
-    assert_eq!(actual.out, "20.0 MiB");
-}
-
-#[test]
-fn filesize_format_auto_metric_true() {
-    let code = &[
-        r#"$env.config = { filesize: { metric: true, format:"auto" } }"#,
-        r#"[2mb 2gb 2tb] | into string | to nuon"#,
-    ];
-    let actual = nu!(nu_repl_code(code));
-    assert_eq!(actual.out, r#"["2.0 MB", "2.0 GB", "2.0 TB"]"#);
-}
-
-#[test]
-fn filesize_format_auto_metric_false() {
-    let code = &[
-        r#"$env.config = { filesize: { metric: false, format:"auto" } }"#,
-        r#"[2mb 2gb 2tb] | into string | to nuon"#,
-    ];
-    let actual = nu!(nu_repl_code(code));
-    assert_eq!(actual.out, r#"["1.9 MiB", "1.9 GiB", "1.8 TiB"]"#);
-}
-
-#[test]
-fn fancy_default_errors() {
-    let actual = nu!(nu_repl_code(&[
+fn fancy_default_errors() -> Result {
+    let mut tester = test();
+    let () = tester.run("$env.config.use_ansi_coloring = true")?;
+    let () = tester.run(
         r#"def force_error [x] {
-        error make {
-            msg: "oh no!"
-            label: {
-                text: "here's the error"
-                span: (metadata $x).span
+            error make {
+                msg: "oh no!"
+                label: {
+                    text: "here's the error"
+                    span: (metadata $x).span
+                }
             }
-        }
-    }"#,
-        r#"force_error "My error""#
-    ]));
+        }"#,
+    )?;
 
-    assert_eq!(
-        actual.err,
-        "Error:   \u{1b}[31m×\u{1b}[0m oh no!\n   ╭─[\u{1b}[36;1;4mline1\u{1b}[0m:1:1]\n \u{1b}[2m1\u{1b}[0m │ force_error \"My error\"\n   · \u{1b}[35;1m            ─────┬────\u{1b}[0m\n   ·                  \u{1b}[35;1m╰── \u{1b}[35;1mhere's the error\u{1b}[0m\u{1b}[0m\n   ╰────\n\n\n"
-    );
+    let err = tester
+        .run(r#"force_error "My error""#)
+        .expect_labeled_error()?;
+
+    assert_eq!(err.msg, "oh no!");
+    assert_eq!(err.labels.len(), 1);
+    assert_eq!(err.labels[0].text, "here's the error");
+
+    Ok(())
 }
 
 #[test]
-fn narratable_errors() {
-    let actual = nu!(nu_repl_code(&[
-        r#"$env.config = { error_style: "plain" }"#,
+fn narratable_errors() -> Result {
+    let mut tester = test();
+    let () = tester.run(r#"$env.config = { error_style: "plain" }"#)?;
+    let () = tester.run(
         r#"def force_error [x] {
-        error make {
-            msg: "oh no!"
-            label: {
-                text: "here's the error"
-                span: (metadata $x).span
+            error make {
+                msg: "oh no!"
+                label: {
+                    text: "here's the error"
+                    span: (metadata $x).span
+                }
             }
-        }
-    }"#,
-        r#"force_error "my error""#,
-    ]));
+        }"#,
+    )?;
 
-    assert_eq!(
-        actual.err,
-        r#"Error: oh no!
-    Diagnostic severity: error
-Begin snippet for line2 starting at line 1, column 1
+    let err = tester
+        .run(r#"force_error "my error""#)
+        .expect_labeled_error()?;
 
-snippet line 1: force_error "my error"
-    label at line 1, columns 13 to 22: here's the error
+    assert_eq!(err.msg, "oh no!");
+    assert_eq!(err.labels.len(), 1);
+    assert_eq!(err.labels[0].text, "here's the error");
 
-
-"#,
-    );
+    Ok(())
 }
 
 #[test]
-fn plugins() {
-    let code = &[
-        r#"$env.config = { plugins: { nu_plugin_config: { key: value } } }"#,
-        r#"$env.config.plugins"#,
-    ];
-    let actual = nu!(nu_repl_code(code));
-    assert_eq!(actual.out, r#"{nu_plugin_config: {key: value}}"#);
+fn abbreviations() -> Result {
+    let mut tester = test();
+    let () = tester.run(r#"$env.config = { abbreviations: { g: "git --no-pager" } }"#)?;
+    tester
+        .run("$env.config.abbreviations")
+        .expect_value_eq(test_value!({
+            "g": "git --no-pager"
+        }))
+}
+
+#[test]
+fn plugins() -> Result {
+    let mut tester = test();
+    let () = tester.run("$env.config = { plugins: { nu_plugin_config: { key: value } } }")?;
+    tester
+        .run("$env.config.plugins")
+        .expect_value_eq(test_value!({
+            "nu_plugin_config": {
+                "key": "value"
+            }
+        }))
 }

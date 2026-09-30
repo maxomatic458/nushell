@@ -1,10 +1,13 @@
-use nu_color_config::{Alignment, StyleComputer, TextStyle};
-use nu_protocol::{Config, FooterMode, ShellError, Span, Value};
-use nu_protocol::{TableMode, TrimStrategy};
-
 use crate::{
-    clean_charset, colorize_space_str, string_wrap, NuTableConfig, TableOutput, TableTheme,
+    TableOutput, TableTheme, clean_charset, colorize_space_str, string_truncate, string_width,
+    string_wrap,
 };
+use nu_color_config::{Alignment, StyleComputer, TextStyle};
+use nu_protocol::{
+    Config, FooterMode, ShellError, Span, TableMode, TrimStrategy, Value,
+    shell_error::generic::GenericError,
+};
+use nu_utils::terminal_size;
 
 pub type NuText = (String, TextStyle);
 pub type TableResult = Result<Option<TableOutput>, ShellError>;
@@ -12,34 +15,50 @@ pub type StringResult = Result<Option<String>, ShellError>;
 
 pub const INDEX_COLUMN_NAME: &str = "index";
 
-pub fn create_nu_table_config(
+pub fn configure_table(
+    out: &mut TableOutput,
     config: &Config,
     comp: &StyleComputer,
-    out: &TableOutput,
-    expand: bool,
     mode: TableMode,
-) -> NuTableConfig {
-    NuTableConfig {
-        theme: load_theme(mode),
-        with_footer: with_footer(config, out.with_header, out.table.count_rows()),
-        with_index: out.with_index,
-        with_header: out.with_header,
-        split_color: Some(lookup_separator_color(comp)),
-        trim: config.trim_strategy.clone(),
-        header_on_border: config.table_move_header,
-        expand,
-    }
+) {
+    let with_footer = is_footer_needed(config, out);
+    let theme = load_theme(mode);
+    // Markup themes must keep the header in its own row to stay valid
+    // Markdown/reStructuredText, so never move it onto the separator.
+    let is_markup = matches!(mode, TableMode::Markdown | TableMode::Restructured);
+
+    out.table.set_theme(theme);
+    out.table
+        .set_structure(out.with_index, out.with_header, with_footer);
+    out.table.set_trim(config.table.trim.clone());
+    out.table
+        .set_border_header(config.table.header_on_separator && !is_markup);
+    out.table.set_border_color(lookup_separator_color(comp));
 }
 
-pub fn nu_value_to_string_colored(val: &Value, cfg: &Config, style: &StyleComputer) -> String {
-    let (mut text, value_style) = nu_value_to_string(val, cfg, style);
-    if let Some(color) = value_style.color_style {
+fn is_footer_needed(config: &Config, out: &TableOutput) -> bool {
+    let mut count_rows = out.table.count_rows();
+    if config.table.footer_inheritance {
+        count_rows = out.count_rows;
+    }
+
+    with_footer(config, out.with_header, count_rows)
+}
+
+pub fn nu_value_to_string_colored(val: &Value, cfg: &Config, comp: &StyleComputer) -> String {
+    let (mut text, style) = nu_value_to_string(val, cfg, comp);
+
+    let is_string = matches!(val, Value::String { .. });
+    if is_string {
+        text = clean_charset(&text);
+    }
+
+    if let Some(color) = style.color_style {
         text = color.paint(text).to_string();
     }
 
-    if matches!(val, Value::String { .. }) {
-        text = clean_charset(&text);
-        colorize_space_str(&mut text, style);
+    if is_string {
+        colorize_space_str(&mut text, comp);
     }
 
     text
@@ -47,9 +66,11 @@ pub fn nu_value_to_string_colored(val: &Value, cfg: &Config, style: &StyleComput
 
 pub fn nu_value_to_string(val: &Value, cfg: &Config, style: &StyleComputer) -> NuText {
     let float_precision = cfg.float_precision as usize;
-    let text = val.into_abbreviated_string(cfg);
-    make_styled_string(style, text, Some(val), float_precision)
+    let text = val.to_abbreviated_string(cfg);
+    make_styled_value(text, val, float_precision, style)
 }
+
+// todo: Expose a method which returns just style
 
 pub fn nu_value_to_string_clean(val: &Value, cfg: &Config, style_comp: &StyleComputer) -> NuText {
     let (text, style) = nu_value_to_string(val, cfg, style_comp);
@@ -59,12 +80,40 @@ pub fn nu_value_to_string_clean(val: &Value, cfg: &Config, style_comp: &StyleCom
     (text, style)
 }
 
-pub fn error_sign(style_computer: &StyleComputer) -> (String, TextStyle) {
-    make_styled_string(style_computer, String::from("❎"), None, 0)
+pub fn error_sign(text: String, style_computer: &StyleComputer) -> (String, TextStyle) {
+    // Though holes are not the same as null, the closure for "empty" is passed a null anyway.
+
+    let style = style_computer.compute("empty", &Value::nothing(Span::unknown()));
+    (text, TextStyle::with_style(Alignment::Center, style))
 }
 
 pub fn wrap_text(text: &str, width: usize, config: &Config) -> String {
-    string_wrap(text, width, is_cfg_trim_keep_words(config))
+    if width == 0 {
+        return String::new();
+    }
+
+    match &config.table.trim {
+        TrimStrategy::Wrap { try_to_keep_words } => string_wrap(text, width, *try_to_keep_words),
+        TrimStrategy::Truncate { suffix } => {
+            if string_width(text) <= width {
+                return text.to_owned();
+            }
+            let suffix = suffix.as_deref().unwrap_or("");
+            let suffix_width = string_width(suffix);
+            text.lines()
+                .map(|line| {
+                    if string_width(line) <= width {
+                        line.to_owned()
+                    } else if suffix_width >= width {
+                        string_truncate(line, width)
+                    } else {
+                        format!("{}{}", string_truncate(line, width - suffix_width), suffix)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
 }
 
 pub fn get_header_style(style_computer: &StyleComputer) -> TextStyle {
@@ -99,52 +148,29 @@ pub fn get_value_style(value: &Value, config: &Config, style_computer: &StyleCom
             style_computer.style_primitive(value),
         ),
         _ => (
-            value.into_abbreviated_string(config),
+            value.to_abbreviated_string(config),
             style_computer.style_primitive(value),
         ),
     }
 }
 
-pub fn get_empty_style(style_computer: &StyleComputer) -> NuText {
-    (
-        String::from("❎"),
-        TextStyle::with_style(
-            Alignment::Right,
-            style_computer.compute("empty", &Value::nothing(Span::unknown())),
-        ),
-    )
-}
-
-fn make_styled_string(
-    style_computer: &StyleComputer,
+fn make_styled_value(
     text: String,
-    value: Option<&Value>, // None represents table holes.
+    value: &Value,
     float_precision: usize,
+    style_computer: &StyleComputer,
 ) -> NuText {
     match value {
-        Some(value) => {
-            match value {
-                Value::Float { .. } => {
-                    // set dynamic precision from config
-                    let precise_number = match convert_with_precision(&text, float_precision) {
-                        Ok(num) => num,
-                        Err(e) => e.to_string(),
-                    };
-                    (precise_number, style_computer.style_primitive(value))
-                }
-                _ => (text, style_computer.style_primitive(value)),
-            }
+        Value::Float { .. } => {
+            // set dynamic precision from config
+            let precise_number = match convert_with_precision(&text, float_precision) {
+                Ok(num) => num,
+                Err(e) => e.to_string(),
+            };
+
+            (precise_number, style_computer.style_primitive(value))
         }
-        None => {
-            // Though holes are not the same as null, the closure for "empty" is passed a null anyway.
-            (
-                text,
-                TextStyle::with_style(
-                    Alignment::Center,
-                    style_computer.compute("empty", &Value::nothing(Span::unknown())),
-                ),
-            )
-        }
+        _ => (text, style_computer.style_primitive(value)),
     }
 }
 
@@ -153,25 +179,13 @@ fn convert_with_precision(val: &str, precision: usize) -> Result<String, ShellEr
     let val_float = match val.trim().parse::<f64>() {
         Ok(f) => f,
         Err(e) => {
-            return Err(ShellError::GenericError {
-                error: format!("error converting string [{}] to f64", &val),
-                msg: "".into(),
-                span: None,
-                help: Some(e.to_string()),
-                inner: vec![],
-            });
+            return Err(ShellError::Generic(
+                GenericError::new_internal(format!("error converting string [{}] to f64", val), "")
+                    .with_help(e.to_string()),
+            ));
         }
     };
     Ok(format!("{val_float:.precision$}"))
-}
-
-fn is_cfg_trim_keep_words(config: &Config) -> bool {
-    matches!(
-        config.trim_strategy,
-        TrimStrategy::Wrap {
-            try_to_keep_words: true
-        }
-    )
 }
 
 pub fn load_theme(mode: TableMode) -> TableTheme {
@@ -180,6 +194,7 @@ pub fn load_theme(mode: TableMode) -> TableTheme {
         TableMode::Thin => TableTheme::thin(),
         TableMode::Light => TableTheme::light(),
         TableMode::Compact => TableTheme::compact(),
+        TableMode::Frameless => TableTheme::frameless(),
         TableMode::WithLove => TableTheme::with_love(),
         TableMode::CompactDouble => TableTheme::compact_double(),
         TableMode::Rounded => TableTheme::rounded(),
@@ -192,6 +207,8 @@ pub fn load_theme(mode: TableMode) -> TableTheme {
         TableMode::Restructured => TableTheme::restructured(),
         TableMode::AsciiRounded => TableTheme::ascii_rounded(),
         TableMode::BasicCompact => TableTheme::basic_compact(),
+        TableMode::Single => TableTheme::single(),
+        TableMode::Double => TableTheme::double(),
     }
 }
 
@@ -204,6 +221,27 @@ fn with_footer(config: &Config, with_header: bool, count_records: usize) -> bool
 }
 
 fn need_footer(config: &Config, count_records: u64) -> bool {
-    matches!(config.footer_mode, FooterMode::RowCount(limit) if count_records > limit)
-        || matches!(config.footer_mode, FooterMode::Always)
+    match config.footer_mode {
+        // Only show the footer if there are more than RowCount rows
+        FooterMode::RowCount(limit) => count_records > limit,
+        // Always show the footer
+        FooterMode::Always => true,
+        // Never show the footer
+        FooterMode::Never => false,
+        // Calculate the screen height and row count, if screen height is larger than row count, don't show footer
+        FooterMode::Auto => {
+            let (_width, height) = match terminal_size() {
+                Ok((w, h)) => (w as u64, h as u64),
+                _ => (0, 0),
+            };
+            height <= count_records
+        }
+    }
+}
+
+pub fn check_value(value: &Value) -> Result<(), ShellError> {
+    match value {
+        Value::Error { error, .. } => Err(*error.clone()),
+        _ => Ok(()),
+    }
 }

@@ -1,56 +1,37 @@
-use nu_test_support::nu_with_plugins;
+use nu_protocol::test_record;
+use nu_test_support::prelude::*;
 
 #[test]
-fn closure() {
-    let actual = nu_with_plugins!(
-        cwd: "tests",
-        plugin: ("nu_plugin_example"),
-        r#"
-            $env.env_value = "value from env"
-
-            $env.config = {
-                plugins: {
-                    example: {||
-                        $env.env_value
-                    }
-                }
-            }
-            nu-example-config
-        "#
-    );
-
-    assert!(actual.out.contains("value from env"));
+#[deps(NU_PLUGIN_EXAMPLE)]
+fn none() -> Result {
+    let err = test().run("example config").expect_shell_error()?;
+    assert_eq!(err.to_string(), "No config sent");
+    Ok(())
 }
 
 #[test]
-fn none() {
-    let actual = nu_with_plugins!(
-        cwd: "tests",
-        plugin: ("nu_plugin_example"),
-        "nu-example-config"
-    );
-
-    assert!(actual.err.contains("No config sent"));
-}
-
-#[test]
-fn record() {
-    let actual = nu_with_plugins!(
-        cwd: "tests",
-        plugin: ("nu_plugin_example"),
-        r#"
-            $env.config = {
-                plugins: {
-                    example: {
-                        key1: "value"
-                        key2: "other"
+#[deps(NU_PLUGIN_EXAMPLE)]
+fn some() -> Result {
+    let code = r#"
+        $env.config = {
+            plugins: {
+                example: {
+                    path: "some/path",
+                    nested: {
+                        bool: true,
+                        string: "Hello Example!"
                     }
                 }
             }
-            nu-example-config
-        "#
-    );
+        }
+        example config
+    "#;
 
-    assert!(actual.out.contains("value"));
-    assert!(actual.out.contains("other"));
+    test().run(code).expect_value_eq(test_record! {
+        "path" => "some/path",
+        "nested" => test_record! {
+            "bool" => true,
+            "string" => "Hello Example!"
+        }
+    })
 }

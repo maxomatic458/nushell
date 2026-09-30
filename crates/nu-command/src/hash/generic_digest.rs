@@ -1,12 +1,6 @@
-use nu_cmd_base::input_handler::{operate, CmdArgument};
-use nu_engine::CallExt;
-use nu_protocol::ast::{Call, CellPath};
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, PipelineData, ShellError, Signature, SyntaxShape, Type, Value,
-};
-use nu_protocol::{IntoPipelineData, Span};
-use std::marker::PhantomData;
+use nu_cmd_base::input_handler::{CmdArgument, operate};
+use nu_engine::command_prelude::*;
+use std::{fmt::Write, marker::PhantomData};
 
 pub trait HashDigest: digest::Digest + Clone {
     fn name() -> &'static str;
@@ -16,7 +10,7 @@ pub trait HashDigest: digest::Digest + Clone {
 #[derive(Clone)]
 pub struct GenericDigest<D: HashDigest> {
     name: String,
-    usage: String,
+    description: String,
     phantom: PhantomData<D>,
 }
 
@@ -24,7 +18,7 @@ impl<D: HashDigest> Default for GenericDigest<D> {
     fn default() -> Self {
         Self {
             name: format!("hash {}", D::name()),
-            usage: format!("Hash a value using the {} hash algorithm.", D::name()),
+            description: format!("Hash a value using the {} hash algorithm.", D::name()),
             phantom: PhantomData,
         }
     }
@@ -41,10 +35,17 @@ impl CmdArgument for Arguments {
     }
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 impl<D> Command for GenericDigest<D>
 where
     D: HashDigest + Send + Sync + 'static,
-    digest::Output<D>: core::fmt::LowerHex,
 {
     fn name(&self) -> &str {
         &self.name
@@ -54,14 +55,23 @@ where
         Signature::build(self.name())
             .category(Category::Hash)
             .input_output_types(vec![
-                (Type::String, Type::Any),
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::String, Type::one_of([Type::String, Type::Binary])),
+                (Type::Binary, Type::one_of([Type::String, Type::Binary])),
+                (
+                    Type::list(Type::String),
+                    Type::list(Type::one_of([Type::String, Type::Binary])),
+                ),
+                (
+                    Type::list(Type::Binary),
+                    Type::list(Type::one_of([Type::String, Type::Binary])),
+                ),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true)
             .switch(
                 "binary",
-                "Output binary instead of hexadecimal representation",
+                "Output binary instead of hexadecimal representation.",
                 Some('b'),
             )
             .rest(
@@ -71,8 +81,8 @@ where
             )
     }
 
-    fn usage(&self) -> &str {
-        &self.usage
+    fn description(&self) -> &str {
+        &self.description
     }
 
     fn examples(&self) -> Vec<Example<'static>> {
@@ -86,54 +96,25 @@ where
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
+        let head = call.head;
         let binary = call.has_flag(engine_state, stack, "binary")?;
         let cell_paths: Vec<CellPath> = call.rest(engine_state, stack, 0)?;
         let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
-        let args = Arguments { binary, cell_paths };
-        let mut hasher = D::new();
-        match input {
-            PipelineData::ExternalStream {
-                stdout: Some(stream),
-                span,
-                ..
-            } => {
-                for item in stream {
-                    match item {
-                        // String and binary data are valid byte patterns
-                        Ok(Value::String { val, .. }) => hasher.update(val.as_bytes()),
-                        Ok(Value::Binary { val, .. }) => hasher.update(val),
-                        // If any Error value is output, echo it back
-                        Ok(v @ Value::Error { .. }) => return Ok(v.into_pipeline_data()),
-                        // Unsupported data
-                        Ok(other) => {
-                            return Ok(Value::error(
-                                ShellError::OnlySupportsThisInputType {
-                                    exp_input_type: "string and binary".into(),
-                                    wrong_type: other.get_type().to_string(),
-                                    dst_span: span,
-                                    src_span: other.span(),
-                                },
-                                span,
-                            )
-                            .into_pipeline_data());
-                        }
-                        Err(err) => return Err(err),
-                    };
-                }
-                let digest = hasher.finalize();
-                if args.binary {
-                    Ok(Value::binary(digest.to_vec(), span).into_pipeline_data())
-                } else {
-                    Ok(Value::string(format!("{digest:x}"), span).into_pipeline_data())
-                }
+
+        if let PipelineData::ByteStream(stream, ..) = input {
+            let bytes = stream.into_bytes()?;
+            let digest = D::digest(&bytes);
+            if binary {
+                Ok(
+                    Value::binary(<[u8]>::to_vec(AsRef::<[u8]>::as_ref(&digest)), head)
+                        .into_pipeline_data(),
+                )
+            } else {
+                Ok(Value::string(hex_encode(digest.as_ref()), head).into_pipeline_data())
             }
-            _ => operate(
-                action::<D>,
-                args,
-                input,
-                call.head,
-                engine_state.ctrlc.clone(),
-            ),
+        } else {
+            let args = Arguments { binary, cell_paths };
+            operate(action::<D>, args, input, head, engine_state.signals())
         }
     }
 }
@@ -141,7 +122,6 @@ where
 pub(super) fn action<D>(input: &Value, args: &Arguments, _span: Span) -> Value
 where
     D: HashDigest,
-    digest::Output<D>: core::fmt::LowerHex,
 {
     let span = input.span();
     let (bytes, span) = match input {
@@ -167,8 +147,8 @@ where
     let digest = D::digest(bytes);
 
     if args.binary {
-        Value::binary(digest.to_vec(), span)
+        Value::binary(<[u8]>::to_vec(AsRef::<[u8]>::as_ref(&digest)), span)
     } else {
-        Value::string(format!("{digest:x}"), span)
+        Value::string(hex_encode(AsRef::<[u8]>::as_ref(&digest)), span)
     }
 }

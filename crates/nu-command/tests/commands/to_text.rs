@@ -1,19 +1,52 @@
-use nu_test_support::nu;
+use rstest::rstest;
+use rstest_reuse::{apply, template};
 
-#[test]
-fn list_to_text() {
-    let actual = nu!(r#"["foo" "bar" "baz"] | to text"#);
+use nu_test_support::prelude::*;
+use nu_utils::consts::LINE_SEPARATOR_STR;
 
-    // these actually have newlines between them in the real world but nu! strips newlines, grr
-    assert_eq!(actual.out, "foobarbaz");
+#[template]
+#[rstest]
+#[case(&[])]
+#[case(&["a"])]
+#[case(&["a", "b"])]
+fn input_template(#[case] input: &[&str]) -> Result {}
+
+#[apply(input_template)]
+fn list(#[case] input: &[&str]) -> Result {
+    let mut expect = input.join(LINE_SEPARATOR_STR);
+    if !expect.is_empty() {
+        expect += LINE_SEPARATOR_STR;
+    }
+    test()
+        .run_with_data("to text", input.to_vec())
+        .expect_value_eq(expect)
 }
 
-// the output should be the same when `to text` gets a ListStream instead of a Value::List
-#[test]
-fn list_stream_to_text() {
-    // use `each` to convert the list to a ListStream
-    let actual = nu!(r#"["foo" "bar" "baz"] | each {|i| $i} | to text"#);
+// The output should be the same when `to text` gets a ListStream instead of a Value::List.
+#[apply(input_template)]
+fn list_stream(#[case] input: &[&str]) -> Result {
+    let mut expect = input.join(LINE_SEPARATOR_STR);
+    if !expect.is_empty() {
+        expect += LINE_SEPARATOR_STR;
+    }
+    test()
+        .run_with_data("each {} | to text", input.to_vec())
+        .expect_value_eq(expect)
+}
 
-    // these actually have newlines between them in the real world but nu! strips newlines, grr
-    assert_eq!(actual.out, "foobarbaz");
+#[apply(input_template)]
+fn list_no_newline(#[case] input: &[&str]) -> Result {
+    let expect = input.join(LINE_SEPARATOR_STR);
+    test()
+        .run_with_data("to text --no-newline", input.to_vec())
+        .expect_value_eq(expect)
+}
+
+// The output should be the same when `to text` gets a ListStream instead of a Value::List.
+#[apply(input_template)]
+fn list_stream_no_newline(#[case] input: &[&str]) -> Result {
+    let expect = input.join(LINE_SEPARATOR_STR);
+    test()
+        .run_with_data("each {} | to text --no-newline", input.to_vec())
+        .expect_value_eq(expect)
 }

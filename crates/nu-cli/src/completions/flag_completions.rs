@@ -1,88 +1,47 @@
-use crate::completions::{Completer, CompletionOptions};
-use nu_protocol::{
-    ast::{Expr, Expression},
-    engine::StateWorkingSet,
-    Span,
+use crate::completions::{
+    Completer, Context, Fetched, SemanticSuggestion, completion_options::NuMatcher,
+    to_reedline_span,
 };
-
+use nu_protocol::{DeclId, SuggestionKind};
 use reedline::Suggestion;
 
 #[derive(Clone)]
 pub struct FlagCompletion {
-    expression: Expression,
-}
-
-impl FlagCompletion {
-    pub fn new(expression: Expression) -> Self {
-        Self { expression }
-    }
+    pub decl_id: DeclId,
 }
 
 impl Completer for FlagCompletion {
-    fn fetch(
-        &mut self,
-        working_set: &StateWorkingSet,
-        prefix: Vec<u8>,
-        span: Span,
-        offset: usize,
-        _: usize,
-        options: &CompletionOptions,
-    ) -> Vec<Suggestion> {
-        // Check if it's a flag
-        if let Expr::Call(call) = &self.expression.expr {
-            let decl = working_set.get_decl(call.decl_id);
-            let sig = decl.signature();
+    fn fetch(&mut self, ctx: &Context) -> Fetched {
+        let working_set = ctx.working_set;
+        let span = ctx.span;
+        let offset = ctx.offset;
+        let mut matcher = NuMatcher::new(ctx.prefix_str(), ctx.options, true);
+        let mut add_suggestion = |value: String, description: String| {
+            matcher.add_semantic_suggestion(SemanticSuggestion {
+                suggestion: Suggestion {
+                    value,
+                    description: Some(description),
+                    span: to_reedline_span(span, offset),
+                    append_whitespace: true,
+                    ..Suggestion::default()
+                },
+                kind: Some(SuggestionKind::Flag),
+            });
+        };
 
-            let mut output = vec![];
-
-            for named in &sig.named {
-                let flag_desc = &named.desc;
-                if let Some(short) = named.short {
-                    let mut named = vec![0; short.len_utf8()];
-                    short.encode_utf8(&mut named);
-                    named.insert(0, b'-');
-
-                    if options.match_algorithm.matches_u8(&named, &prefix) {
-                        output.push(Suggestion {
-                            value: String::from_utf8_lossy(&named).to_string(),
-                            description: Some(flag_desc.to_string()),
-                            style: None,
-                            extra: None,
-                            span: reedline::Span {
-                                start: span.start - offset,
-                                end: span.end - offset,
-                            },
-                            append_whitespace: true,
-                        });
-                    }
-                }
-
-                if named.long.is_empty() {
-                    continue;
-                }
-
-                let mut named = named.long.as_bytes().to_vec();
-                named.insert(0, b'-');
-                named.insert(0, b'-');
-
-                if options.match_algorithm.matches_u8(&named, &prefix) {
-                    output.push(Suggestion {
-                        value: String::from_utf8_lossy(&named).to_string(),
-                        description: Some(flag_desc.to_string()),
-                        style: None,
-                        extra: None,
-                        span: reedline::Span {
-                            start: span.start - offset,
-                            end: span.end - offset,
-                        },
-                        append_whitespace: true,
-                    });
-                }
+        let decl = working_set.get_decl(self.decl_id);
+        let sig = decl.signature();
+        for named in &sig.named {
+            if let Some(short) = named.short {
+                let mut name = String::from("-");
+                name.push(short);
+                add_suggestion(name, named.desc.clone());
             }
 
-            return output;
+            if let Some(long) = named.long_name() {
+                add_suggestion(format!("--{long}"), named.desc.clone());
+            }
         }
-
-        vec![]
+        Fetched::answering(matcher.suggestion_results())
     }
 }

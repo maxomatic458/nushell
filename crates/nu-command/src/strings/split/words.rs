@@ -1,17 +1,13 @@
-use crate::grapheme_flags;
+use crate::{grapheme_flags, grapheme_flags_const};
 use fancy_regex::Regex;
-use nu_engine::CallExt;
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    Category, Example, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value,
-};
+use nu_engine::command_prelude::*;
+
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct SplitWords;
 
-impl Command for SubCommand {
+impl Command for SplitWords {
     fn name(&self) -> &str {
         "split words"
     }
@@ -45,22 +41,22 @@ impl Command for SubCommand {
             .named(
                 "min-word-length",
                 SyntaxShape::Int,
-                "The minimum word length",
+                "The minimum word length.",
                 Some('l'),
             )
             .switch(
                 "grapheme-clusters",
-                "measure word length in grapheme clusters (requires -l)",
+                "Measure word length in grapheme clusters (requires -l).",
                 Some('g'),
             )
             .switch(
                 "utf-8-bytes",
-                "measure word length in UTF-8 bytes (default; requires -l; non-ASCII chars are length 2+)",
+                "Measure word length in UTF-8 bytes (default; requires -l; non-ASCII chars are length 2+).",
                 Some('b'),
             )
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Split a string's words into separate rows."
     }
 
@@ -68,10 +64,10 @@ impl Command for SubCommand {
         vec!["separate", "divide"]
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Split the string's words into separate rows",
+                description: "Split the string's words into separate rows.",
                 example: "'hello world' | split words",
                 result: Some(Value::list(
                     vec![Value::test_string("hello"), Value::test_string("world")],
@@ -79,8 +75,7 @@ impl Command for SubCommand {
                 )),
             },
             Example {
-                description:
-                    "Split the string's words, of at least 3 characters, into separate rows",
+                description: "Split the string's words, of at least 3 characters, into separate rows.",
                 example: "'hello to the world' | split words --min-word-length 3",
                 result: Some(Value::list(
                     vec![
@@ -92,12 +87,15 @@ impl Command for SubCommand {
                 )),
             },
             Example {
-                description:
-                    "A real-world example of splitting words",
+                description: "A real-world example of splitting words.",
                 example: "http get https://www.gutenberg.org/files/11/11-0.txt | str downcase | split words --min-word-length 2 | uniq --count | sort-by count --reverse | first 10",
                 result: None,
             },
         ]
+    }
+
+    fn is_const(&self) -> bool {
+        true
     }
 
     fn run(
@@ -107,41 +105,79 @@ impl Command for SubCommand {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        split_words(engine_state, stack, call, input)
+        let word_length: Option<usize> = call.get_flag(engine_state, stack, "min-word-length")?;
+        let has_grapheme = call.has_flag(engine_state, stack, "grapheme-clusters")?;
+        let has_utf8 = call.has_flag(engine_state, stack, "utf-8-bytes")?;
+        let graphemes = grapheme_flags(engine_state, stack, call)?;
+
+        let args = Arguments {
+            word_length,
+            has_grapheme,
+            has_utf8,
+            graphemes,
+        };
+        split_words(engine_state, call, input, args)
     }
+
+    fn run_const(
+        &self,
+        working_set: &StateWorkingSet,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let word_length: Option<usize> =
+            call.get_flag_const(working_set, stack, "min-word-length")?;
+        let has_grapheme = call.has_flag_const(working_set, stack, "grapheme-clusters")?;
+        let has_utf8 = call.has_flag_const(working_set, stack, "utf-8-bytes")?;
+        let graphemes = grapheme_flags_const(working_set, stack, call)?;
+
+        let args = Arguments {
+            word_length,
+            has_grapheme,
+            has_utf8,
+            graphemes,
+        };
+        split_words(working_set.permanent(), call, input, args)
+    }
+}
+
+struct Arguments {
+    word_length: Option<usize>,
+    has_grapheme: bool,
+    has_utf8: bool,
+    graphemes: bool,
 }
 
 fn split_words(
     engine_state: &EngineState,
-    stack: &mut Stack,
     call: &Call,
     input: PipelineData,
+    args: Arguments,
 ) -> Result<PipelineData, ShellError> {
     let span = call.head;
     // let ignore_hyphenated = call.has_flag(engine_state, stack, "ignore-hyphenated")?;
     // let ignore_apostrophes = call.has_flag(engine_state, stack, "ignore-apostrophes")?;
     // let ignore_punctuation = call.has_flag(engine_state, stack, "ignore-punctuation")?;
-    let word_length: Option<usize> = call.get_flag(engine_state, stack, "min-word-length")?;
 
-    if word_length.is_none() {
-        if call.has_flag(engine_state, stack, "grapheme-clusters")? {
+    if args.word_length.is_none() {
+        if args.has_grapheme {
             return Err(ShellError::IncompatibleParametersSingle {
                 msg: "--grapheme-clusters (-g) requires --min-word-length (-l)".to_string(),
                 span,
             });
         }
-        if call.has_flag(engine_state, stack, "utf-8-bytes")? {
+        if args.has_utf8 {
             return Err(ShellError::IncompatibleParametersSingle {
                 msg: "--utf-8-bytes (-b) requires --min-word-length (-l)".to_string(),
                 span,
             });
         }
     }
-    let graphemes = grapheme_flags(engine_state, stack, call)?;
 
     input.map(
-        move |x| split_words_helper(&x, word_length, span, graphemes),
-        engine_state.ctrlc.clone(),
+        move |x| split_words_helper(&x, args.word_length, span, args.graphemes),
+        engine_state.signals(),
     )
 }
 
@@ -151,19 +187,19 @@ fn split_words_helper(v: &Value, word_length: Option<usize>, span: Span, graphem
     // [^[:alpha:]\'] = do not match any uppercase or lowercase letters or apostrophes
     // [^\p{L}\'] = do not match any unicode uppercase or lowercase letters or apostrophes
     // Let's go with the unicode one in hopes that it works on more than just ascii characters
-    let regex_replace = Regex::new(r"[^\p{L}\']").expect("regular expression error");
+    let regex_replace = Regex::new(r"[^\p{L}\p{N}\']").expect("regular expression error");
     let v_span = v.span();
 
     match v {
         Value::Error { error, .. } => Value::error(*error.clone(), v_span),
         v => {
             let v_span = v.span();
-            if let Ok(s) = v.as_string() {
+            if let Ok(s) = v.as_str() {
                 // let splits = s.unicode_words();
                 // let words = trim_to_words(s);
                 // let words: Vec<&str> = s.split_whitespace().collect();
 
-                let replaced_string = regex_replace.replace_all(&s, " ").to_string();
+                let replaced_string = regex_replace.replace_all(s, " ").to_string();
                 let words = replaced_string
                     .split(' ')
                     .filter_map(|s| {
@@ -190,8 +226,9 @@ fn split_words_helper(v: &Value, word_length: Option<usize>, span: Span, graphem
                 Value::list(words, v_span)
             } else {
                 Value::error(
-                    ShellError::PipelineMismatch {
+                    ShellError::OnlySupportsThisInputType {
                         exp_input_type: "string".into(),
+                        wrong_type: v.get_type().to_string(),
                         dst_span: span,
                         src_span: v_span,
                     },
@@ -366,24 +403,30 @@ fn split_words_helper(v: &Value, word_length: Option<usize>, span: Span, graphem
 #[cfg(test)]
 mod test {
     use super::*;
-    use nu_test_support::nu;
+    use nu_test_support::prelude::{Result, *};
 
     #[test]
-    fn test_incompat_flags() {
-        let out = nu!("'a' | split words -bg -l 2");
-        assert!(out.err.contains("incompatible_parameters"));
+    fn test_incompat_flags() -> Result {
+        test()
+            .run("'a' | split words -bg -l 2")
+            .expect_error_code_eq("nu::shell::incompatible_parameters")
     }
 
     #[test]
-    fn test_incompat_flags_2() {
-        let out = nu!("'a' | split words -g");
-        assert!(out.err.contains("incompatible_parameters"));
+    fn test_incompat_flags_2() -> Result {
+        test()
+            .run("'a' | split words -g")
+            .expect_error_code_eq("nu::shell::incompatible_parameters")
     }
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(SplitWords)
+    }
+    #[test]
+    fn mixed_letter_number() -> Result {
+        test()
+            .run(r#"echo "a1 b2 c3" | split words"#)
+            .expect_value_eq(["a1", "b2", "c3"])
     }
 }

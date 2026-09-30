@@ -1,62 +1,102 @@
-use nu_engine::current_dir;
-use nu_engine::CallExt;
-use nu_path::{expand_path_with, expand_to_real_path};
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
+use nu_engine::command_prelude::*;
+use nu_glob::MatchOptions;
+use nu_path::expand_path_with;
 use nu_protocol::{
-    Category, Example, NuPath, PipelineData, ShellError, Signature, Spanned, SyntaxShape, Type,
+    NuGlob, record,
+    shell_error::{self, generic::GenericError, io::IoError},
 };
-use std::ffi::OsString;
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
 use uu_mv::{BackupMode, UpdateMode};
+use uucore::{localized_help_template, translate};
 
 #[derive(Clone)]
 pub struct UMv;
 
 impl Command for UMv {
     fn name(&self) -> &str {
-        "umv"
+        "mv"
     }
 
-    fn usage(&self) -> &str {
-        "Move files or directories."
+    fn description(&self) -> &str {
+        "Move files or directories using uutils/coreutils mv."
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Rename a file",
-                example: "umv before.txt after.txt",
+                description: "Rename a file.",
+                example: "mv before.txt after.txt",
                 result: None,
             },
             Example {
-                description: "Move a file into a directory",
-                example: "umv test.txt my/subdirectory",
+                description: "Move a file into a directory.",
+                example: "mv test.txt my/subdirectory",
                 result: None,
             },
             Example {
-                description: "Move many files into a directory",
-                example: "umv *.txt my/subdirectory",
+                description: "Move only if source file is newer than target file.",
+                example: "mv -u new/test.txt old/",
                 result: None,
+            },
+            Example {
+                description: "Move many files into a directory.",
+                example: "mv *.txt my/subdirectory",
+                result: None,
+            },
+            Example {
+                description: r#"Move a file into the "my" directory two levels up in the directory tree."#,
+                example: "mv test.txt .../my/",
+                result: None,
+            },
+            Example {
+                description: "Move a file and show what is being done.",
+                example: "mv -v before.txt after.txt",
+                result: Some(Value::test_list(vec![
+                    record! {
+                        "source" => Value::string("before.txt", Span::test_data()),
+                        "destination" => Value::string("after.txt", Span::test_data()),
+                        "message" => Value::string("renamed ", Span::test_data()),
+                    }
+                    .into_value(Span::test_data()),
+                ])),
             },
         ]
     }
 
     fn search_terms(&self) -> Vec<&str> {
-        vec!["move"]
+        vec!["move", "file", "files", "coreutils", "rename", "ren"]
     }
 
     fn signature(&self) -> nu_protocol::Signature {
-        Signature::build("umv")
-            .input_output_types(vec![(Type::Nothing, Type::Nothing)])
-            .switch("force", "do not prompt before overwriting", Some('f'))
-            .switch("verbose", "explain what is being done.", Some('v'))
-            .switch("progress", "display a progress bar", Some('p'))
-            .switch("interactive", "prompt before overwriting", Some('i'))
-            .switch("no-clobber", "do not overwrite an existing file", Some('n'))
+        Signature::build("mv")
+            .input_output_types(vec![
+                (
+                    Type::Nothing,
+                    Type::Table(
+                        vec![
+                            ("source".into(), Type::String),
+                            ("destination".into(), Type::String),
+                            ("message".into(), Type::String),
+                        ]
+                        .into(),
+                    ),
+                ),
+                (Type::Nothing, Type::Nothing),
+            ])
+            .switch("force", "Do not prompt before overwriting.", Some('f'))
+            .switch("verbose", "Explain what is being done.", Some('v'))
+            .switch("progress", "Display a progress bar.", Some('p'))
+            .switch("interactive", "Prompt before overwriting.", Some('i'))
+            .switch(
+                "update",
+                "Move and overwrite only when the SOURCE file is newer than the destination file or when the destination file is missing.",
+                Some('u')
+            )
+            .switch("no-clobber", "Do not overwrite an existing file.", Some('n'))
+            .switch("all", "Move hidden files if '*' is provided.", Some('a'))
             .rest(
                 "paths",
-                SyntaxShape::GlobPattern,
+                SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::String]),
                 "Rename SRC to DST, or move SRC to DIR.",
             )
             .allow_variants_without_examples(true)
@@ -70,10 +110,14 @@ impl Command for UMv {
         call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
+        // setup the uutils error translation
+        let _ = localized_help_template("mv");
+
         let interactive = call.has_flag(engine_state, stack, "interactive")?;
         let no_clobber = call.has_flag(engine_state, stack, "no-clobber")?;
         let progress = call.has_flag(engine_state, stack, "progress")?;
         let verbose = call.has_flag(engine_state, stack, "verbose")?;
+        let all = call.has_flag(engine_state, stack, "all")?;
         let overwrite = if no_clobber {
             uu_mv::OverwriteMode::NoClobber
         } else if interactive {
@@ -81,30 +125,31 @@ impl Command for UMv {
         } else {
             uu_mv::OverwriteMode::Force
         };
+        let update = if call.has_flag(engine_state, stack, "update")? {
+            UpdateMode::IfOlder
+        } else {
+            UpdateMode::All
+        };
 
-        let cwd = current_dir(engine_state, stack)?;
-        let mut paths: Vec<Spanned<NuPath>> = call.rest(engine_state, stack, 0)?;
+        let cwd = engine_state.cwd(Some(stack))?.into_std_path_buf();
+        let mut paths = call.rest::<Spanned<NuGlob>>(engine_state, stack, 0)?;
         if paths.is_empty() {
-            return Err(ShellError::GenericError {
-                error: "Missing file operand".into(),
-                msg: "Missing file operand".into(),
-                span: Some(call.head),
-                help: Some("Please provide source and destination paths".into()),
-                inner: Vec::new(),
-            });
+            return Err(ShellError::Generic(
+                GenericError::new("Missing file operand", "Missing file operand", call.head)
+                    .with_help("Please provide source and destination paths"),
+            ));
         }
         if paths.len() == 1 {
             // expand path for better error message
-            return Err(ShellError::GenericError {
-                error: "Missing destination path".into(),
-                msg: format!(
+            return Err(ShellError::Generic(GenericError::new(
+                "Missing destination path",
+                format!(
                     "Missing destination path operand after {}",
-                    expand_path_with(paths[0].item.as_ref(), cwd).to_string_lossy()
+                    expand_path_with(paths[0].item.as_ref(), cwd, paths[0].item.is_expand())
+                        .to_string_lossy()
                 ),
-                span: Some(paths[0].span),
-                help: None,
-                inner: Vec::new(),
-            });
+                paths[0].span,
+            )));
         }
 
         // Do not glob target
@@ -113,66 +158,122 @@ impl Command for UMv {
             label: "Missing file operand".into(),
             span: call.head,
         })?;
-        let mut files: Vec<PathBuf> = Vec::new();
+        let mut files: Vec<(Vec<PathBuf>, bool)> = Vec::new();
+        let glob_options = if all {
+            None
+        } else {
+            let glob_options = MatchOptions {
+                require_literal_leading_dot: true,
+                ..Default::default()
+            };
+            Some(glob_options)
+        };
         for mut p in paths {
             p.item = p.item.strip_ansi_string_unlikely();
-            let exp_files: Vec<Result<PathBuf, ShellError>> =
-                nu_engine::glob_from(&p, &cwd, call.head, None)
-                    .map(|f| f.1)?
-                    .collect();
+            let exp_files: Vec<Result<PathBuf, ShellError>> = nu_engine::glob_from(
+                &p,
+                &cwd,
+                call.head,
+                glob_options,
+                engine_state.signals().clone(),
+            )
+            .map(|f| f.1)?
+            .collect();
             if exp_files.is_empty() {
-                return Err(ShellError::FileNotFound { span: p.span });
+                return Err(ShellError::Io(IoError::new(
+                    shell_error::io::ErrorKind::FileNotFound,
+                    p.span,
+                    PathBuf::from(p.item.to_string()),
+                )));
             };
             let mut app_vals: Vec<PathBuf> = Vec::new();
             for v in exp_files {
-                match v {
-                    Ok(path) => {
-                        app_vals.push(path);
-                    }
-                    Err(e) => return Err(e),
-                }
+                let path = v?;
+                app_vals.push(path);
             }
-            files.append(&mut app_vals);
+            files.push((app_vals, p.item.is_expand()));
         }
 
         // Make sure to send absolute paths to avoid uu_cp looking for cwd in std::env which is not
         // supported in Nushell
-        for src in files.iter_mut() {
-            if !src.is_absolute() {
-                *src = nu_path::expand_path_with(&src, &cwd);
+        for (files, need_expand_tilde) in files.iter_mut() {
+            for src in files.iter_mut() {
+                if !src.is_absolute() {
+                    *src = nu_path::expand_path_with(&*src, &cwd, *need_expand_tilde);
+                }
             }
         }
+        let source_files: Vec<PathBuf> = files.into_iter().flat_map(|x| x.0).collect();
 
         // Add back the target after globbing
-        let expanded_target = expand_to_real_path(nu_utils::strip_ansi_string_unlikely(
-            spanned_target.item.to_string(),
-        ));
-        let abs_target_path = expand_path_with(expanded_target, &cwd);
-        files.push(abs_target_path.clone());
-        let files = files
+        let abs_target_path = expand_path_with(
+            nu_utils::strip_ansi_string_unlikely(spanned_target.item.to_string()),
+            &cwd,
+            matches!(spanned_target.item, NuGlob::Expand(..)),
+        );
+
+        // Collect verbose messages before the move
+        let verbose_msgs: Vec<(PathBuf, PathBuf)> = if verbose {
+            source_files
+                .iter()
+                .map(|src| {
+                    let dest = if abs_target_path.is_dir() {
+                        abs_target_path.join(src.file_name().unwrap_or_default())
+                    } else {
+                        abs_target_path.clone()
+                    };
+                    (src.clone(), dest)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut files_for_mv = source_files;
+        files_for_mv.push(abs_target_path.clone());
+        let files_for_mv = files_for_mv
             .into_iter()
             .map(|p| p.into_os_string())
             .collect::<Vec<OsString>>();
         let options = uu_mv::Options {
             overwrite,
             progress_bar: progress,
-            verbose,
+            verbose: false,
             suffix: String::from("~"),
-            backup: BackupMode::NoBackup,
-            update: UpdateMode::ReplaceAll,
+            backup: BackupMode::None,
+            update,
             target_dir: None,
             no_target_dir: false,
             strip_slashes: false,
+            debug: false,
+            context: None,
+            exchange: false,
         };
-        if let Err(error) = uu_mv::mv(&files, &options) {
-            return Err(ShellError::GenericError {
-                error: format!("{}", error),
-                msg: format!("{}", error),
-                span: None,
-                help: None,
-                inner: Vec::new(),
-            });
+        if let Err(error) = uu_mv::mv(&files_for_mv, &options) {
+            return Err(ShellError::Generic(GenericError::new_internal(
+                format!("{error}"),
+                translate!(&error.to_string()),
+            )));
         }
-        Ok(PipelineData::empty())
+
+        if verbose {
+            let output: Vec<Value> = verbose_msgs
+                .into_iter()
+                .map(|(src, dest)| {
+                    record! {
+                        "source" => Value::string(src.display().to_string(), call.head),
+                        "destination" => Value::string(dest.display().to_string(), call.head),
+                        "message" => Value::string(translate!(
+                            "mv-verbose-renamed",
+                            "from" => src.display().to_string(),
+                            "to" => dest.display().to_string(),
+                        ), call.head)
+                    }
+                    .into_value(call.head)
+                })
+                .collect();
+            Ok(PipelineData::Value(Value::list(output, call.head), None))
+        } else {
+            Ok(PipelineData::empty())
+        }
     }
 }

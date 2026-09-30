@@ -1,17 +1,13 @@
-use crate::grapheme_flags;
-use crate::grapheme_flags_const;
-use nu_cmd_base::input_handler::{operate, CmdArgument};
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::ast::CellPath;
-use nu_protocol::engine::{Command, EngineState, Stack, StateWorkingSet};
-use nu_protocol::Category;
-use nu_protocol::{Example, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value};
+use crate::{grapheme_flags, grapheme_flags_const};
+use nu_cmd_base::input_handler::{CmdArgument, operate};
+use nu_engine::command_prelude::*;
+
 use unicode_segmentation::UnicodeSegmentation;
 
 struct Arguments {
     cell_paths: Option<Vec<CellPath>>,
     graphemes: bool,
+    chars: bool,
 }
 
 impl CmdArgument for Arguments {
@@ -21,9 +17,9 @@ impl CmdArgument for Arguments {
 }
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct StrLength;
 
-impl Command for SubCommand {
+impl Command for StrLength {
     fn name(&self) -> &str {
         "str length"
     }
@@ -33,19 +29,24 @@ impl Command for SubCommand {
             .input_output_types(vec![
                 (Type::String, Type::Int),
                 (Type::List(Box::new(Type::String)), Type::List(Box::new(Type::Int))),
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true)
             .switch(
                 "grapheme-clusters",
-                "count length using grapheme clusters (all visible chars have length 1)",
+                "Count length in grapheme clusters (all visible chars have length 1).",
                 Some('g'),
             )
             .switch(
                 "utf-8-bytes",
-                "count length using UTF-8 bytes (default; all non-ASCII chars have length 2+)",
+                "Count length in UTF-8 bytes (default; all non-ASCII chars have length 2+).",
                 Some('b'),
+            )
+            .switch(
+                "chars",
+                "Count length in chars.",
+                Some('c'),
             )
             .rest(
                 "rest",
@@ -55,7 +56,7 @@ impl Command for SubCommand {
             .category(Category::Strings)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Output the length of any strings in the pipeline."
     }
 
@@ -75,50 +76,60 @@ impl Command for SubCommand {
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let cell_paths: Vec<CellPath> = call.rest(engine_state, stack, 0)?;
+        let chars = call.has_flag(engine_state, stack, "chars")?;
         run(
             cell_paths,
             engine_state,
             call,
             input,
             grapheme_flags(engine_state, stack, call)?,
+            chars,
         )
     }
 
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let cell_paths: Vec<CellPath> = call.rest_const(working_set, 0)?;
+        let cell_paths: Vec<CellPath> = call.rest_const(working_set, stack, 0)?;
+        let chars = call.has_flag_const(working_set, stack, "chars")?;
         run(
             cell_paths,
             working_set.permanent(),
             call,
             input,
-            grapheme_flags_const(working_set, call)?,
+            grapheme_flags_const(working_set, stack, call)?,
+            chars,
         )
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Return the lengths of a string",
+                description: "Return the lengths of a string in bytes.",
                 example: "'hello' | str length",
                 result: Some(Value::test_int(5)),
             },
             Example {
-                description: "Count length using grapheme clusters",
+                description: "Count length of a string in grapheme clusters.",
                 example: "'🇯🇵ほげ ふが ぴよ' | str length  --grapheme-clusters",
                 result: Some(Value::test_int(9)),
             },
             Example {
-                description: "Return the lengths of multiple strings",
+                description: "Return the lengths of multiple strings in bytes.",
                 example: "['hi' 'there'] | str length",
                 result: Some(Value::list(
                     vec![Value::test_int(2), Value::test_int(5)],
                     Span::test_data(),
                 )),
+            },
+            Example {
+                description: "Return the lengths of a string in chars.",
+                example: "'hällo' | str length --chars",
+                result: Some(Value::test_int(5)),
             },
         ]
     }
@@ -130,12 +141,14 @@ fn run(
     call: &Call,
     input: PipelineData,
     graphemes: bool,
+    chars: bool,
 ) -> Result<PipelineData, ShellError> {
     let args = Arguments {
         cell_paths: (!cell_paths.is_empty()).then_some(cell_paths),
         graphemes,
+        chars,
     };
-    operate(action, args, input, call.head, engine_state.ctrlc.clone())
+    operate(action, args, input, call.head, engine_state.signals())
 }
 
 fn action(input: &Value, arg: &Arguments, head: Span) -> Value {
@@ -143,6 +156,8 @@ fn action(input: &Value, arg: &Arguments, head: Span) -> Value {
         Value::String { val, .. } => Value::int(
             if arg.graphemes {
                 val.graphemes(true).count()
+            } else if arg.chars {
+                val.chars().count()
             } else {
                 val.len()
             } as i64,
@@ -172,6 +187,7 @@ mod test {
         let options = Arguments {
             cell_paths: None,
             graphemes: false,
+            chars: false,
         };
 
         let actual = action(&word, &options, Span::test_data());
@@ -179,9 +195,7 @@ mod test {
     }
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StrLength)
     }
 }

@@ -1,32 +1,107 @@
+use crate::Query;
 use gjson::Value as gjValue;
-use nu_plugin::{EvaluatedCall, LabeledError};
-use nu_protocol::{Record, Span, Spanned, Value};
+use nu_plugin::{EngineInterface, EvaluatedCall, SimplePluginCommand};
+use nu_protocol::{
+    Category, Example, LabeledError, Record, Signature, Span, Spanned, SyntaxShape, Value,
+};
+
+pub struct QueryJson;
+
+impl SimplePluginCommand for QueryJson {
+    type Plugin = Query;
+
+    fn name(&self) -> &str {
+        "query json"
+    }
+
+    fn description(&self) -> &str {
+        "execute json query on json file (open --raw <file> | query json 'query string')"
+    }
+
+    fn extra_description(&self) -> &str {
+        "query json uses the gjson crate https://github.com/tidwall/gjson.rs to query json data."
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(self.name())
+            .required("query", SyntaxShape::String, "Json query.")
+            .category(Category::Filters)
+    }
+
+    fn examples(&self) -> Vec<nu_protocol::Example<'_>> {
+        vec![
+            Example {
+                description: "Get a list of children from a json object",
+                example: r#"'{"children": ["Sara","Alex","Jack"]}' | query json children"#,
+                result: Some(Value::test_list(vec![
+                    Value::test_string("Sara"),
+                    Value::test_string("Alex"),
+                    Value::test_string("Jack"),
+                ])),
+            },
+            Example {
+                description: "Get a list of first names of the friends from a json object",
+                example: r#"'{
+  "friends": [
+    {"first": "Dale", "last": "Murphy", "age": 44, "nets": ["ig", "fb", "tw"]},
+    {"first": "Roger", "last": "Craig", "age": 68, "nets": ["fb", "tw"]},
+    {"first": "Jane", "last": "Murphy", "age": 47, "nets": ["ig", "tw"]}
+  ]
+}' | query json friends.#.first"#,
+                result: Some(Value::test_list(vec![
+                    Value::test_string("Dale"),
+                    Value::test_string("Roger"),
+                    Value::test_string("Jane"),
+                ])),
+            },
+            Example {
+                description: "Get the key named last of the name from a json object",
+                example: r#"'{"name": {"first": "Tom", "last": "Anderson"}}' | query json name.last"#,
+                result: Some(Value::test_string("Anderson")),
+            },
+            Example {
+                description: "Get the count of children from a json object",
+                example: r#"'{"children": ["Sara","Alex","Jack"]}' | query json children.#"#,
+                result: Some(Value::test_int(3)),
+            },
+            Example {
+                description: "Get the first child from the children array in reverse the order using the @reverse modifier from a json object",
+                example: r#"'{"children": ["Sara","Alex","Jack"]}' | query json "children|@reverse|0""#,
+                result: Some(Value::test_string("Jack")),
+            },
+        ]
+    }
+
+    fn run(
+        &self,
+        _plugin: &Query,
+        _engine: &EngineInterface,
+        call: &EvaluatedCall,
+        input: &Value,
+    ) -> Result<Value, LabeledError> {
+        let query: Option<Spanned<String>> = call.opt(0)?;
+
+        execute_json_query(call, input, query)
+    }
+}
 
 pub fn execute_json_query(
-    _name: &str,
     call: &EvaluatedCall,
     input: &Value,
     query: Option<Spanned<String>>,
 ) -> Result<Value, LabeledError> {
-    let input_string = match &input.as_string() {
-        Ok(s) => s.clone(),
+    let input_string = match input.coerce_str() {
+        Ok(s) => s,
         Err(e) => {
-            return Err(LabeledError {
-                span: Some(call.head),
-                msg: e.to_string(),
-                label: "problem with input data".to_string(),
-            })
+            return Err(LabeledError::new("Problem with input data").with_inner(e));
         }
     };
 
     let query_string = match &query {
         Some(v) => &v.item,
         None => {
-            return Err(LabeledError {
-                msg: "problem with input data".to_string(),
-                label: "problem with input data".to_string(),
-                span: Some(call.head),
-            })
+            return Err(LabeledError::new("Problem with input data")
+                .with_label("query string missing", call.head));
         }
     };
 
@@ -34,11 +109,9 @@ pub fn execute_json_query(
     let is_valid_json = gjson::valid(&input_string);
 
     if !is_valid_json {
-        return Err(LabeledError {
-            msg: "invalid json".to_string(),
-            label: "invalid json".to_string(),
-            span: Some(call.head),
-        });
+        return Err(
+            LabeledError::new("Invalid JSON").with_label("this is not valid JSON", call.head)
+        );
     }
 
     let val: gjValue = gjson::get(&input_string, query_string);
@@ -106,7 +179,7 @@ fn convert_gjson_value_to_nu_value(v: &gjValue, span: Span) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use gjson::{valid, Value as gjValue};
+    use gjson::{Value as gjValue, valid};
 
     #[test]
     fn validate_string() {

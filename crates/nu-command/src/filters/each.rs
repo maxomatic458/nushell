@@ -1,11 +1,6 @@
 use super::utils::chain_error_with_input;
-use nu_engine::{eval_block_with_early_return, CallExt};
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Closure, Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, IntoInterruptiblePipelineData, IntoPipelineData, PipelineData, ShellError,
-    Signature, Span, SyntaxShape, Type, Value,
-};
+use nu_engine::{ClosureEval, ClosureEvalOnce, command_prelude::*};
+use nu_protocol::engine::Closure;
 
 #[derive(Clone)]
 pub struct Each;
@@ -15,18 +10,37 @@ impl Command for Each {
         "each"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Run a closure on each row of the input list, creating a new list with the results."
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"Since tables are lists of records, passing a table into 'each' will
-iterate over each record, not necessarily each cell within it.
+    fn extra_description(&self) -> &str {
+        r#"Since tables are lists of records, passing a table into 'each' will iterate over each 
+record, not necessarily each cell within it.
 
-Avoid passing single records to this command. Since a record is a
-one-row structure, 'each' will only run once, behaving similar to 'do'.
-To iterate over a record's values, try converting it to a table
-with 'transpose' first."#
+Avoid passing single records to this command. Since a record is a one-row structure, 
+'each' will only run once, behaving similar to 'do'. To iterate over a record's values, 
+use 'items' or try converting it to a table with 'transpose' first.
+
+By default, for each input there is a single output value. If the closure returns a 
+stream rather than value, the stream is collected completely, and the resulting value 
+becomes one of the items in `each`'s output.
+
+To receive items from those streams without waiting for the whole stream to be
+collected, `each --flatten` can be used. Instead of waiting for the stream to be 
+collected before returning the result as a single item, `each --flatten` will return 
+each item as soon as they are received.
+
+This "flattens" the output, turning an output that would otherwise be a list of lists 
+like `list<list<string>>` into a flat list like `list<string>`.
+
+String or byte streams, empty pipelines, null values, ranges, and some custom values
+can also be used as inputs to 'each'. A stream of bytes or strings (usually from 
+external commands) will be treated as though it was a list of chunks of the stream, 
+where the size of the chunks are determined arbitrarily. Empty pipelines and null 
+values are both returned unchanged from 'each' without calling the provided closure. 
+Ranges and custom values which can be iterated will be treated as lists of the values 
+they represent."#
     }
 
     fn search_terms(&self) -> Vec<&str> {
@@ -40,67 +54,90 @@ with 'transpose' first."#
                     Type::List(Box::new(Type::Any)),
                     Type::List(Box::new(Type::Any)),
                 ),
-                (Type::Table(vec![]), Type::List(Box::new(Type::Any))),
+                (Type::table(), Type::List(Box::new(Type::Any))),
                 (Type::Any, Type::Any),
             ])
             .required(
                 "closure",
-                SyntaxShape::Closure(Some(vec![SyntaxShape::Any, SyntaxShape::Int])),
+                SyntaxShape::Closure(Some(vec![SyntaxShape::Any])),
                 "The closure to run.",
             )
-            .switch("keep-empty", "keep empty result cells", Some('k'))
+            .switch("keep-empty", "Keep empty result cells.", Some('k'))
+            .switch(
+                "flatten",
+                "Combine outputs into a single stream instead of collecting them to separate values.",
+                Some('f'),
+            )
             .allow_variants_without_examples(true)
             .category(Category::Filters)
     }
 
-    fn examples(&self) -> Vec<Example> {
-        let stream_test_1 = vec![Value::test_int(2), Value::test_int(4), Value::test_int(6)];
-
-        let stream_test_2 = vec![
-            Value::nothing(Span::test_data()),
-            Value::test_string("found 2!"),
-            Value::nothing(Span::test_data()),
-        ];
-
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 example: "[1 2 3] | each {|e| 2 * $e }",
-                description: "Multiplies elements in the list",
-                result: Some(Value::list(stream_test_1, Span::test_data())),
+                description: "Multiplies elements in the list.",
+                result: Some(Value::test_list(vec![
+                    Value::test_int(2),
+                    Value::test_int(4),
+                    Value::test_int(6),
+                ])),
             },
             Example {
                 example: "{major:2, minor:1, patch:4} | values | each {|| into string }",
-                description: "Produce a list of values in the record, converted to string",
-                result: Some(Value::list(
-                    vec![
-                        Value::test_string("2"),
-                        Value::test_string("1"),
-                        Value::test_string("4"),
-                    ],
-                    Span::test_data(),
-                )),
+                description: "Produce a list of values in the record, converted to string.",
+                result: Some(Value::test_list(vec![
+                    Value::test_string("2"),
+                    Value::test_string("1"),
+                    Value::test_string("4"),
+                ])),
             },
             Example {
                 example: r#"[1 2 3 2] | each {|e| if $e == 2 { "two" } }"#,
-                description: "Produce a list that has \"two\" for each 2 in the input",
-                result: Some(Value::list(
-                    vec![Value::test_string("two"), Value::test_string("two")],
-                    Span::test_data(),
-                )),
+                description: "'null' items will be dropped from the result list. It has the same effect as 'filter_map' in other languages.",
+                result: Some(Value::test_list(vec![
+                    Value::test_string("two"),
+                    Value::test_string("two"),
+                ])),
             },
             Example {
                 example: r#"[1 2 3] | enumerate | each {|e| if $e.item == 2 { $"found 2 at ($e.index)!"} }"#,
-                description:
-                    "Iterate over each element, producing a list showing indexes of any 2s",
-                result: Some(Value::list(
-                    vec![Value::test_string("found 2 at 1!")],
-                    Span::test_data(),
-                )),
+                description: "Iterate over each element, producing a list showing indexes of any 2s.",
+                result: Some(Value::test_list(vec![Value::test_string("found 2 at 1!")])),
             },
             Example {
                 example: r#"[1 2 3] | each --keep-empty {|e| if $e == 2 { "found 2!"} }"#,
-                description: "Iterate over each element, keeping null results",
-                result: Some(Value::list(stream_test_2, Span::test_data())),
+                description: "Iterate over each element, keeping null results.",
+                result: Some(Value::test_list(vec![
+                    Value::nothing(Span::test_data()),
+                    Value::test_string("found 2!"),
+                    Value::nothing(Span::test_data()),
+                ])),
+            },
+            Example {
+                example: r#"$env.name? | each { $"hello ($in)" } | default "bye""#,
+                description: "Return \"hello $name\" for each name in the list of names $env.name, \
+                or return \"bye\" if $env.name does not exist.",
+                result: None,
+            },
+            Example {
+                description: "Scan through multiple files without pause.",
+                example: "\
+                    ls *.txt \
+                    | each --flatten {|f| open $f.name | lines } \
+                    | find -i 'note: ' \
+                    | str join \"\\n\"\
+                    ",
+                result: None,
+            },
+            Example {
+                description: "Print chunks of data from an external command as soon as \
+                they become available.",
+                example: "\
+                ^$nu.current-exe -c 'print hello; sleep 0.5sec; print world' \
+                | each { print $in } | ignore\
+                ",
+                result: None,
             },
         ]
     }
@@ -110,135 +147,144 @@ with 'transpose' first."#
         engine_state: &EngineState,
         stack: &mut Stack,
         call: &Call,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let capture_block: Closure = call.req(engine_state, stack, 0)?;
-
+        let head = call.head;
+        let closure: Closure = call.req(engine_state, stack, 0)?;
         let keep_empty = call.has_flag(engine_state, stack, "keep-empty")?;
+        let flatten = call.has_flag(engine_state, stack, "flatten")?;
 
-        let metadata = input.metadata();
-        let ctrlc = engine_state.ctrlc.clone();
-        let outer_ctrlc = engine_state.ctrlc.clone();
-        let engine_state = engine_state.clone();
-        let block = engine_state.get_block(capture_block.block_id).clone();
-        let mut stack = stack.captures_to_stack(capture_block.captures);
-        let orig_env_vars = stack.env_vars.clone();
-        let orig_env_hidden = stack.env_hidden.clone();
-        let span = call.head;
-        let redirect_stdout = call.redirect_stdout;
-        let redirect_stderr = call.redirect_stderr;
-
-        match input {
-            PipelineData::Empty => Ok(PipelineData::Empty),
+        let result = match input {
+            PipelineData::Empty | PipelineData::Value(Value::Nothing { .. }, ..) => {
+                return Ok(input);
+            }
+            PipelineData::Value(Value::Custom { ref val, .. }, ..)
+                if val.type_name() == "matrix" =>
+            {
+                return Err(ShellError::Generic(
+                    nu_protocol::shell_error::generic::GenericError::new(
+                        "Unsupported type",
+                        "Use `matrix map` for element-wise operations or `matrix reduce` to fold values.",
+                        call.head,
+                    ),
+                ));
+            }
             PipelineData::Value(Value::Range { .. }, ..)
             | PipelineData::Value(Value::List { .. }, ..)
-            | PipelineData::ListStream { .. } => Ok(input
-                .into_iter()
-                .map_while(move |x| {
-                    // with_env() is used here to ensure that each iteration uses
-                    // a different set of environment variables.
-                    // Hence, a 'cd' in the first loop won't affect the next loop.
-                    stack.with_env(&orig_env_vars, &orig_env_hidden);
+            | PipelineData::ListStream(..) => {
+                let metadata = input.take_metadata();
+                let mut closure = ClosureEval::new(engine_state, stack, closure);
 
-                    if let Some(var) = block.signature.get_positional(0) {
-                        if let Some(var_id) = &var.var_id {
-                            stack.add_var(*var_id, x.clone());
-                        }
-                    }
+                let out = if flatten {
+                    input
+                        .into_iter()
+                        .flat_map(move |value| {
+                            closure.run_with_value(value).unwrap_or_else(|error| {
+                                Value::error(error, head).into_pipeline_data()
+                            })
+                        })
+                        .into_pipeline_data(head, engine_state.signals().clone())
+                } else {
+                    input
+                        .into_iter()
+                        .map(move |value| {
+                            each_map(value, &mut closure, head)
+                                .unwrap_or_else(|error| Value::error(error, head))
+                        })
+                        .into_pipeline_data(head, engine_state.signals().clone())
+                };
+                Ok(out.set_metadata(metadata))
+            }
+            // Handle iterable custom values (like SQLiteQueryBuilder)
+            #[expect(deprecated)]
+            PipelineData::Value(Value::Custom { ref val, .. }, ..)
+                if val.is_iterable() && val.type_name() != "matrix" =>
+            {
+                let metadata = input.take_metadata();
+                let mut closure = ClosureEval::new(engine_state, stack, closure);
 
-                    let input_span = x.span();
-                    let x_is_error = x.is_error();
-                    match eval_block_with_early_return(
-                        &engine_state,
-                        &mut stack,
-                        &block,
-                        x.into_pipeline_data(),
-                        redirect_stdout,
-                        redirect_stderr,
-                    ) {
-                        Ok(v) => Some(v.into_value(span)),
-                        Err(ShellError::Continue { span }) => Some(Value::nothing(span)),
-                        Err(ShellError::Break { .. }) => None,
-                        Err(error) => {
-                            let error = chain_error_with_input(error, x_is_error, input_span);
-                            Some(Value::error(error, input_span))
-                        }
-                    }
-                })
-                .into_pipeline_data(ctrlc)),
-            PipelineData::ExternalStream { stdout: None, .. } => Ok(PipelineData::empty()),
-            PipelineData::ExternalStream {
-                stdout: Some(stream),
-                ..
-            } => Ok(stream
-                .into_iter()
-                .map_while(move |x| {
-                    // with_env() is used here to ensure that each iteration uses
-                    // a different set of environment variables.
-                    // Hence, a 'cd' in the first loop won't affect the next loop.
-                    stack.with_env(&orig_env_vars, &orig_env_hidden);
+                let out = if flatten {
+                    input
+                        .into_iter()
+                        .flat_map(move |value| {
+                            closure.run_with_value(value).unwrap_or_else(|error| {
+                                Value::error(error, head).into_pipeline_data()
+                            })
+                        })
+                        .into_pipeline_data(head, engine_state.signals().clone())
+                } else {
+                    input
+                        .into_iter()
+                        .map(move |value| {
+                            each_map(value, &mut closure, head)
+                                .unwrap_or_else(|error| Value::error(error, head))
+                        })
+                        .into_pipeline_data(head, engine_state.signals().clone())
+                };
+                Ok(out.set_metadata(metadata))
+            }
+            PipelineData::ByteStream(stream, metadata) => {
+                let Some(chunks) = stream.chunks() else {
+                    return Ok(PipelineData::empty());
+                };
 
-                    let x = match x {
-                        Ok(x) => x,
-                        Err(ShellError::Continue { span }) => return Some(Value::nothing(span)),
-                        Err(ShellError::Break { .. }) => return None,
-                        Err(err) => return Some(Value::error(err, span)),
-                    };
-
-                    if let Some(var) = block.signature.get_positional(0) {
-                        if let Some(var_id) = &var.var_id {
-                            stack.add_var(*var_id, x.clone());
-                        }
-                    }
-
-                    let input_span = x.span();
-                    let x_is_error = x.is_error();
-
-                    match eval_block_with_early_return(
-                        &engine_state,
-                        &mut stack,
-                        &block,
-                        x.into_pipeline_data(),
-                        redirect_stdout,
-                        redirect_stderr,
-                    ) {
-                        Ok(v) => Some(v.into_value(span)),
-                        Err(ShellError::Continue { span }) => Some(Value::nothing(span)),
-                        Err(ShellError::Break { .. }) => None,
-                        Err(error) => {
-                            let error = chain_error_with_input(error, x_is_error, input_span);
-                            Some(Value::error(error, input_span))
-                        }
-                    }
-                })
-                .into_pipeline_data(ctrlc)),
+                let mut closure = ClosureEval::new(engine_state, stack, closure);
+                let out = if flatten {
+                    chunks
+                        .flat_map(move |result| {
+                            result
+                                .and_then(|value| closure.run_with_value(value))
+                                .unwrap_or_else(|error| {
+                                    Value::error(error, head).into_pipeline_data()
+                                })
+                        })
+                        .into_pipeline_data(head, engine_state.signals().clone())
+                } else {
+                    chunks
+                        .map(move |result| {
+                            result
+                                .and_then(|value| each_map(value, &mut closure, head))
+                                .unwrap_or_else(|error| Value::error(error, head))
+                        })
+                        .into_pipeline_data(head, engine_state.signals().clone())
+                };
+                Ok(out.set_metadata(metadata))
+            }
+            PipelineData::Value(Value::Custom { ref val, .. }, ..)
+                if val.type_name() == "matrix" =>
+            {
+                return Err(ShellError::Generic(
+                    nu_protocol::shell_error::generic::GenericError::new(
+                        "Unsupported type",
+                        "Use `matrix map` for element-wise operations.",
+                        call.head,
+                    ),
+                ));
+            }
             // This match allows non-iterables to be accepted,
             // which is currently considered undesirable (Nov 2022).
-            PipelineData::Value(x, ..) => {
-                if let Some(var) = block.signature.get_positional(0) {
-                    if let Some(var_id) = &var.var_id {
-                        stack.add_var(*var_id, x.clone());
-                    }
-                }
-
-                eval_block_with_early_return(
-                    &engine_state,
-                    &mut stack,
-                    &block,
-                    x.into_pipeline_data(),
-                    redirect_stdout,
-                    redirect_stderr,
-                )
+            PipelineData::Value(value, metadata) => {
+                ClosureEvalOnce::new(engine_state, stack, closure)
+                    .run_with_value_with_metadata(value, metadata)
             }
+        };
+
+        if keep_empty {
+            result
+        } else {
+            result.and_then(|x| x.filter(|v| !v.is_nothing(), engine_state.signals()))
         }
-        .and_then(|x| {
-            x.filter(
-                move |x| if !keep_empty { !x.is_nothing() } else { true },
-                outer_ctrlc,
-            )
-        })
-        .map(|x| x.set_metadata(metadata))
     }
+}
+
+#[inline]
+fn each_map(value: Value, closure: &mut ClosureEval, head: Span) -> Result<Value, ShellError> {
+    let span = value.span();
+    let is_error = value.is_error();
+    closure
+        .run_with_value(value)
+        .and_then(|pipeline_data| pipeline_data.into_value(head))
+        .map_err(|error| chain_error_with_input(error, is_error, span))
 }
 
 #[cfg(test)]
@@ -246,9 +292,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Each {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Each)
     }
 }

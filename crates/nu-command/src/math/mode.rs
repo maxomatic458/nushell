@@ -1,14 +1,11 @@
-use crate::math::utils::run_with_function;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, PipelineData, ShellError, Signature, Span, Type, Value,
+use crate::math::utils::{
+    NUMERIC_INPUT_TYPES, run_with_function_with_cell_paths, run_with_function_with_cell_paths_const,
 };
-use std::cmp::Ordering;
-use std::collections::HashMap;
+use nu_engine::command_prelude::*;
+use std::{cmp::Ordering, collections::HashMap};
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct MathMode;
 
 #[derive(Hash, Eq, PartialEq, Debug)]
 enum NumberTypes {
@@ -33,7 +30,7 @@ impl HashableType {
     }
 }
 
-impl Command for SubCommand {
+impl Command for MathMode {
     fn name(&self) -> &str {
         "math mode"
     }
@@ -53,13 +50,19 @@ impl Command for SubCommand {
                     Type::List(Box::new(Type::Filesize)),
                     Type::List(Box::new(Type::Filesize)),
                 ),
-                (Type::Table(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::record()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true)
+            .rest(
+                "columns",
+                SyntaxShape::CellPath,
+                "The cell-paths/columns to operate on.",
+            )
             .category(Category::Math)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Returns the most frequent element(s) from a list of numbers or tables."
     }
 
@@ -67,20 +70,34 @@ impl Command for SubCommand {
         vec!["common", "often"]
     }
 
+    fn is_const(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
-        _engine_state: &EngineState,
-        _stack: &mut Stack,
+        engine_state: &EngineState,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        run_with_function(call, input, mode)
+        run_with_function_with_cell_paths(engine_state, stack, call, input, mode)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn run_const(
+        &self,
+        working_set: &StateWorkingSet,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        run_with_function_with_cell_paths_const(working_set, stack, call, input, mode)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Compute the mode(s) of a list of numbers",
+                description: "Compute the mode(s) of a list of numbers.",
                 example: "[3 3 9 12 12 15] | math mode",
                 result: Some(Value::test_list(vec![
                     Value::test_int(3),
@@ -88,7 +105,7 @@ impl Command for SubCommand {
                 ])),
             },
             Example {
-                description: "Compute the mode(s) of the columns of a table",
+                description: "Compute the mode(s) of the columns of a table.",
                 example: "[{a: 1 b: 3} {a: 2 b: -1} {a: 1 b: 5}] | math mode",
                 result: Some(Value::test_record(record! {
                         "a" => Value::list(vec![Value::test_int(1)], Span::test_data()),
@@ -98,34 +115,36 @@ impl Command for SubCommand {
                         ),
                 })),
             },
+            Example {
+                description: "Compute the mode(s) of list-valued columns in a record.",
+                example: "{alice: [1 1 2 3], bob: [5 5 6]} | math mode",
+                result: Some(Value::test_record(record! {
+                    "alice" => Value::list(vec![Value::test_int(1)], Span::test_data()),
+                    "bob" => Value::list(vec![Value::test_int(5)], Span::test_data()),
+                })),
+            },
+            Example {
+                description: "Compute the mode(s) of a single column using a cell path.",
+                example: "{alice: [1 1 2 3], bob: [5 5 6]} | math mode alice",
+                result: Some(Value::test_record(record! {
+                    "alice" => Value::list(vec![Value::test_int(1)], Span::test_data()),
+                    "bob" => Value::list(
+                        vec![Value::test_int(5), Value::test_int(5), Value::test_int(6)],
+                        Span::test_data(),
+                    ),
+                })),
+            },
         ]
     }
 }
 
 pub fn mode(values: &[Value], _span: Span, head: Span) -> Result<Value, ShellError> {
-    if let Some(Err(values)) = values
-        .windows(2)
-        .map(|elem| {
-            if elem[0].partial_cmp(&elem[1]).is_none() {
-                return Err(ShellError::OperatorMismatch {
-                    op_span: head,
-                    lhs_ty: elem[0].get_type().to_string(),
-                    lhs_span: elem[0].span(),
-                    rhs_ty: elem[1].get_type().to_string(),
-                    rhs_span: elem[1].span(),
-                });
-            }
-            Ok(elem[0].partial_cmp(&elem[1]).unwrap_or(Ordering::Equal))
-        })
-        .find(|elem| elem.is_err())
-    {
-        return Err(values);
-    }
     //In e-q, Value doesn't implement Hash or Eq, so we have to get the values inside
     // But f64 doesn't implement Hash, so we get the binary representation to use as
     // key in the HashMap
     let hashable_values = values
         .iter()
+        .filter(|x| !x.as_float().is_ok_and(f64::is_nan))
         .map(|val| match val {
             Value::Int { val, .. } => Ok(HashableType::new(val.to_ne_bytes(), NumberTypes::Int)),
             Value::Duration { val, .. } => {
@@ -134,15 +153,16 @@ pub fn mode(values: &[Value], _span: Span, head: Span) -> Result<Value, ShellErr
             Value::Float { val, .. } => {
                 Ok(HashableType::new(val.to_ne_bytes(), NumberTypes::Float))
             }
-            Value::Filesize { val, .. } => {
-                Ok(HashableType::new(val.to_ne_bytes(), NumberTypes::Filesize))
-            }
+            Value::Filesize { val, .. } => Ok(HashableType::new(
+                val.get().to_ne_bytes(),
+                NumberTypes::Filesize,
+            )),
             Value::Error { error, .. } => Err(*error.clone()),
-            other => Err(ShellError::UnsupportedInput {
-                msg: "Unable to give a result with this input".to_string(),
-                input: "value originates from here".into(),
-                msg_span: head,
-                input_span: other.span(),
+            other => Err(ShellError::OnlySupportsThisInputType {
+                exp_input_type: NUMERIC_INPUT_TYPES.into(),
+                wrong_type: other.get_type().to_string(),
+                dst_span: head,
+                src_span: other.span(),
             }),
         })
         .collect::<Result<Vec<HashableType>, ShellError>>()?;
@@ -188,9 +208,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(MathMode)
     }
 }

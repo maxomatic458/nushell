@@ -1,10 +1,5 @@
-use nu_engine::{eval_block, CallExt};
-use nu_protocol::{
-    ast::Call,
-    engine::{Closure, Command, EngineState, Stack},
-    record, Category, Example, IntoInterruptiblePipelineData, PipelineData, ShellError, Signature,
-    SyntaxShape, Type, Value,
-};
+use nu_engine::{ClosureEval, command_prelude::*};
+use nu_protocol::{engine::Closure, test_table, test_value};
 
 #[derive(Clone)]
 pub struct TakeWhile;
@@ -17,53 +12,56 @@ impl Command for TakeWhile {
     fn signature(&self) -> Signature {
         Signature::build(self.name())
             .input_output_types(vec![
-                (Type::Table(vec![]), Type::Table(vec![])),
+                (Type::table(), Type::table()),
                 (
                     Type::List(Box::new(Type::Any)),
                     Type::List(Box::new(Type::Any)),
                 ),
             ])
+            .named(
+                "include",
+                SyntaxShape::Int,
+                "Include extra items after the stream would otherwise have stopped. `0` is a no-op.",
+                Some('i'),
+            )
             .required(
                 "predicate",
-                SyntaxShape::Closure(Some(vec![SyntaxShape::Any, SyntaxShape::Int])),
+                SyntaxShape::RowCondition,
                 "The predicate that element(s) must match.",
             )
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Take elements of the input while a predicate is true."
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Take while the element is negative",
-                example: "[-1 -2 9 1] | take while {|x| $x < 0 }",
-                result: Some(Value::test_list(vec![
-                    Value::test_int(-1),
-                    Value::test_int(-2),
-                ])),
+                description: "Take while the element is negative.",
+                example: "[-1 -2 9 1] | take while $it < 0",
+                result: Some(test_value!([-1, -2])),
             },
             Example {
-                description: "Take while the element is negative using stored condition",
+                description: "Take while the element is negative using stored condition.",
                 example: "let cond = {|x| $x < 0 }; [-1 -2 9 1] | take while $cond",
-                result: Some(Value::test_list(vec![
-                    Value::test_int(-1),
-                    Value::test_int(-2),
-                ])),
+                result: Some(test_value!([-1, -2])),
             },
             Example {
-                description: "Take while the field value is negative",
-                example: "[{a: -1} {a: -2} {a: 9} {a: 1}] | take while {|x| $x.a < 0 }",
-                result: Some(Value::test_list(vec![
-                    Value::test_record(record! {
-                        "a" => Value::test_int(-1),
-                    }),
-                    Value::test_record(record! {
-                        "a" => Value::test_int(-2),
-                    }),
-                ])),
+                description: "Take while the field value is negative.",
+                example: "[{a: -1} {a: -2} {a: 9} {a: 1}] | take while a < 0",
+                result: Some(test_value!([{a: (-1)}, {a: (-2)}])),
+            },
+            Example {
+                description: "Take until the first item without a lowercase name including that item.",
+                example: "[[name value]; [b, 2], [c, 3], [A, 1], [D, 4]] | take while -i 1 {|x| $x.name like '[a-z]' }",
+                result: Some(test_table![
+                    ["name", "value"];
+                    ["b", 2],
+                    ["c", 3],
+                    ["A", 1],
+                ]),
             },
         ]
     }
@@ -73,44 +71,34 @@ impl Command for TakeWhile {
         engine_state: &EngineState,
         stack: &mut Stack,
         call: &Call,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let metadata = input.metadata();
-        let span = call.head;
+        let head = call.head;
+        let closure: Closure = call.req(engine_state, stack, 0)?;
+        let include: usize = call.get_flag(engine_state, stack, "include")?.unwrap_or(0);
 
-        let capture_block: Closure = call.req(engine_state, stack, 0)?;
+        let metadata = input.take_metadata();
 
-        let block = engine_state.get_block(capture_block.block_id).clone();
-        let var_id = block.signature.get_positional(0).and_then(|arg| arg.var_id);
+        let mut closure = ClosureEval::new(engine_state, stack, closure);
+        let predicate = move |value: &Value| {
+            closure
+                .run_with_value(value.clone())
+                .and_then(|data| data.into_value(head))
+                .map(|cond| cond.is_true())
+                .unwrap_or(false)
+        };
 
-        let mut stack = stack.captures_to_stack(capture_block.captures);
+        let it = input.into_iter_strict(head)?;
 
-        let ctrlc = engine_state.ctrlc.clone();
-        let engine_state = engine_state.clone();
-
-        let redirect_stdout = call.redirect_stdout;
-        let redirect_stderr = call.redirect_stderr;
-
-        Ok(input
-            .into_iter_strict(span)?
-            .take_while(move |value| {
-                if let Some(var_id) = var_id {
-                    stack.add_var(var_id, value.clone());
-                }
-
-                eval_block(
-                    &engine_state,
-                    &mut stack,
-                    &block,
-                    PipelineData::empty(),
-                    redirect_stdout,
-                    redirect_stderr,
-                )
-                .map_or(false, |pipeline_data| {
-                    pipeline_data.into_value(span).is_true()
-                })
-            })
-            .into_pipeline_data_with_metadata(metadata, ctrlc))
+        Ok(match include {
+            0 => it.take_while(predicate).into_pipeline_data_with_metadata(
+                head,
+                engine_state.signals().clone(),
+                metadata,
+            ),
+            n => super::take_while_include::take_while_include_n(it, predicate, n)
+                .into_pipeline_data_with_metadata(head, engine_state.signals().clone(), metadata),
+        })
     }
 }
 
@@ -119,9 +107,7 @@ mod tests {
     use crate::TakeWhile;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(TakeWhile)
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(TakeWhile)
     }
 }

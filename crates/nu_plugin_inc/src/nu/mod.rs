@@ -1,55 +1,73 @@
-use crate::inc::SemVerAction;
-use crate::Inc;
-use nu_plugin::{EvaluatedCall, LabeledError, Plugin};
-use nu_protocol::{ast::CellPath, PluginSignature, SyntaxShape, Value};
+use crate::{Inc, inc::SemVerAction};
+use nu_plugin::{EngineInterface, EvaluatedCall, Plugin, PluginCommand, SimplePluginCommand};
+use nu_protocol::{LabeledError, Signature, SyntaxShape, Value, ast::CellPath};
 
-impl Plugin for Inc {
-    fn signature(&self) -> Vec<PluginSignature> {
-        vec![PluginSignature::build("inc")
-            .usage("Increment a value or version. Optionally use the column of a table.")
-            .optional("cell_path", SyntaxShape::CellPath, "cell path to update")
+pub struct IncPlugin;
+
+impl Plugin for IncPlugin {
+    fn version(&self) -> String {
+        env!("CARGO_PKG_VERSION").into()
+    }
+
+    fn commands(&self) -> Vec<Box<dyn PluginCommand<Plugin = Self>>> {
+        vec![Box::new(Inc::new())]
+    }
+}
+
+impl SimplePluginCommand for Inc {
+    type Plugin = IncPlugin;
+
+    fn name(&self) -> &str {
+        "inc"
+    }
+
+    fn description(&self) -> &str {
+        "Increment a value or version. Optionally use the column of a table."
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(PluginCommand::name(self))
+            .optional("cell_path", SyntaxShape::CellPath, "Cell path to update.")
             .switch(
                 "major",
-                "increment the major version (eg 1.2.1 -> 2.0.0)",
+                "Increment the major version (eg 1.2.1 -> 2.0.0).",
                 Some('M'),
             )
             .switch(
                 "minor",
-                "increment the minor version (eg 1.2.1 -> 1.3.0)",
+                "Increment the minor version (eg 1.2.1 -> 1.3.0).",
                 Some('m'),
             )
             .switch(
                 "patch",
-                "increment the patch version (eg 1.2.1 -> 1.2.2)",
+                "Increment the patch version (eg 1.2.1 -> 1.2.2).",
                 Some('p'),
-            )]
+            )
     }
 
     fn run(
-        &mut self,
-        name: &str,
-        _config: &Option<Value>,
+        &self,
+        _plugin: &IncPlugin,
+        _engine: &EngineInterface,
         call: &EvaluatedCall,
         input: &Value,
     ) -> Result<Value, LabeledError> {
-        if name != "inc" {
-            return Ok(Value::nothing(call.head));
-        }
+        let mut inc = self.clone();
 
         let cell_path: Option<CellPath> = call.opt(0)?;
 
-        self.cell_path = cell_path;
+        inc.cell_path = cell_path;
 
         if call.has_flag("major")? {
-            self.for_semver(SemVerAction::Major);
+            inc.for_semver(SemVerAction::Major);
         }
         if call.has_flag("minor")? {
-            self.for_semver(SemVerAction::Minor);
+            inc.for_semver(SemVerAction::Minor);
         }
         if call.has_flag("patch")? {
-            self.for_semver(SemVerAction::Patch);
+            inc.for_semver(SemVerAction::Patch);
         }
 
-        self.inc(call.head, input)
+        inc.inc(call.head, input)
     }
 }

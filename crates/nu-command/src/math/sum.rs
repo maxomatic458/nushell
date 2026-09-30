@@ -1,15 +1,13 @@
-use crate::math::reducers::{reducer_for, Reduce};
-use crate::math::utils::run_with_function;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, PipelineData, ShellError, Signature, Span, Type, Value,
+use crate::math::{
+    reducers::{Reduce, reducer_for},
+    utils::{run_with_function_with_cell_paths, run_with_function_with_cell_paths_const},
 };
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct MathSum;
 
-impl Command for SubCommand {
+impl Command for MathSum {
     fn name(&self) -> &str {
         "math sum"
     }
@@ -21,14 +19,19 @@ impl Command for SubCommand {
                 (Type::List(Box::new(Type::Duration)), Type::Duration),
                 (Type::List(Box::new(Type::Filesize)), Type::Filesize),
                 (Type::Range, Type::Number),
-                (Type::Table(vec![]), Type::Record(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::record()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true)
+            .rest(
+                "columns",
+                SyntaxShape::CellPath,
+                "The cell-paths/columns to operate on.",
+            )
             .category(Category::Math)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Returns the sum of a list of numbers or of each column in a table."
     }
 
@@ -36,34 +39,67 @@ impl Command for SubCommand {
         vec!["plus", "add", "total", "+"]
     }
 
+    fn is_const(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
-        _engine_state: &EngineState,
-        _stack: &mut Stack,
+        engine_state: &EngineState,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        run_with_function(call, input, summation)
+        run_with_function_with_cell_paths(engine_state, stack, call, input, summation)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn run_const(
+        &self,
+        working_set: &StateWorkingSet,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        run_with_function_with_cell_paths_const(working_set, stack, call, input, summation)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Sum a list of numbers",
+                description: "Sum a list of numbers.",
                 example: "[1 2 3] | math sum",
                 result: Some(Value::test_int(6)),
             },
             Example {
-                description: "Get the disk usage for the current directory",
+                description: "Get the disk usage for the current directory.",
                 example: "ls | get size | math sum",
                 result: None,
             },
             Example {
-                description: "Compute the sum of each column in a table",
+                description: "Compute the sum of each column in a table.",
                 example: "[[a b]; [1 2] [3 4]] | math sum",
                 result: Some(Value::test_record(record! {
                     "a" => Value::test_int(4),
                     "b" => Value::test_int(6),
+                })),
+            },
+            Example {
+                description: "Sum the values of list-valued columns in a record.",
+                example: "{alice: [1 2 3], bob: [4 5 6]} | math sum",
+                result: Some(Value::test_record(record! {
+                    "alice" => Value::test_int(6),
+                    "bob" => Value::test_int(15),
+                })),
+            },
+            Example {
+                description: "Sum a single column using a cell path.",
+                example: "{alice: [1 2 3], bob: [4 5 6]} | math sum alice",
+                result: Some(Value::test_record(record! {
+                    "alice" => Value::test_int(6),
+                    "bob" => Value::list(
+                        vec![Value::test_int(4), Value::test_int(5), Value::test_int(6)],
+                        Span::test_data(),
+                    ),
                 })),
             },
         ]
@@ -80,9 +116,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(MathSum)
     }
 }

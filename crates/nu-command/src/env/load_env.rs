@@ -1,9 +1,4 @@
-use nu_engine::{current_dir, CallExt};
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, PipelineData, Record, ShellError, Signature, SyntaxShape, Type, Value,
-};
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
 pub struct LoadEnv;
@@ -13,20 +8,27 @@ impl Command for LoadEnv {
         "load-env"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Loads an environment update from a record."
+    }
+
+    fn extra_description(&self) -> &str {
+        "Environment conversions are not applied automatically. To apply the conversions configured in $env.ENV_CONVERSIONS after loading an update, assign $env.ENV_CONVERSIONS to itself."
     }
 
     fn signature(&self) -> nu_protocol::Signature {
         Signature::build("load-env")
             .input_output_types(vec![
-                (Type::Record(vec![]), Type::Nothing),
+                (Type::record(), Type::Nothing),
                 (Type::Nothing, Type::Nothing),
+                // FIXME Type::Any input added to disable pipeline input type checking, as run-time checks can raise undesirable type errors
+                // which aren't caught by the parser. see https://github.com/nushell/nushell/pull/14922 for more details
+                (Type::Any, Type::Nothing),
             ])
             .allow_variants_without_examples(true)
             .optional(
                 "update",
-                SyntaxShape::Record(vec![]),
+                SyntaxShape::record(),
                 "The record to use for updates.",
             )
             .category(Category::FileSystem)
@@ -42,66 +44,55 @@ impl Command for LoadEnv {
         let arg: Option<Record> = call.opt(engine_state, stack, 0)?;
         let span = call.head;
 
-        match arg {
-            Some(record) => {
-                for (env_var, rhs) in record {
-                    let env_var_ = env_var.as_str();
-                    if ["FILE_PWD", "CURRENT_FILE", "PWD"].contains(&env_var_) {
-                        return Err(ShellError::AutomaticEnvVarSetManually {
-                            envvar_name: env_var,
-                            span: call.head,
-                        });
-                    }
-                    stack.add_env_var(env_var, rhs);
-                }
-                Ok(PipelineData::empty())
-            }
+        let record = match arg {
+            Some(record) => record,
             None => match input {
-                PipelineData::Value(Value::Record { val, .. }, ..) => {
-                    for (env_var, rhs) in val {
-                        let env_var_ = env_var.as_str();
-                        if ["FILE_PWD", "CURRENT_FILE"].contains(&env_var_) {
-                            return Err(ShellError::AutomaticEnvVarSetManually {
-                                envvar_name: env_var,
-                                span: call.head,
-                            });
-                        }
-
-                        if env_var == "PWD" {
-                            let cwd = current_dir(engine_state, stack)?;
-                            let rhs = rhs.as_string()?;
-                            let rhs = nu_path::expand_path_with(rhs, cwd);
-                            stack.add_env_var(
-                                env_var,
-                                Value::string(rhs.to_string_lossy(), call.head),
-                            );
-                        } else {
-                            stack.add_env_var(env_var, rhs);
-                        }
-                    }
-                    Ok(PipelineData::empty())
+                PipelineData::Value(Value::Record { val, .. }, ..) => val.into_owned(),
+                _ => {
+                    return Err(ShellError::UnsupportedInput {
+                        msg: "'load-env' expects a single record".into(),
+                        input: "value originated from here".into(),
+                        msg_span: span,
+                        input_span: input.span().unwrap_or(span),
+                    });
                 }
-                _ => Err(ShellError::UnsupportedInput {
-                    msg: "'load-env' expects a single record".into(),
-                    input: "value originated from here".into(),
-                    msg_span: span,
-                    input_span: input.span().unwrap_or(span),
-                }),
             },
+        };
+
+        for prohibited in ["FILE_PWD", "CURRENT_FILE", "PWD"] {
+            if record.contains(prohibited) {
+                return Err(ShellError::AutomaticEnvVarSetManually {
+                    envvar_name: prohibited.to_string(),
+                    span: call.head,
+                });
+            }
         }
+
+        for (env_var, rhs) in record {
+            stack.add_env_var(env_var, rhs);
+        }
+        Ok(PipelineData::empty())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Load variables from an input stream",
-                example: r#"{NAME: ABE, AGE: UNKNOWN} | load-env; $env.NAME"#,
+                description: "Load variables from an input stream.",
+                example: "{NAME: ABE, AGE: UNKNOWN} | load-env; $env.NAME",
                 result: Some(Value::test_string("ABE")),
             },
             Example {
-                description: "Load variables from an argument",
-                example: r#"load-env {NAME: ABE, AGE: UNKNOWN}; $env.NAME"#,
+                description: "Load variables from an argument.",
+                example: "load-env {NAME: ABE, AGE: UNKNOWN}; $env.NAME",
                 result: Some(Value::test_string("ABE")),
+            },
+            Example {
+                description: "Load a variable, then apply its environment conversion.",
+                example: "$env.ENV_CONVERSIONS = {MY_ENV_VAR: {from_string: { split row ':' }}}; load-env {MY_ENV_VAR: 'foo:bar'}; $env.ENV_CONVERSIONS = $env.ENV_CONVERSIONS; $env.MY_ENV_VAR",
+                result: Some(Value::test_list(vec![
+                    Value::test_string("foo"),
+                    Value::test_string("bar"),
+                ])),
             },
         ]
     }
@@ -112,9 +103,7 @@ mod tests {
     use super::LoadEnv;
 
     #[test]
-    fn examples_work_as_expected() {
-        use crate::test_examples;
-
-        test_examples(LoadEnv {})
+    fn examples_work_as_expected() -> nu_test_support::Result {
+        nu_test_support::test().examples(LoadEnv)
     }
 }

@@ -7,7 +7,7 @@ This commitment to a cross-platform Nushell forces us to make provisions so user
 
 In general our design strives to have a consistent behavior across all platforms if defining the semantics is possible for Nushell.
 In some cases where the platform requirements dominate we may choose to follow the platform specific defaults. (some nuances around the file system)
-Only rarely do we want to accept commands/language features that only support a single platform, only to access common system behavior of this particular platform (e.g. `registry query` command for the windows registry, `exec` for Linux and MacOS)
+Only rarely do we want to accept commands/language features that only support a single platform, only to access common system behavior of this particular platform (e.g. `registry query` command for the windows registry, `exec` for Linux and macOS)
 
 ## cross-platform builds and testing
 
@@ -15,7 +15,7 @@ The Nushell team runs **testing of Nushell for the following platforms** through
 
 - macOS (latest version available through GitHub CI)
 - Windows (10 and 11)
-- Linux (our test runners use `ubuntu-20.04` to represent distributions with not the latest glibc versions.)
+- Linux (our test runners use `ubuntu-22.04` to represent distributions with not the latest glibc versions.)
 
 All PR level tests are performed on x86/AMD64 (at least at the time of writing the default macOS runner was not yet using arm64).
 
@@ -26,20 +26,18 @@ Those target **additional build targets**:
 - musl as an alternative to Glibc on linux
 - riscv only for linux
 - armv7 only for linux
+- loongarch64 only for linux (with limitations [^1])
 
 We will try to provide builds for all of them but a standard configuration for x86-64 or aarch64 will take priority for us should we face technical challenges in a release cycle.
+
+[^1]: The build for loongarch64 currently lacks support for the Nushell internal error recovery, as it doesn't compile with `rustc -C panic=unwind`. It has to use `panic=abort` thus bugs raising panics will abort your shell. Our other platforms by default have a limited capability to recover from non-fatal panics to provide a stable login shell.
 
 ### Supported feature flags
 
 We have features of Nushell behind flags that can be passed at compilation time.
 
-The design focus of Nushell is primarily expressed by everything accessible without passing additional feature flag. This provides a standard command set and receives the most attention.
-Two other feature flags are actively tested but are not guaranteed to express the stable design direction of Nushell:
-- `extra`
-    - This includes commands where we are not convinced that they are ready to be stabilized for 1.0 or popular enough
-- `dataframe`
-    - This includes dataframe support via `polars` and `arrow2`. Introduces a significant additional compilation and binary size.
-    - Due to the use of SIMD extensions may not be compatible with every minimal architecture.
+The design focus of Nushell is primarily expressed by everything accessible without passing additional feature flag.
+This provides a standard command set and receives the most attention.
 
 ## Passively supported platforms
 

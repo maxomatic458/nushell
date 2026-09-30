@@ -1,11 +1,10 @@
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{Category, Example, PipelineData, ShellError, Signature, Span, Type, Value};
+use crate::math::utils::run_with_elementwise;
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct MathSqrt;
 
-impl Command for SubCommand {
+impl Command for MathSqrt {
     fn name(&self) -> &str {
         "math sqrt"
     }
@@ -18,12 +17,19 @@ impl Command for SubCommand {
                     Type::List(Box::new(Type::Number)),
                     Type::List(Box::new(Type::Float)),
                 ),
+                (Type::Range, Type::List(Box::new(Type::Number))),
+                (Type::record(), Type::record()),
             ])
+            .rest(
+                "columns",
+                SyntaxShape::CellPath,
+                "The cell-paths/columns to operate on.",
+            )
             .allow_variants_without_examples(true)
             .category(Category::Math)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Returns the square root of the input number."
     }
 
@@ -31,33 +37,87 @@ impl Command for SubCommand {
         vec!["square", "root"]
     }
 
+    fn is_const(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
         engine_state: &EngineState,
-        _stack: &mut Stack,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
+        let cell_paths: Vec<CellPath> = call.rest(engine_state, stack, 0)?;
         let head = call.head;
-        // This doesn't match explicit nulls
-        if matches!(input, PipelineData::Empty) {
-            return Err(ShellError::PipelineEmpty { dst_span: head });
-        }
-        input.map(
+        run_with_elementwise(
+            input,
+            cell_paths,
+            head,
+            engine_state.signals(),
+            true,
             move |value| operate(value, head),
-            engine_state.ctrlc.clone(),
         )
     }
 
-    fn examples(&self) -> Vec<Example> {
-        vec![Example {
-            description: "Compute the square root of each number in a list",
-            example: "[9 16] | math sqrt",
-            result: Some(Value::list(
-                vec![Value::test_float(3.0), Value::test_float(4.0)],
-                Span::test_data(),
-            )),
-        }]
+    fn run_const(
+        &self,
+        working_set: &StateWorkingSet,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let cell_paths: Vec<CellPath> = call.rest_const(working_set, stack, 0)?;
+        let head = call.head;
+        run_with_elementwise(
+            input,
+            cell_paths,
+            head,
+            working_set.permanent().signals(),
+            true,
+            move |value| operate(value, head),
+        )
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![
+            Example {
+                description: "Compute the square root of each number in a list.",
+                example: "[9 16] | math sqrt",
+                result: Some(Value::list(
+                    vec![Value::test_float(3.0), Value::test_float(4.0)],
+                    Span::test_data(),
+                )),
+            },
+            Example {
+                description: "Apply square root to list-valued columns in a record.",
+                example: "{alice: [1 4 9], bob: [16 25 36]} | math sqrt",
+                result: Some(Value::test_record(record! {
+                    "alice" => Value::list(
+                        vec![Value::test_float(1.0), Value::test_float(2.0), Value::test_float(3.0)],
+                        Span::test_data(),
+                    ),
+                    "bob" => Value::list(
+                        vec![Value::test_float(4.0), Value::test_float(5.0), Value::test_float(6.0)],
+                        Span::test_data(),
+                    ),
+                })),
+            },
+            Example {
+                description: "Apply square root to a single column using a cell path.",
+                example: "{alice: [1 4 9], bob: [16 25 36]} | math sqrt alice",
+                result: Some(Value::test_record(record! {
+                    "alice" => Value::list(
+                        vec![Value::test_float(1.0), Value::test_float(2.0), Value::test_float(3.0)],
+                        Span::test_data(),
+                    ),
+                    "bob" => Value::list(
+                        vec![Value::test_int(16), Value::test_int(25), Value::test_int(36)],
+                        Span::test_data(),
+                    ),
+                })),
+            },
+        ]
     }
 }
 
@@ -81,7 +141,7 @@ fn operate(value: Value, head: Span) -> Value {
         Value::Error { .. } => value,
         other => Value::error(
             ShellError::OnlySupportsThisInputType {
-                exp_input_type: "numeric".into(),
+                exp_input_type: crate::math::utils::NUMBER_INPUT_TYPES.into(),
                 wrong_type: other.get_type().to_string(),
                 dst_span: head,
                 src_span: other.span(),
@@ -108,9 +168,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(MathSqrt)
     }
 }

@@ -1,12 +1,5 @@
-use std::collections::VecDeque;
-
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, IntoInterruptiblePipelineData, IntoPipelineData, PipelineData, RawStream,
-    ShellError, Signature, Span, Type, Value,
-};
+use nu_engine::command_prelude::*;
+use nu_protocol::Signals;
 
 #[derive(Clone)]
 pub struct Lines;
@@ -16,14 +9,15 @@ impl Command for Lines {
         "lines"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Converts input to lines."
     }
 
     fn signature(&self) -> nu_protocol::Signature {
         Signature::build("lines")
             .input_output_types(vec![(Type::Any, Type::List(Box::new(Type::String)))])
-            .switch("skip-empty", "skip empty lines", Some('s'))
+            .switch("skip-empty", "Skip empty lines.", Some('s'))
+            .switch("strict", "Validate UTF-8 strictly.", None)
             .category(Category::Filters)
     }
     fn run(
@@ -34,33 +28,38 @@ impl Command for Lines {
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let head = call.head;
-        let ctrlc = engine_state.ctrlc.clone();
         let skip_empty = call.has_flag(engine_state, stack, "skip-empty")?;
+        let strict = call.has_flag(engine_state, stack, "strict")?;
 
-        let span = input.span().unwrap_or(call.head);
         match input {
-            PipelineData::Value(Value::String { val, .. }, ..) => {
-                let lines = if skip_empty {
-                    val.lines()
-                        .filter_map(|s| {
-                            if s.trim().is_empty() {
-                                None
-                            } else {
-                                Some(Value::string(s, span))
-                            }
-                        })
-                        .collect()
-                } else {
-                    val.lines().map(|s| Value::string(s, span)).collect()
-                };
+            PipelineData::Value(value, ..) => match value {
+                Value::String { val, .. } => {
+                    let lines = ByteStream::read_string(val, head, Signals::empty())
+                        .lines()
+                        .expect(".lines() always succeeds for ByteStreamSource::Read");
+                    // source is a UTF-8 String, so strict mode should always produce valid UTF-8 strings
+                    let lines = lines.strict(true);
 
-                Ok(Value::list(lines, span).into_pipeline_data())
-            }
-            PipelineData::Empty => Ok(PipelineData::Empty),
-            PipelineData::ListStream(stream, ..) => {
-                let iter = stream
-                    .into_iter()
-                    .filter_map(move |value| {
+                    Ok(lines_to_pipeline_data(
+                        lines,
+                        skip_empty,
+                        head,
+                        engine_state.signals().clone(),
+                    ))
+                }
+                // Propagate existing errors
+                Value::Error { error, .. } => Err(*error),
+                value => Err(ShellError::OnlySupportsThisInputType {
+                    exp_input_type: "string or byte stream".into(),
+                    wrong_type: value.get_type().to_string(),
+                    dst_span: head,
+                    src_span: value.span(),
+                }),
+            },
+            PipelineData::Empty => Ok(PipelineData::empty()),
+            PipelineData::ListStream(stream, metadata) => {
+                let stream = stream.modify(|iter| {
+                    iter.filter_map(move |value| {
                         let span = value.span();
                         if let Value::String { val, .. } = value {
                             Some(
@@ -78,144 +77,61 @@ impl Command for Lines {
                             None
                         }
                     })
-                    .flatten();
+                    .flatten()
+                });
 
-                Ok(iter.into_pipeline_data(engine_state.ctrlc.clone()))
+                Ok(PipelineData::list_stream(stream, metadata))
             }
-            PipelineData::Value(val, ..) => {
-                match val {
-                    // Propagate existing errors
-                    Value::Error { error, .. } => Err(*error),
-                    _ => Err(ShellError::OnlySupportsThisInputType {
-                        exp_input_type: "string or raw data".into(),
-                        wrong_type: val.get_type().to_string(),
-                        dst_span: head,
-                        src_span: val.span(),
-                    }),
+            PipelineData::ByteStream(stream, ..) => {
+                if let Some(lines) = stream.lines().map(|l| l.strict(strict)) {
+                    Ok(lines_to_pipeline_data(
+                        lines,
+                        skip_empty,
+                        head,
+                        engine_state.signals().clone(),
+                    ))
+                } else {
+                    Ok(PipelineData::empty())
                 }
             }
-            PipelineData::ExternalStream { stdout: None, .. } => Ok(PipelineData::empty()),
-            PipelineData::ExternalStream {
-                stdout: Some(stream),
-                ..
-            } => Ok(RawStreamLinesAdapter::new(stream, head, skip_empty)
-                .map(move |x| x.unwrap_or_else(|err| Value::error(err, head)))
-                .into_pipeline_data(ctrlc)),
         }
     }
 
-    fn examples(&self) -> Vec<Example> {
-        vec![Example {
-            description: "Split multi-line string into lines",
-            example: r#"$"two\nlines" | lines"#,
-            result: Some(Value::list(
-                vec![Value::test_string("two"), Value::test_string("lines")],
-                Span::test_data(),
-            )),
-        }]
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![
+            Example {
+                description: "Split multi-line string into lines",
+                example: r#"$"two\nlines" | lines"#,
+                result: Some(Value::list(
+                    vec![Value::test_string("two"), Value::test_string("lines")],
+                    Span::test_data(),
+                )),
+            },
+            Example {
+                description: "Skip empty lines",
+                example: r#""foo\n\nbar" | lines --skip-empty"#,
+                result: Some(Value::list(
+                    vec![Value::test_string("foo"), Value::test_string("bar")],
+                    Span::test_data(),
+                )),
+            },
+        ]
     }
 }
 
-#[derive(Debug)]
-struct RawStreamLinesAdapter {
-    inner: RawStream,
-    inner_complete: bool,
+fn lines_to_pipeline_data(
+    lines: impl Iterator<Item = Result<String, ShellError>> + Send + 'static,
     skip_empty: bool,
     span: Span,
-    incomplete_line: String,
-    queue: VecDeque<String>,
-}
-
-impl Iterator for RawStreamLinesAdapter {
-    type Item = Result<Value, ShellError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(s) = self.queue.pop_front() {
-                if self.skip_empty && s.trim().is_empty() {
-                    continue;
-                }
-                return Some(Ok(Value::string(s, self.span)));
-            } else {
-                // inner is complete, feed out remaining state
-                if self.inner_complete {
-                    return if self.incomplete_line.is_empty() {
-                        None
-                    } else {
-                        Some(Ok(Value::string(
-                            std::mem::take(&mut self.incomplete_line),
-                            self.span,
-                        )))
-                    };
-                }
-
-                // pull more data from inner
-                if let Some(result) = self.inner.next() {
-                    match result {
-                        Ok(v) => {
-                            let span = v.span();
-                            match v {
-                                // TODO: Value::Binary support required?
-                                Value::String { val, .. } => {
-                                    self.span = span;
-
-                                    let mut lines = val.lines();
-
-                                    // handle incomplete line from previous
-                                    if !self.incomplete_line.is_empty() {
-                                        if let Some(first) = lines.next() {
-                                            self.incomplete_line.push_str(first);
-                                            self.queue.push_back(std::mem::take(
-                                                &mut self.incomplete_line,
-                                            ));
-                                        }
-                                    }
-
-                                    // save completed lines
-                                    self.queue.extend(lines.map(String::from));
-
-                                    if !val.ends_with('\n') {
-                                        // incomplete line, save for next time
-                                        // if `val` and `incomplete_line` were empty,
-                                        // then pop will return none
-                                        if let Some(s) = self.queue.pop_back() {
-                                            self.incomplete_line = s;
-                                        }
-                                    }
-                                }
-                                // Propagate errors by explicitly matching them before the final case.
-                                Value::Error { error, .. } => return Some(Err(*error)),
-                                other => {
-                                    return Some(Err(ShellError::OnlySupportsThisInputType {
-                                        exp_input_type: "string".into(),
-                                        wrong_type: other.get_type().to_string(),
-                                        dst_span: self.span,
-                                        src_span: other.span(),
-                                    }));
-                                }
-                            }
-                        }
-                        Err(err) => return Some(Err(err)),
-                    }
-                } else {
-                    self.inner_complete = true;
-                }
-            }
-        }
-    }
-}
-
-impl RawStreamLinesAdapter {
-    pub fn new(inner: RawStream, span: Span, skip_empty: bool) -> Self {
-        Self {
-            inner,
-            span,
-            skip_empty,
-            incomplete_line: String::new(),
-            queue: VecDeque::new(),
-            inner_complete: false,
-        }
-    }
+    signals: Signals,
+) -> PipelineData {
+    lines
+        .filter_map(move |line| match line {
+            Ok(line) if skip_empty && line.trim().is_empty() => None,
+            Ok(line) => Some(Value::string(line, span)),
+            Err(err) => Some(Value::error(err, span)),
+        })
+        .into_pipeline_data(span, signals)
 }
 
 #[cfg(test)]
@@ -223,9 +139,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Lines {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Lines)
     }
 }

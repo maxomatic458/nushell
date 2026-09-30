@@ -1,15 +1,13 @@
-use nu_cmd_base::input_handler::{operate, CellPathOnlyArgs};
-use nu_engine::CallExt;
-use nu_protocol::{
-    ast::{Call, CellPath},
-    engine::{Command, EngineState, Stack},
-    record, Category, Example, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value,
-};
+use std::borrow::Cow;
+
+use nu_cmd_base::input_handler::{CellPathOnlyArgs, operate};
+use nu_engine::command_prelude::*;
+use nu_protocol::shell_error::generic::GenericError;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct IntoFloat;
 
-impl Command for SubCommand {
+impl Command for IntoFloat {
     fn name(&self) -> &str {
         "into float"
     }
@@ -21,8 +19,8 @@ impl Command for SubCommand {
                 (Type::String, Type::Float),
                 (Type::Bool, Type::Float),
                 (Type::Float, Type::Float),
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
                 (
                     Type::List(Box::new(Type::Any)),
                     Type::List(Box::new(Type::Float)),
@@ -37,7 +35,7 @@ impl Command for SubCommand {
             .category(Category::Conversions)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Convert data into floating point number."
     }
 
@@ -54,25 +52,25 @@ impl Command for SubCommand {
     ) -> Result<PipelineData, ShellError> {
         let cell_paths: Vec<CellPath> = call.rest(engine_state, stack, 0)?;
         let args = CellPathOnlyArgs::from(cell_paths);
-        operate(action, args, input, call.head, engine_state.ctrlc.clone())
+        operate(action, args, input, call.head, engine_state.signals())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Convert string to float in table",
+                description: "Convert string to float in table.",
                 example: "[[num]; ['5.01']] | into float num",
                 result: Some(Value::test_list(vec![Value::test_record(record! {
                     "num" => Value::test_float(5.01),
                 })])),
             },
             Example {
-                description: "Convert string to floating point number",
+                description: "Convert string to floating point number.",
                 example: "'1.345' | into float",
                 result: Some(Value::test_float(1.345)),
             },
             Example {
-                description: "Coerce list of ints and floats to float",
+                description: "Coerce list of ints and floats to float.",
                 example: "[4 -5.9] | into float",
                 result: Some(Value::test_list(vec![
                     Value::test_float(4.0),
@@ -80,7 +78,7 @@ impl Command for SubCommand {
                 ])),
             },
             Example {
-                description: "Convert boolean to float",
+                description: "Convert boolean to float.",
                 example: "true | into float",
                 result: Some(Value::test_float(1.0)),
             },
@@ -93,9 +91,30 @@ fn action(input: &Value, _args: &CellPathOnlyArgs, head: Span) -> Value {
     match input {
         Value::Float { .. } => input.clone(),
         Value::String { val: s, .. } => {
-            let other = s.trim();
+            let val = s.trim();
+            let has_comma = val.contains(',');
+            let has_dot = val.contains('.');
 
-            match other.parse::<f64>() {
+            if has_comma && has_dot {
+                return Value::error(
+                    ShellError::Generic(
+                        GenericError::new(
+                            "Ambiguity in conversion",
+                            "input contains both `,` and `.`",
+                            span,
+                        )
+                        .with_code("nu::shell::cant_convert::ambiguity"),
+                    ),
+                    span,
+                );
+            }
+
+            let val = match has_comma {
+                false => Cow::Borrowed(val),
+                true => Cow::Owned(val.replace(',', ".")),
+            };
+
+            match val.parse::<f64>() {
                 Ok(x) => Value::float(x, head),
                 Err(reason) => Value::error(
                     ShellError::CantConvert {
@@ -134,12 +153,15 @@ fn action(input: &Value, _args: &CellPathOnlyArgs, head: Span) -> Value {
 mod tests {
     use super::*;
     use nu_protocol::Type::Error;
+    use pretty_assertions::assert_matches;
+    use rstest::rstest;
+
+    static ARGS: &CellPathOnlyArgs = &CellPathOnlyArgs::empty();
+    static SPAN: Span = Span::test_data();
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(IntoFloat)
     }
 
     #[test]
@@ -148,7 +170,7 @@ mod tests {
         let word = Value::test_string("3.1415");
         let expected = Value::test_float(3.1415);
 
-        let actual = action(&word, &CellPathOnlyArgs::from(vec![]), Span::test_data());
+        let actual = action(&word, ARGS, SPAN);
         assert_eq!(actual, expected);
     }
 
@@ -156,11 +178,7 @@ mod tests {
     fn communicates_parsing_error_given_an_invalid_floatlike_string() {
         let invalid_str = Value::test_string("11.6anra");
 
-        let actual = action(
-            &invalid_str,
-            &CellPathOnlyArgs::from(vec![]),
-            Span::test_data(),
-        );
+        let actual = action(&invalid_str, ARGS, SPAN);
 
         assert_eq!(actual.get_type(), Error);
     }
@@ -169,12 +187,28 @@ mod tests {
     fn int_to_float() {
         let input_int = Value::test_int(10);
         let expected = Value::test_float(10.0);
-        let actual = action(
-            &input_int,
-            &CellPathOnlyArgs::from(vec![]),
-            Span::test_data(),
-        );
+        let actual = action(&input_int, ARGS, SPAN);
 
         assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    #[case::dot("12.34", 12.34)]
+    #[case::comma("12,34", 12.34)]
+    #[case::positive_dot("+12.34", 12.34)]
+    #[case::positive_comma("+12,34", 12.34)]
+    #[case::negative_dot("-12.34", -12.34)]
+    #[case::negative_comma("-12,34", -12.34)]
+    fn parse_dot_or_comma(#[case] input: &str, #[case] expected: f64) {
+        assert_eq!(
+            action(&Value::test_string(input), ARGS, SPAN),
+            Value::test_float(expected)
+        );
+    }
+
+    #[test]
+    fn dot_and_comma_fails() {
+        let err = action(&Value::test_string("12.34,56"), ARGS, SPAN);
+        assert_matches!(err, Value::Error { error, .. } if error.to_string() == "Ambiguity in conversion");
     }
 }

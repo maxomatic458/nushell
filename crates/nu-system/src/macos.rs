@@ -1,17 +1,18 @@
 use libc::{c_int, c_void, size_t};
 use libproc::libproc::bsd_info::BSDInfo;
-use libproc::libproc::file_info::{pidfdinfo, ListFDs, ProcFDType};
+use libproc::libproc::file_info::{ListFDs, ProcFDType, pidfdinfo};
 use libproc::libproc::net_info::{InSockInfo, SocketFDInfo, SocketInfoKind, TcpSockInfo};
-use libproc::libproc::pid_rusage::{pidrusage, RUsageInfoV2};
-use libproc::libproc::proc_pid::{listpidinfo, pidinfo, ListThreads};
+use libproc::libproc::pid_rusage::{RUsageInfoV2, pidrusage};
+use libproc::libproc::proc_pid::{ListThreads, listpidinfo, pidinfo};
 use libproc::libproc::task_info::{TaskAllInfo, TaskInfo};
 use libproc::libproc::thread_info::ThreadInfo;
-use libproc::processes::{pids_by_type, ProcFilter};
+use libproc::processes::{ProcFilter, pids_by_type};
 use mach2::mach_time;
+use nu_utils::time::Instant;
 use std::cmp;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub struct ProcessInfo {
     pub pid: i32,
@@ -25,9 +26,12 @@ pub struct ProcessInfo {
     pub curr_res: Option<RUsageInfoV2>,
     pub prev_res: Option<RUsageInfoV2>,
     pub interval: Duration,
+    pub start_time: i64,
+    pub user_id: i64,
+    pub priority: i64,
+    pub task_thread_num: i64,
 }
 
-#[cfg_attr(tarpaulin, ignore)]
 pub fn collect_proc(interval: Duration, _with_thread: bool) -> Vec<ProcessInfo> {
     let mut base_procs = Vec::new();
     let mut ret = Vec::new();
@@ -70,21 +74,21 @@ pub fn collect_proc(interval: Duration, _with_thread: bool) -> Vec<ProcessInfo> 
         let fds = listpidinfo::<ListFDs>(pid, curr_task.pbsd.pbi_nfiles as usize);
         if let Ok(fds) = fds {
             for fd in fds {
-                if let ProcFDType::Socket = fd.proc_fdtype.into() {
-                    if let Ok(socket) = pidfdinfo::<SocketFDInfo>(pid, fd.proc_fd) {
-                        match socket.psi.soi_kind.into() {
-                            SocketInfoKind::In => {
-                                if socket.psi.soi_protocol == libc::IPPROTO_UDP {
-                                    let info = unsafe { socket.psi.soi_proto.pri_in };
-                                    curr_udps.push(info);
-                                }
+                if let ProcFDType::Socket = fd.proc_fdtype.into()
+                    && let Ok(socket) = pidfdinfo::<SocketFDInfo>(pid, fd.proc_fd)
+                {
+                    match socket.psi.soi_kind.into() {
+                        SocketInfoKind::In => {
+                            if socket.psi.soi_protocol == libc::IPPROTO_UDP {
+                                let info = unsafe { socket.psi.soi_proto.pri_in };
+                                curr_udps.push(info);
                             }
-                            SocketInfoKind::Tcp => {
-                                let info = unsafe { socket.psi.soi_proto.pri_tcp };
-                                curr_tcps.push(info);
-                            }
-                            _ => (),
                         }
+                        SocketInfoKind::Tcp => {
+                            let info = unsafe { socket.psi.soi_proto.pri_tcp };
+                            curr_tcps.push(info);
+                        }
+                        _ => (),
                     }
                 }
             }
@@ -93,8 +97,12 @@ pub fn collect_proc(interval: Duration, _with_thread: bool) -> Vec<ProcessInfo> 
         let curr_res = pidrusage::<RUsageInfoV2>(pid).ok();
 
         let curr_time = Instant::now();
-        let interval = curr_time - prev_time;
+        let interval = curr_time.saturating_duration_since(prev_time);
         let ppid = curr_task.pbsd.pbi_ppid as i32;
+        let start_time = curr_task.pbsd.pbi_start_tvsec as i64;
+        let user_id = curr_task.pbsd.pbi_uid as i64;
+        let priority = curr_task.ptinfo.pti_priority as i64;
+        let task_thread_num = curr_task.ptinfo.pti_threadnum as i64;
 
         let proc = ProcessInfo {
             pid,
@@ -108,6 +116,10 @@ pub fn collect_proc(interval: Duration, _with_thread: bool) -> Vec<ProcessInfo> 
             curr_res,
             prev_res,
             interval,
+            start_time,
+            user_id,
+            priority,
+            task_thread_num,
         };
 
         ret.push(proc);
@@ -116,7 +128,6 @@ pub fn collect_proc(interval: Duration, _with_thread: bool) -> Vec<ProcessInfo> 
     ret
 }
 
-#[cfg_attr(tarpaulin, ignore)]
 fn get_arg_max() -> size_t {
     let mut mib: [c_int; 2] = [libc::CTL_KERN, libc::KERN_ARGMAX];
     let mut arg_max = 0i32;
@@ -144,16 +155,14 @@ pub struct PathInfo {
     pub cwd: PathBuf,
 }
 
-#[cfg_attr(tarpaulin, ignore)]
 unsafe fn get_unchecked_str(cp: *mut u8, start: *mut u8) -> String {
-    let len = cp as usize - start as usize;
-    let part = Vec::from_raw_parts(start, len, len);
-    let tmp = String::from_utf8_unchecked(part.clone());
-    ::std::mem::forget(part);
-    tmp
+    unsafe {
+        let len = (cp as usize).saturating_sub(start as usize);
+        let part = std::slice::from_raw_parts(start, len);
+        String::from_utf8_unchecked(part.to_vec())
+    }
 }
 
-#[cfg_attr(tarpaulin, ignore)]
 fn get_path_info(pid: i32, mut size: size_t) -> Option<PathInfo> {
     let mut proc_args = Vec::with_capacity(size);
     let ptr: *mut u8 = proc_args.as_mut_slice().as_mut_ptr();
@@ -191,11 +200,11 @@ fn get_path_info(pid: i32, mut size: size_t) -> Option<PathInfo> {
                     .to_owned();
                 let mut need_root = true;
                 let mut root = Default::default();
-                if exe.is_absolute() {
-                    if let Some(parent) = exe.parent() {
-                        root = parent.to_path_buf();
-                        need_root = false;
-                    }
+                if exe.is_absolute()
+                    && let Some(parent) = exe.parent()
+                {
+                    root = parent.to_path_buf();
+                    need_root = false;
                 }
                 while cp < ptr.add(size) && *cp == 0 {
                     cp = cp.offset(1);
@@ -254,7 +263,6 @@ fn get_path_info(pid: i32, mut size: size_t) -> Option<PathInfo> {
     }
 }
 
-#[cfg_attr(tarpaulin, ignore)]
 fn clone_task_all_info(src: &TaskAllInfo) -> TaskAllInfo {
     let pbsd = BSDInfo {
         pbi_flags: src.pbsd.pbi_flags,
@@ -280,24 +288,44 @@ fn clone_task_all_info(src: &TaskAllInfo) -> TaskAllInfo {
         pbi_start_tvsec: src.pbsd.pbi_start_tvsec,
         pbi_start_tvusec: src.pbsd.pbi_start_tvusec,
     };
+
+    // Comments taken from here https://github.com/apple-oss-distributions/xnu/blob/8d741a5de7ff4191bf97d57b9f54c2f6d4a15585/bsd/sys/proc_info.h#L127
     let ptinfo = TaskInfo {
+        // virtual memory size (bytes)
         pti_virtual_size: src.ptinfo.pti_virtual_size,
+        // resident memory size (bytes)
         pti_resident_size: src.ptinfo.pti_resident_size,
+        // total user time
         pti_total_user: src.ptinfo.pti_total_user,
+        // total system time
         pti_total_system: src.ptinfo.pti_total_system,
+        // existing threads only user
         pti_threads_user: src.ptinfo.pti_threads_user,
+        // existing threads only system
         pti_threads_system: src.ptinfo.pti_threads_system,
+        // default policy for new threads
         pti_policy: src.ptinfo.pti_policy,
+        // number of page faults
         pti_faults: src.ptinfo.pti_faults,
+        // number of actual pageins
         pti_pageins: src.ptinfo.pti_pageins,
+        // number of copy-on-write faults
         pti_cow_faults: src.ptinfo.pti_cow_faults,
+        // number of messages sent
         pti_messages_sent: src.ptinfo.pti_messages_sent,
+        // number of messages received
         pti_messages_received: src.ptinfo.pti_messages_received,
+        // number of mach system calls
         pti_syscalls_mach: src.ptinfo.pti_syscalls_mach,
+        // number of unix system calls
         pti_syscalls_unix: src.ptinfo.pti_syscalls_unix,
+        // number of context switches
         pti_csw: src.ptinfo.pti_csw,
+        // number of threads in the task
         pti_threadnum: src.ptinfo.pti_threadnum,
+        // number of running threads
         pti_numrunning: src.ptinfo.pti_numrunning,
+        // task priority
         pti_priority: src.ptinfo.pti_priority,
     };
     TaskAllInfo { pbsd, ptinfo }
@@ -385,7 +413,7 @@ impl ProcessInfo {
             self.curr_task.ptinfo.pti_total_user + self.curr_task.ptinfo.pti_total_system;
         let prev_time =
             self.prev_task.ptinfo.pti_total_user + self.prev_task.ptinfo.pti_total_system;
-        let usage_ticks = curr_time - prev_time;
+        let usage_ticks = curr_time.saturating_sub(prev_time);
         let interval_us = self.interval.as_micros();
         let ticktime_us = mach_ticktime() / 1000.0;
         usage_ticks as f64 * 100.0 * ticktime_us / interval_us as f64

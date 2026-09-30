@@ -1,12 +1,7 @@
-use std::vec;
-
-use nu_engine::{eval_expression, CallExt};
-use nu_parser::parse_expression;
-use nu_protocol::ast::{Call, PathMember};
-use nu_protocol::engine::{Command, EngineState, Stack, StateWorkingSet};
+use itertools::Itertools;
+use nu_engine::command_prelude::*;
 use nu_protocol::{
-    Category, Example, ListStream, PipelineData, ShellError, Signature, Span, SyntaxShape, Type,
-    Value,
+    Config, ListStream, ast::PathMember, casing::Casing, shell_error::generic::GenericError,
 };
 
 #[derive(Clone)]
@@ -20,19 +15,19 @@ impl Command for FormatPattern {
     fn signature(&self) -> Signature {
         Signature::build("format pattern")
             .input_output_types(vec![
-                (Type::Table(vec![]), Type::List(Box::new(Type::String))),
-                (Type::Record(vec![]), Type::Any),
+                (Type::table(), Type::List(Box::new(Type::String))),
+                (Type::record(), Type::Any),
             ])
             .required(
                 "pattern",
                 SyntaxShape::String,
-                "the pattern to output. e.g.) \"{foo}: {bar}\"",
+                "The pattern to output. e.g.) \"{foo}: {bar}\".",
             )
             .allow_variants_without_examples(true)
             .category(Category::Strings)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Format columns into a string using a simple pattern."
     }
 
@@ -43,40 +38,16 @@ impl Command for FormatPattern {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let mut working_set = StateWorkingSet::new(engine_state);
+        let pattern: Spanned<String> = call.req(engine_state, stack, 0)?;
+        let input_val = input.into_value(call.head)?;
 
-        let specified_pattern: Result<Value, ShellError> = call.req(engine_state, stack, 0);
-        let input_val = input.into_value(call.head);
-        // add '$it' variable to support format like this: $it.column1.column2.
-        let it_id = working_set.add_variable(b"$it".to_vec(), call.head, Type::Any, false);
-        stack.add_var(it_id, input_val.clone());
+        let ops = extract_formatting_operations(pattern, call.head)?;
+        let config = stack.get_config(engine_state);
 
-        match specified_pattern {
-            Err(e) => Err(e),
-            Ok(pattern) => {
-                let string_pattern = pattern.as_string()?;
-                let string_span = pattern.span();
-                // the string span is start as `"`, we don't need the character
-                // to generate proper span for sub expression.
-                let ops = extract_formatting_operations(
-                    string_pattern,
-                    call.head,
-                    string_span.start + 1,
-                )?;
-
-                format(
-                    input_val,
-                    &ops,
-                    engine_state,
-                    &mut working_set,
-                    stack,
-                    call.head,
-                )
-            }
-        }
+        format(input_val, &ops, engine_state, &config, call.head)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "Print filenames with their sizes",
@@ -86,9 +57,16 @@ impl Command for FormatPattern {
             Example {
                 description: "Print elements from some columns of a table",
                 example: "[[col1, col2]; [v1, v2] [v3, v4]] | format pattern '{col2}'",
-                result: Some(Value::list(
-                    vec![Value::test_string("v2"), Value::test_string("v4")],
-                    Span::test_data(),
+                result: Some(Value::test_list(vec![
+                    Value::test_string("v2"),
+                    Value::test_string("v4"),
+                ])),
+            },
+            Example {
+                description: "Escape braces by repeating them",
+                example: r#"{start: 3, end: 5} | format pattern 'if {start} < {end} {{ "correct" }} else {{ "incorrect" }}'"#,
+                result: Some(Value::test_string(
+                    r#"if 3 < 5 { "correct" } else { "incorrect" }"#,
                 )),
             },
         ]
@@ -106,9 +84,16 @@ impl Command for FormatPattern {
 enum FormatOperation {
     FixedText(String),
     // raw input is something like {column1.column2}
-    ValueFromColumn(String, Span),
-    // raw input is something like {$it.column1.column2} or {$var}.
-    ValueNeedEval(String, Span),
+    ValueFromColumn { content: String, span: Option<Span> },
+}
+
+impl FormatOperation {
+    fn update_span(mut self, f: impl FnOnce(Option<Span>) -> Option<Span>) -> Self {
+        if let FormatOperation::ValueFromColumn { span, .. } = &mut self {
+            *span = f(*span);
+        }
+        self
+    }
 }
 
 /// Given a pattern that is fed into the Format command, we can process it and subdivide it
@@ -117,74 +102,130 @@ enum FormatOperation {
 /// there without any further processing.
 /// FormatOperation::ValueFromColumn contains the name of a column whose values will be
 /// formatted according to the input pattern.
-/// FormatOperation::ValueNeedEval contains expression which need to eval, it has the following form:
 /// "$it.column1.column2" or "$variable"
 fn extract_formatting_operations(
-    input: String,
-    error_span: Span,
-    span_start: usize,
+    input: Spanned<String>,
+    call_head: Span,
 ) -> Result<Vec<FormatOperation>, ShellError> {
-    let mut output = vec![];
+    let Spanned {
+        item: pattern,
+        span: pattern_span,
+    } = input;
 
-    let mut characters = input.char_indices();
+    // To have proper spans for the extracted operations, we need the span of the pattern string.
+    // Specifically we need the *string content*, without any surrounding quotes.
+    //
+    // NOTE: This implementation can't accurately derive spans for strings containing escape
+    // sequences ("\n", "\t", "\u{3bd}", ...). I don't think we can without parser support.
+    // NOTE: Pattern strings provided with variables are also problematic. The spans we get for
+    // arguments are from the call site, we can't get the original span of a value passed as a
+    // variable.
+    let pattern_span = {
+        //
+        //    .----------span len: 21
+        //    |     .--string len: 12
+        //    |     |       delta:  9
+        //  .-+-----|-----------.
+        //  |    .--+-------.   |
+        //  r###'hello {user}'###
+        //
+        let delta = pattern_span.len() - pattern.len();
+        // might be `r'foo'` or `$'foo'`
+        // either 1 or 0
+        let str_prefix_len = delta % 2;
+        //
+        //    r###'hello {user}'###
+        //    ^^^^
+        let span_str_start_delta = delta / 2 + str_prefix_len;
+        pattern_span.subspan(span_str_start_delta, span_str_start_delta + pattern.len())
+    };
 
-    let mut column_span_start = 0;
-    let mut column_span_end = 0;
-    loop {
-        let mut before_bracket = String::new();
-
-        for (index, ch) in &mut characters {
-            if ch == '{' {
-                column_span_start = index + 1; // not include '{' character.
-                break;
+    let mut is_fixed = true;
+    // `batching` stops on `None`. An unclosed `{` at end-of-pattern yields
+    // FixedText first, then the next call peeks empty; report that error once.
+    let mut reported_unclosed = false;
+    let ops = pattern.char_indices().peekable().batching(move |it| {
+        let Some(&(start_index, _)) = it.peek() else {
+            if is_fixed || reported_unclosed {
+                return None;
             }
-            before_bracket.push(ch);
-        }
-
-        if !before_bracket.is_empty() {
-            output.push(FormatOperation::FixedText(before_bracket.to_string()));
-        }
-
-        let mut column_name = String::new();
-        let mut column_need_eval = false;
-        for (index, ch) in &mut characters {
-            if ch == '$' {
-                column_need_eval = true;
-            }
-
-            if ch == '}' {
-                column_span_end = index; // not include '}' character.
-                break;
-            }
-            column_name.push(ch);
-        }
-
-        if column_span_end < column_span_start {
-            return Err(ShellError::DelimiterError {
-                msg: "there are unmatched curly braces".to_string(),
-                span: error_span,
-            });
-        }
-
-        if !column_name.is_empty() {
-            if column_need_eval {
-                output.push(FormatOperation::ValueNeedEval(
-                    column_name.clone(),
-                    Span::new(span_start + column_span_start, span_start + column_span_end),
-                ));
-            } else {
-                output.push(FormatOperation::ValueFromColumn(
-                    column_name.clone(),
-                    Span::new(span_start + column_span_start, span_start + column_span_end),
-                ));
+            reported_unclosed = true;
+            return Some(Err(()));
+        };
+        let mut buf = String::new();
+        while let Some((index, ch)) = it.next() {
+            match ch {
+                '{' if is_fixed => {
+                    if it.next_if(|(_, next_ch)| *next_ch == '{').is_some() {
+                        buf.push(ch);
+                    } else {
+                        is_fixed = false;
+                        return Some(Ok(FormatOperation::FixedText(buf)));
+                    };
+                }
+                '}' => {
+                    if is_fixed {
+                        if it.next_if(|(_, next_ch)| *next_ch == '}').is_some() {
+                            buf.push(ch);
+                        } else {
+                            return Some(Err(()));
+                        }
+                    } else {
+                        is_fixed = true;
+                        return Some(Ok(FormatOperation::ValueFromColumn {
+                            content: buf,
+                            // span is relative to `pattern`
+                            span: Some(Span::new(start_index, index)),
+                        }));
+                    }
+                }
+                _ => {
+                    buf.push(ch);
+                }
             }
         }
-
-        if before_bracket.is_empty() && column_name.is_empty() {
-            break;
+        if is_fixed {
+            Some(std::mem::take(&mut buf))
+                .filter(|buf| !buf.is_empty())
+                .map(FormatOperation::FixedText)
+                .map(Ok)
+        } else {
+            Some(Err(()))
         }
-    }
-    Ok(output)
+    });
+
+    let adjust_span = move |col_span: Span| -> Option<Span> {
+        pattern_span?.subspan(col_span.start, col_span.end)
+    };
+
+    let make_delimiter_error = move |_| ShellError::DelimiterError {
+        msg: "there are unmatched curly braces".to_string(),
+        span: call_head,
+    };
+
+    let make_removed_functionality_error = |span: Span| {
+        ShellError::Generic(
+            GenericError::new(
+                "Removed functionality",
+                "The ability to use variables ($it) in `format pattern` has been removed.",
+                span,
+            )
+            .with_help("You can use other formatting options, such as string interpolation."),
+        )
+    };
+
+    ops.map(|res_op| {
+        res_op
+            .map(|op| op.update_span(|col_span| col_span.and_then(adjust_span)))
+            .map_err(make_delimiter_error)
+            .and_then(|op| match op {
+                FormatOperation::ValueFromColumn { content, span } if content.starts_with('$') => {
+                    Err(make_removed_functionality_error(span.unwrap_or(call_head)))
+                }
+                op => Ok(op),
+            })
+    })
+    .collect()
 }
 
 /// Format the incoming PipelineData according to the pattern
@@ -192,8 +233,7 @@ fn format(
     input_data: Value,
     format_operations: &[FormatOperation],
     engine_state: &EngineState,
-    working_set: &mut StateWorkingSet,
-    stack: &mut Stack,
+    config: &Config,
     head_span: Span,
 ) -> Result<PipelineData, ShellError> {
     let data_as_value = input_data;
@@ -201,14 +241,8 @@ fn format(
     //  We can only handle a Record or a List of Records
     match data_as_value {
         Value::Record { .. } => {
-            match format_record(
-                format_operations,
-                &data_as_value,
-                engine_state,
-                working_set,
-                stack,
-            ) {
-                Ok(value) => Ok(PipelineData::Value(Value::string(value, head_span), None)),
+            match format_record(format_operations, &data_as_value, config, head_span) {
+                Ok(value) => Ok(PipelineData::value(Value::string(value, head_span), None)),
                 Err(value) => Err(value),
             }
         }
@@ -218,13 +252,7 @@ fn format(
             for val in vals.iter() {
                 match val {
                     Value::Record { .. } => {
-                        match format_record(
-                            format_operations,
-                            val,
-                            engine_state,
-                            working_set,
-                            stack,
-                        ) {
+                        match format_record(format_operations, val, config, head_span) {
                             Ok(value) => {
                                 list.push(Value::string(value, head_span));
                             }
@@ -240,15 +268,12 @@ fn format(
                             wrong_type: val.get_type().to_string(),
                             dst_span: head_span,
                             src_span: val.span(),
-                        })
+                        });
                     }
                 }
             }
 
-            Ok(PipelineData::ListStream(
-                ListStream::from_stream(list.into_iter(), None),
-                None,
-            ))
+            Ok(ListStream::new(list.into_iter(), head_span, engine_state.signals().clone()).into())
         }
         // Unwrapping this ShellError is a bit unfortunate.
         // Ideally, its Span would be preserved.
@@ -265,49 +290,33 @@ fn format(
 fn format_record(
     format_operations: &[FormatOperation],
     data_as_value: &Value,
-    engine_state: &EngineState,
-    working_set: &mut StateWorkingSet,
-    stack: &mut Stack,
+    config: &Config,
+    head_span: Span,
 ) -> Result<String, ShellError> {
-    let config = engine_state.get_config();
     let mut output = String::new();
 
     for op in format_operations {
         match op {
             FormatOperation::FixedText(s) => output.push_str(s.as_str()),
-            FormatOperation::ValueFromColumn(col_name, span) => {
+            FormatOperation::ValueFromColumn {
+                content: col_name,
+                span,
+            } => {
                 // path member should split by '.' to handle for nested structure.
                 let path_members: Vec<PathMember> = col_name
                     .split('.')
                     .map(|path| PathMember::String {
                         val: path.to_string(),
-                        span: *span,
+                        span: span.unwrap_or(head_span),
                         optional: false,
+                        casing: Casing::Sensitive,
                     })
                     .collect();
-                match data_as_value.clone().follow_cell_path(&path_members, false) {
-                    Ok(value_at_column) => {
-                        output.push_str(value_at_column.into_string(", ", config).as_str())
-                    }
-                    Err(se) => return Err(se),
-                }
-            }
-            FormatOperation::ValueNeedEval(_col_name, span) => {
-                let exp = parse_expression(working_set, &[*span], false);
-                match working_set.parse_errors.first() {
-                    None => {
-                        let parsed_result = eval_expression(engine_state, stack, &exp);
-                        if let Ok(val) = parsed_result {
-                            output.push_str(&val.into_abbreviated_string(config))
-                        }
-                    }
-                    Some(err) => {
-                        return Err(ShellError::TypeMismatch {
-                            err_message: format!("expression is invalid, detail message: {err:?}"),
-                            span: *span,
-                        })
-                    }
-                }
+
+                let expanded_string = data_as_value
+                    .follow_cell_path(&path_members)?
+                    .to_expanded_string(", ", config);
+                output.push_str(expanded_string.as_str())
             }
         }
     }
@@ -317,9 +326,8 @@ fn format_record(
 #[cfg(test)]
 mod test {
     #[test]
-    fn test_examples() {
+    fn test_examples() -> nu_test_support::Result {
         use super::FormatPattern;
-        use crate::test_examples;
-        test_examples(FormatPattern {})
+        nu_test_support::test().examples(FormatPattern)
     }
 }

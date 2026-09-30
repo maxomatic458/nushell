@@ -1,9 +1,5 @@
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Config, Example, IntoPipelineData, PipelineData, ShellError, Signature, Type,
-    Value,
-};
+use nu_engine::command_prelude::*;
+use nu_protocol::{Config, shell_error::generic::GenericError};
 
 #[derive(Clone)]
 pub struct Headers;
@@ -15,22 +11,15 @@ impl Command for Headers {
 
     fn signature(&self) -> Signature {
         Signature::build(self.name())
-            .input_output_types(vec![
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (
-                    // Tables with missing values are List<Any>
-                    Type::List(Box::new(Type::Any)),
-                    Type::Table(vec![]),
-                ),
-            ])
+            .input_output_types(vec![(Type::table(), Type::table())])
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Use the first row of the table as column names."
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "Sets the column names for a table created by `split column`",
@@ -63,114 +52,111 @@ impl Command for Headers {
     fn run(
         &self,
         engine_state: &EngineState,
-        _stack: &mut Stack,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let config = engine_state.get_config();
-        let metadata = input.metadata();
-        let value = input.into_value(call.head);
-        let (old_headers, new_headers) = extract_headers(&value, config)?;
-        let new_headers = replace_headers(value, &old_headers, &new_headers)?;
+        let mut input = input.into_stream_or_original(engine_state);
+        let config = &stack.get_config(engine_state);
+        let metadata = input.take_metadata();
+        let span = input.span().unwrap_or(call.head);
+        let value = input.into_value(span)?;
+        let Value::List { vals: table, .. } = value else {
+            return Err(ShellError::TypeMismatch {
+                err_message: "not a table".to_string(),
+                span,
+            });
+        };
 
-        Ok(new_headers.into_pipeline_data_with_metadata(metadata))
+        let (old_headers, new_headers) = extract_headers(&table, span, config)?;
+        let value = replace_headers(table.into_owned(), span, &old_headers, &new_headers)?;
+
+        Ok(value.into_pipeline_data_with_metadata(metadata))
+    }
+}
+
+fn extract_headers(
+    table: &[Value],
+    span: Span,
+    config: &Config,
+) -> Result<(Vec<String>, Vec<String>), ShellError> {
+    let record = table
+        .first()
+        .ok_or_else(|| {
+            ShellError::Generic(GenericError::new(
+                "Found empty list",
+                "unable to extract headers",
+                span,
+            ))
+        })?
+        .as_record()?;
+
+    let new_headers = record
+        .values()
+        .enumerate()
+        .map(|(idx, value)| make_header_string(config, idx, value))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let old_headers = record.columns().cloned().collect();
+
+    Ok((old_headers, new_headers))
+}
+
+fn make_header_string(config: &Config, idx: usize, value: &Value) -> Result<String, ShellError> {
+    match value {
+        Value::Nothing { .. }
+        | Value::String { .. }
+        | Value::Bool { .. }
+        | Value::Float { .. }
+        | Value::Int { .. } => {
+            let col = value.to_expanded_string("", config);
+            Ok(match col.is_empty() {
+                true => format!("column{idx}"),
+                false => col,
+            })
+        }
+        _ => Err(ShellError::TypeMismatch {
+            err_message: "needs compatible type: Null, String, Bool, Float, Int".to_string(),
+            span: value.span(),
+        }),
     }
 }
 
 fn replace_headers(
-    value: Value,
+    rows: Vec<Value>,
+    span: Span,
     old_headers: &[String],
     new_headers: &[String],
 ) -> Result<Value, ShellError> {
-    let span = value.span();
-    match value {
-        Value::Record { val, .. } => Ok(Value::record(
-            val.into_iter()
-                .filter_map(|(col, val)| {
-                    old_headers
-                        .iter()
-                        .position(|c| c == &col)
-                        .map(|i| (new_headers[i].clone(), val))
+    rows.into_iter()
+        .skip(1)
+        .map(|value| {
+            let span = value.span();
+            if let Value::Record { val: record, .. } = value {
+                Ok(Value::record(
+                    record
+                        .into_owned()
+                        .into_iter()
+                        .filter_map(|(col, val)| {
+                            old_headers
+                                .iter()
+                                .position(|c| c == &col)
+                                .map(|i| (new_headers[i].clone(), val))
+                        })
+                        .collect(),
+                    span,
+                ))
+            } else {
+                Err(ShellError::CantConvert {
+                    to_type: "record".into(),
+                    from_type: value.get_type().to_string(),
+                    span,
+                    help: None,
                 })
-                .collect(),
-            span,
-        )),
-        Value::List { vals, .. } => {
-            let vals = vals
-                .into_iter()
-                .skip(1)
-                .map(|value| replace_headers(value, old_headers, new_headers))
-                .collect::<Result<Vec<Value>, ShellError>>()?;
-
-            Ok(Value::list(vals, span))
-        }
-        _ => Err(ShellError::TypeMismatch {
-            err_message: "record".to_string(),
-            span: value.span(),
-        }),
-    }
-}
-
-fn is_valid_header(value: &Value) -> bool {
-    matches!(
-        value,
-        Value::Nothing { .. }
-            | Value::String { val: _, .. }
-            | Value::Bool { val: _, .. }
-            | Value::Float { val: _, .. }
-            | Value::Int { val: _, .. }
-    )
-}
-
-fn extract_headers(
-    value: &Value,
-    config: &Config,
-) -> Result<(Vec<String>, Vec<String>), ShellError> {
-    let span = value.span();
-    match value {
-        Value::Record { val: record, .. } => {
-            for v in record.values() {
-                if !is_valid_header(v) {
-                    return Err(ShellError::TypeMismatch {
-                        err_message: "needs compatible type: Null, String, Bool, Float, Int"
-                            .to_string(),
-                        span: v.span(),
-                    });
-                }
             }
-
-            let old_headers = record.columns().cloned().collect();
-            let new_headers = record
-                .values()
-                .enumerate()
-                .map(|(idx, value)| {
-                    let col = value.into_string("", config);
-                    if col.is_empty() {
-                        format!("column{idx}")
-                    } else {
-                        col
-                    }
-                })
-                .collect::<Vec<String>>();
-
-            Ok((old_headers, new_headers))
-        }
-        Value::List { vals, .. } => vals
-            .iter()
-            .map(|value| extract_headers(value, config))
-            .next()
-            .ok_or_else(|| ShellError::GenericError {
-                error: "Found empty list".into(),
-                msg: "unable to extract headers".into(),
-                span: Some(span),
-                help: None,
-                inner: vec![],
-            })?,
-        _ => Err(ShellError::TypeMismatch {
-            err_message: "record".to_string(),
-            span: value.span(),
-        }),
-    }
+        })
+        .collect::<Result<_, _>>()
+        .map(|rows| Value::list(rows, span))
 }
 
 #[cfg(test)]
@@ -178,9 +164,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Headers {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Headers)
     }
 }

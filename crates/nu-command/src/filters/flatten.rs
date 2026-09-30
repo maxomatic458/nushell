@@ -1,12 +1,6 @@
 use indexmap::IndexMap;
-use nu_engine::CallExt;
-use nu_protocol::ast::{Call, CellPath, PathMember};
-
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, PipelineData, Record, ShellError, Signature, Span, SyntaxShape,
-    Type, Value,
-};
+use nu_engine::command_prelude::*;
+use nu_protocol::ast::PathMember;
 
 #[derive(Clone)]
 pub struct Flatten;
@@ -23,19 +17,26 @@ impl Command for Flatten {
                     Type::List(Box::new(Type::Any)),
                     Type::List(Box::new(Type::Any)),
                 ),
-                (Type::Record(vec![]), Type::Table(vec![])),
+                (Type::record(), Type::table()),
             ])
             .rest(
                 "rest",
                 SyntaxShape::String,
                 "Optionally flatten data by column.",
             )
-            .switch("all", "flatten inner table one level out", Some('a'))
+            .switch("all", "Flatten inner table one level out.", Some('a'))
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
-        "Flatten the table."
+    fn description(&self) -> &str {
+        "Flatten a table by extracting nested values."
+    }
+
+    fn extra_description(&self) -> &str {
+        "A record is treated as a one-row table, so the output is always a table.
+Fields of a nested record are lifted to the top level and the parent key is dropped.
+If a lifted field would collide with a top-level column, it is renamed to `<parent>_<field>`.
+A nested list is expanded into one row per element."
     }
 
     fn run(
@@ -48,39 +49,47 @@ impl Command for Flatten {
         flatten(engine_state, stack, call, input)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "flatten a table",
+                description: "flatten a table.",
                 example: "[[N, u, s, h, e, l, l]] | flatten ",
-                result: Some(Value::test_list(
-                    vec![
-                        Value::test_string("N"),
-                        Value::test_string("u"),
-                        Value::test_string("s"),
-                        Value::test_string("h"),
-                        Value::test_string("e"),
-                        Value::test_string("l"),
-                        Value::test_string("l")],
-                ))
+                result: Some(Value::test_list(vec![
+                    Value::test_string("N"),
+                    Value::test_string("u"),
+                    Value::test_string("s"),
+                    Value::test_string("h"),
+                    Value::test_string("e"),
+                    Value::test_string("l"),
+                    Value::test_string("l"),
+                ])),
             },
             Example {
-                description: "flatten a table, get the first item",
+                description: "flatten a table, get the first item.",
                 example: "[[N, u, s, h, e, l, l]] | flatten | first",
-                result: None,//Some(Value::test_string("N")),
+                result: None, //Some(Value::test_string("N")),
             },
             Example {
-                description: "flatten a column having a nested table",
+                description: "flatten a column having a nested table.",
                 example: "[[origin, people]; [Ecuador, ([[name, meal]; ['Andres', 'arepa']])]] | flatten --all | get meal",
-                result: None,//Some(Value::test_string("arepa")),
+                result: None, //Some(Value::test_string("arepa")),
             },
             Example {
-                description: "restrict the flattening by passing column names",
+                description: "restrict the flattening by passing column names.",
                 example: "[[origin, crate, versions]; [World, ([[name]; ['nu-cli']]), ['0.21', '0.22']]] | flatten versions --all | last | get versions",
                 result: None, //Some(Value::test_string("0.22")),
             },
             Example {
-                description: "Flatten inner table",
+                description: "Flatten a record: nested record fields are lifted, and a lifted field that collides with a top-level column is prefixed with its parent key.",
+                example: "{ a: { b: 1, c: 2 }, c: 3 } | flatten",
+                result: Some(Value::test_list(vec![Value::test_record(record! {
+                    "b" => Value::test_int(1),
+                    "a_c" => Value::test_int(2),
+                    "c" => Value::test_int(3),
+                })])),
+            },
+            Example {
+                description: "Flatten inner table.",
                 example: "{ a: b, d: [ 1 2 3 4 ], e: [ 4 3 ] } | flatten d --all",
                 result: Some(Value::list(
                     vec![
@@ -115,7 +124,7 @@ impl Command for Flatten {
                     ],
                     Span::test_data(),
                 )),
-            }
+            },
         ]
     }
 }
@@ -124,16 +133,16 @@ fn flatten(
     engine_state: &EngineState,
     stack: &mut Stack,
     call: &Call,
-    input: PipelineData,
+    mut input: PipelineData,
 ) -> Result<PipelineData, ShellError> {
     let columns: Vec<CellPath> = call.rest(engine_state, stack, 0)?;
-    let metadata = input.metadata();
+    let metadata = input.take_metadata();
     let flatten_all = call.has_flag(engine_state, stack, "all")?;
 
     input
         .flat_map(
             move |item| flat_value(&columns, item, flatten_all),
-            engine_state.ctrlc.clone(),
+            engine_state.signals(),
         )
         .map(|x| x.set_metadata(metadata))
 }
@@ -159,28 +168,59 @@ fn flat_value(columns: &[CellPath], item: Value, all: bool) -> Vec<Value> {
 
     match item {
         Value::Record { val, .. } => {
+            let val = val.into_owned();
+            // Top-level columns that keep their name in the output. A lifted inner field
+            // that collides with one of these is renamed to `<parent>_<field>` instead of
+            // silently being overwritten (or overwriting it), regardless of field order.
+            let retained_outer_columns: Vec<String> = val
+                .iter()
+                .filter_map(|(column, value)| {
+                    let column_requested = columns.iter().find(|c| c.to_column_name() == *column);
+                    let need_flatten = columns.is_empty() || column_requested.is_some();
+
+                    let will_flatten = match value {
+                        Value::Record { .. } => need_flatten,
+                        Value::List { vals, .. } => {
+                            if all && vals.iter().all(|value| value.as_record().is_ok()) {
+                                need_flatten
+                            } else {
+                                matches!(
+                                    column_requested
+                                        .and_then(|cell_path| cell_path.members.first()),
+                                    Some(PathMember::String { .. })
+                                )
+                            }
+                        }
+                        _ => false,
+                    };
+
+                    (!will_flatten).then_some(column.clone())
+                })
+                .collect();
             let mut out = IndexMap::<String, Value>::new();
             let mut inner_table = None;
 
             for (column_index, (column, value)) in val.into_iter().enumerate() {
-                let column_requested = columns.iter().find(|c| c.to_string() == column);
+                let column_requested = columns.iter().find(|c| c.to_column_name() == column);
                 let need_flatten = { columns.is_empty() || column_requested.is_some() };
                 let span = value.span();
 
                 match value {
-                    Value::Record { val, .. } => {
+                    Value::Record { ref val, .. } => {
                         if need_flatten {
-                            for (col, val) in val {
-                                if out.contains_key(&col) {
+                            for (col, val) in val.clone().into_owned() {
+                                if out.contains_key(&col)
+                                    || retained_outer_columns.iter().any(|column| column == &col)
+                                {
                                     out.insert(format!("{column}_{col}"), val);
                                 } else {
                                     out.insert(col, val);
                                 }
                             }
                         } else if out.contains_key(&column) {
-                            out.insert(format!("{column}_{column}"), Value::record(val, span));
+                            out.insert(format!("{column}_{column}"), value);
                         } else {
-                            out.insert(column, Value::record(val, span));
+                            out.insert(column, value);
                         }
                     }
                     Value::List { vals, .. } => {
@@ -201,13 +241,7 @@ fn flat_value(columns: &[CellPath], item: Value, all: bool) -> Vec<Value> {
                             if need_flatten {
                                 let records = vals
                                     .into_iter()
-                                    .filter_map(|v| {
-                                        if let Value::Record { val, .. } = v {
-                                            Some(val)
-                                        } else {
-                                            None
-                                        }
-                                    })
+                                    .filter_map(|v| v.into_record().ok())
                                     .collect();
 
                                 inner_table = Some(TableInside::FlattenedRows {
@@ -216,9 +250,12 @@ fn flat_value(columns: &[CellPath], item: Value, all: bool) -> Vec<Value> {
                                     parent_column_index: column_index,
                                 });
                             } else if out.contains_key(&column) {
-                                out.insert(format!("{column}_{column}"), Value::list(vals, span));
+                                out.insert(
+                                    format!("{column}_{column}"),
+                                    Value::list_shared(vals, span),
+                                );
                             } else {
-                                out.insert(column, Value::list(vals, span));
+                                out.insert(column, Value::list_shared(vals, span));
                             }
                         } else if !columns.is_empty() {
                             let cell_path =
@@ -228,13 +265,20 @@ fn flat_value(columns: &[CellPath], item: Value, all: bool) -> Vec<Value> {
                                 });
 
                             if let Some(r) = cell_path {
-                                inner_table =
-                                    Some(TableInside::Entries(r.clone(), vals, column_index));
+                                inner_table = Some(TableInside::Entries(
+                                    r.clone(),
+                                    vals.into_owned(),
+                                    column_index,
+                                ));
                             } else {
-                                out.insert(column, Value::list(vals, span));
+                                out.insert(column, Value::list_shared(vals, span));
                             }
                         } else {
-                            inner_table = Some(TableInside::Entries(column, vals, column_index));
+                            inner_table = Some(TableInside::Entries(
+                                column,
+                                vals.into_owned(),
+                                column_index,
+                            ));
                         }
                     }
                     _ => {
@@ -281,7 +325,9 @@ fn flat_value(columns: &[CellPath], item: Value, all: bool) -> Vec<Value> {
                             // this can avoid output column order changed.
                             if index == parent_column_index {
                                 for (col, val) in &inner_record {
-                                    if record.contains(col) {
+                                    if record.contains(col)
+                                        || (!columns.is_empty() && out.contains_key(col))
+                                    {
                                         record.push(
                                             format!("{parent_column_name}_{col}"),
                                             val.clone(),
@@ -299,7 +345,9 @@ fn flat_value(columns: &[CellPath], item: Value, all: bool) -> Vec<Value> {
                         // the flattened column may be the last column in the original table.
                         if index == parent_column_index {
                             for (col, val) in inner_record {
-                                if record.contains(&col) {
+                                if record.contains(&col)
+                                    || (!columns.is_empty() && out.contains_key(&col))
+                                {
                                     record.push(format!("{parent_column_name}_{col}"), val);
                                 } else {
                                     record.push(col, val);
@@ -315,7 +363,7 @@ fn flat_value(columns: &[CellPath], item: Value, all: bool) -> Vec<Value> {
             }
             expanded
         }
-        Value::List { vals, .. } => vals,
+        Value::List { vals, .. } => vals.into_owned(),
         item => vec![item],
     }
 }
@@ -324,9 +372,7 @@ fn flat_value(columns: &[CellPath], item: Value, all: bool) -> Vec<Value> {
 mod test {
     use super::*;
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Flatten {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Flatten)
     }
 }

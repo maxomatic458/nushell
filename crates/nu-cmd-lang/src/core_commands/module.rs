@@ -1,8 +1,5 @@
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, PipelineData, ShellError, Signature, SyntaxShape, Type, Value,
-};
+use nu_engine::command_prelude::*;
+use nu_protocol::engine::CommandType;
 
 #[derive(Clone)]
 pub struct Module;
@@ -12,7 +9,7 @@ impl Command for Module {
         "module"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Define a custom module."
     }
 
@@ -29,13 +26,13 @@ impl Command for Module {
             .category(Category::Core)
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"This command is a parser keyword. For details, check:
-  https://www.nushell.sh/book/thinking_in_nu.html"#
+    fn extra_description(&self) -> &str {
+        "This command is a parser keyword. For details, check:
+  https://www.nushell.sh/book/thinking_in_nu.html"
     }
 
-    fn is_parser_keyword(&self) -> bool {
-        true
+    fn command_type(&self) -> CommandType {
+        CommandType::Keyword
     }
 
     fn run(
@@ -48,20 +45,20 @@ impl Command for Module {
         Ok(PipelineData::empty())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Define a custom command in a module and call it",
+                description: "Define a custom command in a module and call it.",
                 example: r#"module spam { export def foo [] { "foo" } }; use spam foo; foo"#,
                 result: Some(Value::test_string("foo")),
             },
             Example {
-                description: "Define an environment variable in a module",
+                description: "Define an environment variable in a module.",
                 example: r#"module foo { export-env { $env.FOO = "BAZ" } }; use foo; $env.FOO"#,
                 result: Some(Value::test_string("BAZ")),
             },
             Example {
-                description: "Define a custom command that participates in the environment in a module and call it",
+                description: "Define a custom command that participates in the environment in a module and call it.",
                 example: r#"module foo { export def --env bar [] { $env.FOO_BAR = "BAZ" } }; use foo bar; bar; $env.FOO_BAR"#,
                 result: Some(Value::test_string("BAZ")),
             },

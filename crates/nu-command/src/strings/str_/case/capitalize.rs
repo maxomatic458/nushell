@@ -1,15 +1,9 @@
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::ast::CellPath;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::record;
-use nu_protocol::Category;
-use nu_protocol::{Example, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value};
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct StrCapitalize;
 
-impl Command for SubCommand {
+impl Command for StrCapitalize {
     fn name(&self) -> &str {
         "str capitalize"
     }
@@ -22,8 +16,8 @@ impl Command for SubCommand {
                     Type::List(Box::new(Type::String)),
                     Type::List(Box::new(Type::String)),
                 ),
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true)
             .rest(
@@ -34,12 +28,16 @@ impl Command for SubCommand {
             .category(Category::Strings)
     }
 
-    fn usage(&self) -> &str {
-        "Capitalize first letter of text."
+    fn description(&self) -> &str {
+        "Capitalize the first letter of text."
     }
 
     fn search_terms(&self) -> Vec<&str> {
         vec!["convert", "style", "caps", "upper"]
+    }
+
+    fn is_const(&self) -> bool {
+        true
     }
 
     fn run(
@@ -49,23 +47,35 @@ impl Command for SubCommand {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        operate(engine_state, stack, call, input)
+        let column_paths: Vec<CellPath> = call.rest(engine_state, stack, 0)?;
+        operate(engine_state, call, input, column_paths)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn run_const(
+        &self,
+        working_set: &StateWorkingSet,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let column_paths: Vec<CellPath> = call.rest_const(working_set, stack, 0)?;
+        operate(working_set.permanent(), call, input, column_paths)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Capitalize contents",
+                description: "Capitalize contents.",
                 example: "'good day' | str capitalize",
                 result: Some(Value::test_string("Good day")),
             },
             Example {
-                description: "Capitalize contents",
+                description: "Capitalize contents.",
                 example: "'anton' | str capitalize",
                 result: Some(Value::test_string("Anton")),
             },
             Example {
-                description: "Capitalize a column in a table",
+                description: "Capitalize a column in a table.",
                 example: "[[lang, gems]; [nu_test, 100]] | str capitalize lang",
                 result: Some(Value::test_list(vec![Value::test_record(record! {
                     "lang" => Value::test_string("Nu_test"),
@@ -78,12 +88,11 @@ impl Command for SubCommand {
 
 fn operate(
     engine_state: &EngineState,
-    stack: &mut Stack,
     call: &Call,
     input: PipelineData,
+    column_paths: Vec<CellPath>,
 ) -> Result<PipelineData, ShellError> {
     let head = call.head;
-    let column_paths: Vec<CellPath> = call.rest(engine_state, stack, 0)?;
     input.map(
         move |v| {
             if column_paths.is_empty() {
@@ -100,7 +109,7 @@ fn operate(
                 ret
             }
         },
-        engine_state.ctrlc.clone(),
+        engine_state.signals(),
     )
 }
 
@@ -134,9 +143,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StrCapitalize)
     }
 }

@@ -6,7 +6,7 @@ use std::{
 use nix::{
     errno::Errno,
     libc,
-    sys::signal::{killpg, raise, sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal},
+    sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, killpg, raise, sigaction},
     unistd::{self, Pid},
 };
 
@@ -57,7 +57,7 @@ pub(crate) fn acquire(interactive: bool) {
             }
         }
         // Set our possibly new pgid to be in control of terminal
-        let _ = unistd::tcsetpgrp(libc::STDIN_FILENO, shell_pgid);
+        let _ = unistd::tcsetpgrp(unsafe { nu_system::stdin_fd() }, shell_pgid);
     }
 }
 
@@ -66,7 +66,7 @@ pub(crate) fn acquire(interactive: bool) {
 fn take_control() -> Pid {
     let shell_pgid = unistd::getpgrp();
 
-    match unistd::tcgetpgrp(nix::libc::STDIN_FILENO) {
+    match unistd::tcgetpgrp(unsafe { nu_system::stdin_fd() }) {
         Ok(owner_pgid) if owner_pgid == shell_pgid => {
             // Common case, nothing to do
             return owner_pgid;
@@ -84,21 +84,21 @@ fn take_control() -> Pid {
     for sig in Signal::iterator() {
         if let Ok(old_act) = unsafe { sigaction(sig, &default) } {
             // fish preserves ignored SIGHUP, presumably for nohup support, so let's do the same
-            if sig == Signal::SIGHUP && old_act.handler() == SigHandler::SigIgn {
+            if sig == Signal::SIGHUP && matches!(old_act.handler(), SigHandler::SigIgn) {
                 let _ = unsafe { sigaction(sig, &old_act) };
             }
         }
     }
 
     for _ in 0..4096 {
-        match unistd::tcgetpgrp(libc::STDIN_FILENO) {
+        match unistd::tcgetpgrp(unsafe { nu_system::stdin_fd() }) {
             Ok(owner_pgid) if owner_pgid == shell_pgid => {
                 // success
                 return owner_pgid;
             }
             Ok(owner_pgid) if owner_pgid == Pid::from_raw(0) => {
                 // Zero basically means something like "not owned" and we can just take it
-                let _ = unistd::tcsetpgrp(libc::STDIN_FILENO, shell_pgid);
+                let _ = unistd::tcsetpgrp(unsafe { nu_system::stdin_fd() }, shell_pgid);
             }
             Err(Errno::ENOTTY) => {
                 eprintln!("ERROR: no TTY for interactive shell");
@@ -123,7 +123,7 @@ extern "C" fn restore_terminal() {
     // `tcsetpgrp` and `getpgrp` are async-signal-safe
     let initial_pgid = Pid::from_raw(INITIAL_PGID.load(Ordering::Relaxed));
     if initial_pgid.as_raw() > 0 && initial_pgid != unistd::getpgrp() {
-        let _ = unistd::tcsetpgrp(libc::STDIN_FILENO, initial_pgid);
+        let _ = unistd::tcsetpgrp(unsafe { nu_system::stdin_fd() }, initial_pgid);
     }
 }
 

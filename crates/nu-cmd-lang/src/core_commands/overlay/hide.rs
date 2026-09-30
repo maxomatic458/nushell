@@ -1,9 +1,5 @@
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, PipelineData, ShellError, Signature, Spanned, SyntaxShape, Type,
-};
+use nu_engine::command_prelude::*;
+use nu_protocol::engine::CommandType;
 
 #[derive(Clone)]
 pub struct OverlayHide;
@@ -13,7 +9,7 @@ impl Command for OverlayHide {
         "overlay hide"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Hide an active overlay."
     }
 
@@ -29,19 +25,19 @@ impl Command for OverlayHide {
             .named(
                 "keep-env",
                 SyntaxShape::List(Box::new(SyntaxShape::String)),
-                "List of environment variables to keep in the next activated overlay",
+                "List of environment variables to keep in the next activated overlay.",
                 Some('e'),
             )
             .category(Category::Core)
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"This command is a parser keyword. For details, check:
-  https://www.nushell.sh/book/thinking_in_nu.html"#
+    fn extra_description(&self) -> &str {
+        "This command is a parser keyword. For details, check:
+  https://www.nushell.sh/book/thinking_in_nu.html"
     }
 
-    fn is_parser_keyword(&self) -> bool {
-        true
+    fn command_type(&self) -> CommandType {
+        CommandType::Keyword
     }
 
     fn run(
@@ -80,7 +76,7 @@ impl Command for OverlayHide {
                         return Err(ShellError::EnvVarNotFoundAtRuntime {
                             envvar_name: name.item,
                             span: name.span,
-                        })
+                        });
                     }
                 }
             }
@@ -90,19 +86,24 @@ impl Command for OverlayHide {
             vec![]
         };
 
+        // also restore env vars which has been hidden
+        let env_vars_to_restore = stack.get_hidden_env_vars(&overlay_name.item, engine_state);
         stack.remove_overlay(&overlay_name.item);
+        for (name, val) in env_vars_to_restore {
+            stack.add_env_var(name, val);
+        }
 
         for (name, val) in env_vars_to_keep {
             stack.add_env_var(name, val);
         }
-
+        stack.update_config(engine_state)?;
         Ok(PipelineData::empty())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Keep a custom command after hiding the overlay",
+                description: "Keep a custom command after hiding the overlay.",
                 example: r#"module spam { export def foo [] { "foo" } }
     overlay use spam
     def bar [] { "bar" }
@@ -112,24 +113,24 @@ impl Command for OverlayHide {
                 result: None,
             },
             Example {
-                description: "Hide an overlay created from a file",
+                description: "Hide an overlay created from a file.",
                 example: r#"'export alias f = "foo"' | save spam.nu
     overlay use spam.nu
     overlay hide spam"#,
                 result: None,
             },
             Example {
-                description: "Hide the last activated overlay",
+                description: "Hide the last activated overlay.",
                 example: r#"module spam { export-env { $env.FOO = "foo" } }
     overlay use spam
     overlay hide"#,
                 result: None,
             },
             Example {
-                description: "Keep the current working directory when removing an overlay",
-                example: r#"overlay new spam
+                description: "Keep the current working directory when removing an overlay.",
+                example: "overlay new spam
     cd some-dir
-    overlay hide --keep-env [ PWD ] spam"#,
+    overlay hide --keep-env [ PWD ] spam",
                 result: None,
             },
         ]

@@ -1,16 +1,11 @@
-use heck::ToKebabCase;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, PipelineData, ShellError, Signature, SyntaxShape, Type, Value,
-};
-
 use super::operate;
+use heck::ToKebabCase;
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct StrKebabCase;
 
-impl Command for SubCommand {
+impl Command for StrKebabCase {
     fn name(&self) -> &str {
         "str kebab-case"
     }
@@ -19,8 +14,8 @@ impl Command for SubCommand {
         Signature::build("str kebab-case")
             .input_output_types(vec![
                 (Type::String, Type::String),
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
                 (
                     Type::List(Box::new(Type::String)),
                     Type::List(Box::new(Type::String)),
@@ -30,12 +25,12 @@ impl Command for SubCommand {
             .rest(
                 "rest",
                 SyntaxShape::CellPath,
-                "For a data structure input, convert strings at the given cell paths",
+                "For a data structure input, convert strings at the given cell paths.",
             )
             .category(Category::Strings)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Convert a string to kebab-case."
     }
 
@@ -59,7 +54,7 @@ impl Command for SubCommand {
         )
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "convert a string to kebab-case",
@@ -78,7 +73,7 @@ impl Command for SubCommand {
             },
             Example {
                 description: "convert a column from a table to kebab-case",
-                example: r#"[[lang, gems]; [nuTest, 100]] | str kebab-case lang"#,
+                example: "[[lang, gems]; [nuTest, 100]] | str kebab-case lang",
                 result: Some(Value::test_list(vec![Value::test_record(record! {
                     "lang" =>  Value::test_string("nu-test"),
                     "gems" =>  Value::test_int(100),
@@ -92,9 +87,7 @@ impl Command for SubCommand {
 mod tests {
     use super::*;
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StrKebabCase)
     }
 }

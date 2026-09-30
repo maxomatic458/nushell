@@ -1,15 +1,11 @@
-use nu_cmd_base::input_handler::{operate, CmdArgument};
-use nu_engine::CallExt;
-use nu_protocol::{
-    ast::{Call, CellPath},
-    engine::{Command, EngineState, Stack},
-    Category, Example, IntoPipelineData, PipelineData, ShellError, Signature, Span, SyntaxShape,
-    Type, Value,
-};
+use nu_cmd_base::input_handler::{CmdArgument, operate};
+use nu_engine::command_prelude::*;
+use nu_heavy_utils::endian::Endian;
 
-pub struct Arguments {
+struct Arguments {
     cell_paths: Option<Vec<CellPath>>,
     compact: bool,
+    endian: Endian,
 }
 
 impl CmdArgument for Arguments {
@@ -19,9 +15,9 @@ impl CmdArgument for Arguments {
 }
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct IntoBinary;
 
-impl Command for SubCommand {
+impl Command for IntoBinary {
     fn name(&self) -> &str {
         "into binary"
     }
@@ -35,12 +31,18 @@ impl Command for SubCommand {
                 (Type::String, Type::Binary),
                 (Type::Bool, Type::Binary),
                 (Type::Filesize, Type::Binary),
+                (Type::Duration, Type::Binary),
                 (Type::Date, Type::Binary),
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true) // TODO: supply exhaustive examples
-            .switch("compact", "output without padding zeros", Some('c'))
+            .switch("compact", "Output without padding zeros.", Some('c'))
+            .param(Endian::flag().desc(
+                "Byte encode endian. Does not affect string, date or binary. \
+                In containers, only individual elements are affected. \
+                Available options: native(default), little, big.",
+            ))
             .rest(
                 "rest",
                 SyntaxShape::CellPath,
@@ -49,7 +51,7 @@ impl Command for SubCommand {
             .category(Category::Conversions)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Convert value to a binary primitive."
     }
 
@@ -67,10 +69,10 @@ impl Command for SubCommand {
         into_binary(engine_state, stack, call, input)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "convert string to a nushell binary primitive",
+                description: "convert string to a nushell binary primitive.",
                 example: "'This is a string that is exactly 52 characters long.' | into binary",
                 result: Some(Value::binary(
                     "This is a string that is exactly 52 characters long."
@@ -81,7 +83,7 @@ impl Command for SubCommand {
                 )),
             },
             Example {
-                description: "convert a number to a nushell binary primitive",
+                description: "convert a number to a nushell binary primitive.",
                 example: "1 | into binary",
                 result: Some(Value::binary(
                     i64::from(1).to_ne_bytes().to_vec(),
@@ -89,7 +91,23 @@ impl Command for SubCommand {
                 )),
             },
             Example {
-                description: "convert a boolean to a nushell binary primitive",
+                description: "convert a number to a nushell binary primitive (big endian).",
+                example: "258 | into binary --endian big",
+                result: Some(Value::binary(
+                    i64::from(258).to_be_bytes().to_vec(),
+                    Span::test_data(),
+                )),
+            },
+            Example {
+                description: "convert a number to a nushell binary primitive (little endian).",
+                example: "258 | into binary --endian little",
+                result: Some(Value::binary(
+                    i64::from(258).to_le_bytes().to_vec(),
+                    Span::test_data(),
+                )),
+            },
+            Example {
+                description: "convert a boolean to a nushell binary primitive.",
                 example: "true | into binary",
                 result: Some(Value::binary(
                     i64::from(1).to_ne_bytes().to_vec(),
@@ -97,17 +115,17 @@ impl Command for SubCommand {
                 )),
             },
             Example {
-                description: "convert a filesize to a nushell binary primitive",
+                description: "convert a filesize to a nushell binary primitive.",
                 example: "ls | where name == LICENSE | get size | into binary",
                 result: None,
             },
             Example {
-                description: "convert a filepath to a nushell binary primitive",
+                description: "convert a filepath to a nushell binary primitive.",
                 example: "ls | where name == LICENSE | get name | path expand | into binary",
                 result: None,
             },
             Example {
-                description: "convert a float to a nushell binary primitive",
+                description: "convert a float to a nushell binary primitive.",
                 example: "1.234 | into binary",
                 result: Some(Value::binary(
                     1.234f64.to_ne_bytes().to_vec(),
@@ -115,9 +133,17 @@ impl Command for SubCommand {
                 )),
             },
             Example {
-                description: "convert an int to a nushell binary primitive with compact enabled",
+                description: "convert an int to a nushell binary primitive with compact enabled.",
                 example: "10 | into binary --compact",
                 result: Some(Value::binary(vec![10], Span::test_data())),
+            },
+            Example {
+                description: "convert a duration to a nushell binary primitive.",
+                example: "1sec | into binary",
+                result: Some(Value::binary(
+                    1_000_000_000i64.to_ne_bytes().to_vec(),
+                    Span::test_data(),
+                )),
             },
         ]
     }
@@ -133,37 +159,73 @@ fn into_binary(
     let cell_paths = call.rest(engine_state, stack, 0)?;
     let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
 
-    match input {
-        PipelineData::ExternalStream { stdout: None, .. } => {
-            Ok(Value::binary(vec![], head).into_pipeline_data())
-        }
-        PipelineData::ExternalStream {
-            stdout: Some(stream),
-            ..
-        } => {
-            // TODO: in the future, we may want this to stream out, converting each to bytes
-            let output = stream.into_bytes()?;
-            Ok(Value::binary(output.item, head).into_pipeline_data())
-        }
-        _ => {
-            let args = Arguments {
-                cell_paths,
-                compact: call.has_flag(engine_state, stack, "compact")?,
-            };
-            operate(action, args, input, call.head, engine_state.ctrlc.clone())
-        }
+    if let PipelineData::ByteStream(stream, metadata) = input {
+        // Just set the type - that should be good enough
+        Ok(PipelineData::byte_stream(
+            stream.with_type(ByteStreamType::Binary),
+            metadata,
+        ))
+    } else {
+        let endian = call
+            .get_flag::<Endian>(engine_state, stack, "endian")?
+            .unwrap_or_default();
+
+        let args = Arguments {
+            cell_paths,
+            compact: call.has_flag(engine_state, stack, "compact")?,
+            endian,
+        };
+        operate(action, args, input, head, engine_state.signals())
     }
 }
 
-pub fn action(input: &Value, _args: &Arguments, span: Span) -> Value {
+fn action(input: &Value, args: &Arguments, span: Span) -> Value {
     let value = match input {
         Value::Binary { .. } => input.clone(),
-        Value::Int { val, .. } => Value::binary(val.to_ne_bytes().to_vec(), span),
-        Value::Float { val, .. } => Value::binary(val.to_ne_bytes().to_vec(), span),
-        Value::Filesize { val, .. } => Value::binary(val.to_ne_bytes().to_vec(), span),
+        Value::Int { val, .. } => Value::binary(
+            match args.endian {
+                Endian::Little => val.to_le_bytes(),
+                Endian::Big => val.to_be_bytes(),
+            }
+            .to_vec(),
+            span,
+        ),
+        Value::Float { val, .. } => Value::binary(
+            match args.endian {
+                Endian::Little => val.to_le_bytes(),
+                Endian::Big => val.to_be_bytes(),
+            }
+            .to_vec(),
+            span,
+        ),
+        Value::Filesize { val, .. } => Value::binary(
+            match args.endian {
+                Endian::Little => val.get().to_le_bytes(),
+                Endian::Big => val.get().to_be_bytes(),
+            }
+            .to_vec(),
+            span,
+        ),
         Value::String { val, .. } => Value::binary(val.as_bytes().to_vec(), span),
-        Value::Bool { val, .. } => Value::binary(i64::from(*val).to_ne_bytes().to_vec(), span),
-        Value::Duration { val, .. } => Value::binary(val.to_ne_bytes().to_vec(), span),
+        Value::Bool { val, .. } => Value::binary(
+            {
+                let as_int = i64::from(*val);
+                match args.endian {
+                    Endian::Little => as_int.to_le_bytes(),
+                    Endian::Big => as_int.to_be_bytes(),
+                }
+                .to_vec()
+            },
+            span,
+        ),
+        Value::Duration { val, .. } => Value::binary(
+            match args.endian {
+                Endian::Little => val.to_le_bytes(),
+                Endian::Big => val.to_be_bytes(),
+            }
+            .to_vec(),
+            span,
+        ),
         Value::Date { val, .. } => {
             Value::binary(val.format("%c").to_string().as_bytes().to_vec(), span)
         }
@@ -181,21 +243,22 @@ pub fn action(input: &Value, _args: &Arguments, span: Span) -> Value {
         ),
     };
 
-    if _args.compact {
+    if args.compact {
         let val_span = value.span();
         if let Value::Binary { val, .. } = value {
-            let val = if cfg!(target_endian = "little") {
-                match val.iter().rposition(|&x| x != 0) {
-                    Some(idx) => &val[..idx + 1],
+            let val = match args.endian {
+                Endian::Little => {
+                    match val.iter().rposition(|&x| x != 0) {
+                        Some(idx) => &val[..idx + 1],
 
-                    // all 0s should just return a single 0 byte
-                    None => &[0],
+                        // all 0s should just return a single 0 byte
+                        None => &[0],
+                    }
                 }
-            } else {
-                match val.iter().position(|&x| x != 0) {
+                Endian::Big => match val.iter().position(|&x| x != 0) {
                     Some(idx) => &val[idx..],
                     None => &[0],
-                }
+                },
             };
 
             Value::binary(val.to_vec(), val_span)
@@ -214,10 +277,8 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(IntoBinary)
     }
 
     #[rstest]
@@ -232,6 +293,7 @@ mod test {
             &Arguments {
                 cell_paths: None,
                 compact: true,
+                endian: Endian::NATIVE,
             },
             Span::test_data(),
         );

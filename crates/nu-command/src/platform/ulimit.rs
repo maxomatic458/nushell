@@ -1,12 +1,8 @@
-use nix::sys::resource::{rlim_t, Resource, RLIM_INFINITY};
-use nu_engine::CallExt;
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    Category, Example, IntoPipelineData, PipelineData, Record, ShellError, Signature, Span,
-    SyntaxShape, Type, Value,
-};
-use once_cell::sync::Lazy;
+use nix::sys::resource::{RLIM_INFINITY, Resource, rlim_t};
+use nu_engine::command_prelude::*;
+use nu_protocol::shell_error::generic::GenericError;
+
+use std::sync::LazyLock;
 
 /// An object contains resource related parameters
 struct ResourceInfo<'a> {
@@ -47,7 +43,7 @@ impl<'a> ResourceInfo<'a> {
     }
 }
 
-impl<'a> Default for ResourceInfo<'a> {
+impl Default for ResourceInfo<'_> {
     fn default() -> Self {
         Self {
             name: "file-size",
@@ -59,7 +55,7 @@ impl<'a> Default for ResourceInfo<'a> {
     }
 }
 
-static RESOURCE_ARRAY: Lazy<Vec<ResourceInfo>> = Lazy::new(|| {
+static RESOURCE_ARRAY: LazyLock<Vec<ResourceInfo>> = LazyLock::new(|| {
     let resources = [
         #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
         (
@@ -111,6 +107,7 @@ static RESOURCE_ARRAY: Lazy<Vec<ResourceInfo>> = Lazy::new(|| {
             target_os = "freebsd",
             target_os = "openbsd",
             target_os = "linux",
+            target_os = "freebsd",
             target_os = "netbsd"
         ))]
         (
@@ -126,6 +123,7 @@ static RESOURCE_ARRAY: Lazy<Vec<ResourceInfo>> = Lazy::new(|| {
             target_os = "netbsd",
             target_os = "openbsd",
             target_os = "linux",
+            target_os = "freebsd",
             target_os = "aix",
         ))]
         (
@@ -178,6 +176,7 @@ static RESOURCE_ARRAY: Lazy<Vec<ResourceInfo>> = Lazy::new(|| {
             target_os = "netbsd",
             target_os = "openbsd",
             target_os = "linux",
+            target_os = "freebsd",
             target_os = "aix",
         ))]
         (
@@ -402,26 +401,14 @@ fn print_limits(
 
 /// Wrap `nix::sys::resource::getrlimit`
 fn setrlimit(res: Resource, soft_limit: rlim_t, hard_limit: rlim_t) -> Result<(), ShellError> {
-    nix::sys::resource::setrlimit(res, soft_limit, hard_limit).map_err(|e| {
-        ShellError::GenericError {
-            error: e.to_string(),
-            msg: String::new(),
-            span: None,
-            help: None,
-            inner: vec![],
-        }
-    })
+    nix::sys::resource::setrlimit(res, soft_limit, hard_limit)
+        .map_err(|e| ShellError::Generic(GenericError::new_internal(e.to_string(), "")))
 }
 
 /// Wrap `nix::sys::resource::setrlimit`
 fn getrlimit(res: Resource) -> Result<(rlim_t, rlim_t), ShellError> {
-    nix::sys::resource::getrlimit(res).map_err(|e| ShellError::GenericError {
-        error: e.to_string(),
-        msg: String::new(),
-        span: None,
-        help: None,
-        inner: vec![],
-    })
+    nix::sys::resource::getrlimit(res)
+        .map_err(|e| ShellError::Generic(GenericError::new_internal(e.to_string(), "")))
 }
 
 /// Parse user input
@@ -433,12 +420,13 @@ fn parse_limit(
     hard_limit: rlim_t,
     call_span: Span,
 ) -> Result<rlim_t, ShellError> {
+    let val_span = limit_value.span();
     match limit_value {
-        Value::Int { val, internal_span } => {
+        Value::Int { val, .. } => {
             let value = rlim_t::try_from(*val).map_err(|e| ShellError::CantConvert {
                 to_type: "rlim_t".into(),
                 from_type: "i64".into(),
-                span: *internal_span,
+                span: val_span,
                 help: Some(e.to_string()),
             })?;
 
@@ -449,41 +437,37 @@ fn parse_limit(
                 Ok(limit)
             }
         }
-        Value::Filesize { val, internal_span } => {
+        Value::Filesize { val, .. } => {
             if res.multiplier != 1024 {
                 return Err(ShellError::TypeMismatch {
                     err_message: format!(
                         "filesize is not compatible with resource {:?}",
                         res.resource
                     ),
-                    span: *internal_span,
+                    span: val_span,
                 });
             }
 
             rlim_t::try_from(*val).map_err(|e| ShellError::CantConvert {
                 to_type: "rlim_t".into(),
                 from_type: "i64".into(),
-                span: *internal_span,
+                span: val_span,
                 help: Some(e.to_string()),
             })
         }
-        Value::String { val, internal_span } => {
+        Value::String { val, .. } => {
             if val == "unlimited" {
                 Ok(RLIM_INFINITY)
             } else if val == "soft" {
-                if soft {
-                    Ok(hard_limit)
-                } else {
-                    Ok(soft_limit)
-                }
+                if soft { Ok(hard_limit) } else { Ok(soft_limit) }
             } else if val == "hard" {
                 Ok(hard_limit)
             } else {
-                return Err(ShellError::IncorrectValue {
+                Err(ShellError::IncorrectValue {
                     msg: "Only unlimited, soft and hard are supported for strings".into(),
-                    val_span: *internal_span,
+                    val_span,
                     call_span,
-                });
+                })
             }
         }
         _ => Err(ShellError::TypeMismatch {
@@ -504,17 +488,17 @@ impl Command for ULimit {
         "ulimit"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Set or get resource usage limits."
     }
 
     fn signature(&self) -> Signature {
         let mut sig = Signature::build("ulimit")
             .input_output_types(vec![(Type::Nothing, Type::Any)])
-            .switch("soft", "Sets soft resource limit", Some('S'))
-            .switch("hard", "Sets hard resource limit", Some('H'))
-            .switch("all", "Prints all current limits", Some('a'))
-            .optional("limit", SyntaxShape::Any, "Limit value.")
+            .switch("soft", "Sets soft resource limit.", Some('S'))
+            .switch("hard", "Sets hard resource limit.", Some('H'))
+            .switch("all", "Prints all current limits.", Some('a'))
+            .optional("limit", SyntaxShape::Any, "The limit value to set.")
             .category(Category::Platform);
 
         for res in RESOURCE_ARRAY.iter() {
@@ -560,41 +544,41 @@ impl Command for ULimit {
                 set_limits(&limit_value, &res, hard, soft, call.head)?;
             }
 
-            Ok(PipelineData::Empty)
+            Ok(PipelineData::empty())
         } else {
             print_limits(call, engine_state, stack, all, soft, hard)
         }
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Print all current limits",
+                description: "Print all current limits.",
                 example: "ulimit -a",
                 result: None,
             },
             Example {
-                description: "Print specified limits",
+                description: "Print specified limits.",
                 example: "ulimit --core-size --data-size --file-size",
                 result: None,
             },
             Example {
-                description: "Set limit",
+                description: "Set limit.",
                 example: "ulimit --core-size 102400",
                 result: None,
             },
             Example {
-                description: "Set stack size soft limit",
+                description: "Set stack size soft limit.",
                 example: "ulimit -s -S 10240",
                 result: None,
             },
             Example {
-                description: "Set virtual memory size hard limit",
+                description: "Set virtual memory size hard limit.",
                 example: "ulimit -v -H 10240",
                 result: None,
             },
             Example {
-                description: "Set core size limit to unlimited",
+                description: "Set core size limit to unlimited.",
                 example: "ulimit -c unlimited",
                 result: None,
             },

@@ -1,22 +1,15 @@
-use nu_cmd_base::input_handler::{operate, CmdArgument};
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::ast::CellPath;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::record;
-use nu_protocol::{
-    Category, Example, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value,
-};
+use nu_cmd_base::input_handler::{CmdArgument, operate};
+use nu_engine::command_prelude::*;
+
 use nu_utils::IgnoreCaseExt;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct StrContains;
 
 struct Arguments {
     substring: String,
     cell_paths: Option<Vec<CellPath>>,
     case_insensitive: bool,
-    not_contain: bool,
 }
 
 impl CmdArgument for Arguments {
@@ -25,7 +18,7 @@ impl CmdArgument for Arguments {
     }
 }
 
-impl Command for SubCommand {
+impl Command for StrContains {
     fn name(&self) -> &str {
         "str contains"
     }
@@ -35,8 +28,8 @@ impl Command for SubCommand {
             .input_output_types(vec![
                 (Type::String, Type::Bool),
                 // TODO figure out cell-path type behavior
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
                 (Type::List(Box::new(Type::String)), Type::List(Box::new(Type::Bool)))
             ])
             .required("string", SyntaxShape::String, "The substring to find.")
@@ -45,17 +38,20 @@ impl Command for SubCommand {
                 SyntaxShape::CellPath,
                 "For a data structure input, check strings at the given cell paths, and replace with result.",
             )
-            .switch("ignore-case", "search is case insensitive", Some('i'))
-            .switch("not", "does not contain", Some('n'))
+            .switch("ignore-case", "Search is case insensitive.", Some('i'))
             .category(Category::Strings)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Checks if string input contains a substring."
     }
 
     fn search_terms(&self) -> Vec<&str> {
         vec!["substring", "match", "find", "search"]
+    }
+
+    fn is_const(&self) -> bool {
+        true
     }
 
     fn run(
@@ -71,25 +67,47 @@ impl Command for SubCommand {
             substring: call.req::<String>(engine_state, stack, 0)?,
             cell_paths,
             case_insensitive: call.has_flag(engine_state, stack, "ignore-case")?,
-            not_contain: call.has_flag(engine_state, stack, "not")?,
         };
-        operate(action, args, input, call.head, engine_state.ctrlc.clone())
+        operate(action, args, input, call.head, engine_state.signals())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn run_const(
+        &self,
+        working_set: &StateWorkingSet,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let cell_paths: Vec<CellPath> = call.rest_const(working_set, stack, 1)?;
+        let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
+        let args = Arguments {
+            substring: call.req_const::<String>(working_set, stack, 0)?,
+            cell_paths,
+            case_insensitive: call.has_flag_const(working_set, stack, "ignore-case")?,
+        };
+        operate(
+            action,
+            args,
+            input,
+            call.head,
+            working_set.permanent().signals(),
+        )
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Check if input contains string",
+                description: "Check if input contains string.",
                 example: "'my_library.rb' | str contains '.rb'",
                 result: Some(Value::test_bool(true)),
             },
             Example {
-                description: "Check if input contains string case insensitive",
+                description: "Check if input contains string case insensitive.",
                 example: "'my_library.rb' | str contains --ignore-case '.RB'",
                 result: Some(Value::test_bool(true)),
             },
             Example {
-                description: "Check if input contains string in a record",
+                description: "Check if input contains string in a record.",
                 example: "{ ColA: test, ColB: 100 } | str contains 'e' ColA",
                 result: Some(Value::test_record(record! {
                     "ColA" => Value::test_bool(true),
@@ -97,7 +115,7 @@ impl Command for SubCommand {
                 })),
             },
             Example {
-                description: "Check if input contains string in a table",
+                description: "Check if input contains string in a table.",
                 example: " [[ColA ColB]; [test 100]] | str contains --ignore-case 'E' ColA",
                 result: Some(Value::test_list(vec![Value::test_record(record! {
                     "ColA" => Value::test_bool(true),
@@ -105,7 +123,7 @@ impl Command for SubCommand {
                 })])),
             },
             Example {
-                description: "Check if input contains string in a table",
+                description: "Check if input contains string in a table.",
                 example: " [[ColA ColB]; [test hello]] | str contains 'e' ColA ColB",
                 result: Some(Value::test_list(vec![Value::test_record(record! {
                     "ColA" => Value::test_bool(true),
@@ -113,26 +131,17 @@ impl Command for SubCommand {
                 })])),
             },
             Example {
-                description: "Check if input string contains 'banana'",
+                description: "Check if input string contains 'banana'.",
                 example: "'hello' | str contains 'banana'",
                 result: Some(Value::test_bool(false)),
             },
             Example {
-                description: "Check if list contains string",
+                description: "Check if list contains string.",
                 example: "[one two three] | str contains o",
                 result: Some(Value::test_list(vec![
                     Value::test_bool(true),
                     Value::test_bool(true),
                     Value::test_bool(false),
-                ])),
-            },
-            Example {
-                description: "Check if list does not contain string",
-                example: "[one two three] | str contains --not o",
-                result: Some(Value::test_list(vec![
-                    Value::test_bool(false),
-                    Value::test_bool(false),
-                    Value::test_bool(true),
                 ])),
             },
         ]
@@ -143,7 +152,6 @@ fn action(
     input: &Value,
     Arguments {
         case_insensitive,
-        not_contain,
         substring,
         ..
     }: &Arguments,
@@ -151,23 +159,11 @@ fn action(
 ) -> Value {
     match input {
         Value::String { val, .. } => Value::bool(
-            match case_insensitive {
-                true => {
-                    if *not_contain {
-                        !val.to_folded_case()
-                            .contains(substring.to_folded_case().as_str())
-                    } else {
-                        val.to_folded_case()
-                            .contains(substring.to_folded_case().as_str())
-                    }
-                }
-                false => {
-                    if *not_contain {
-                        !val.contains(substring)
-                    } else {
-                        val.contains(substring)
-                    }
-                }
+            if *case_insensitive {
+                val.to_folded_case()
+                    .contains(substring.to_folded_case().as_str())
+            } else {
+                val.contains(substring)
             },
             head,
         ),
@@ -189,9 +185,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StrContains)
     }
 }

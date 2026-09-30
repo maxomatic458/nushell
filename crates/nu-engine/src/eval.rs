@@ -1,181 +1,488 @@
-use crate::{current_dir_str, get_config, get_full_help};
-use nu_path::expand_path_with;
-use nu_protocol::{
-    ast::{
-        Argument, Assignment, Block, Call, Expr, Expression, ExternalArgument, PathMember,
-        PipelineElement, Redirection,
-    },
-    engine::{Closure, EngineState, Stack},
-    eval_base::Eval,
-    Config, DeclId, IntoPipelineData, PipelineData, ShellError, Span, Spanned, Type, Value, VarId,
-    ENV_VARIABLE_ID,
+#[allow(deprecated)]
+use crate::get_full_help;
+use crate::named_flags::{
+    expand_flag_record, flag_type_accepts_nothing, list_spread_before_required_error,
 };
-use std::thread::{self, JoinHandle};
-use std::{borrow::Cow, collections::HashMap};
+use crate::{EvalBlockWithEarlyReturnFn, eval_ir::eval_ir_block};
+use nu_protocol::{
+    BlockId, CompareTypes, Config, ENV_VARIABLE_ID, IntoPipelineData, PipelineData,
+    PipelineExecutionData, ShellError, Signature, Span, Value, VarId,
+    ast::{
+        Argument as AstArgument, Assignment, Block, Call, Expr, Expression, ExternalArgument,
+        PathMember,
+    },
+    debugger::{DebugContext, WithDebug, WithoutDebug},
+    engine::{Argument as EngineArgument, Closure, EngineState, EnvName, EnvVars, Stack},
+    eval_base::Eval,
+    shell_error::generic::GenericError,
+};
+use nu_utils::IgnoreCaseExt;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-pub fn eval_call(
+/// [`CallEval`] is used to evaluate a command or closure call.
+///
+/// It is intended as an internal interface in the engine, to make sure
+/// command and closure calls behave the same.
+/// If you want to evaluate a closure in a command, use [`ClosureEval`] or
+/// [`ClosureEvalOnce`]. If you want to call a command, use [`eval_call`].
+///
+/// [`CallEval`] has a builder API.
+/// It is first created vial [`CallEval::new`],
+/// then has arguments added via [`CallEval::add_positional`] and [`CallEval::add_named`],
+/// and then can be run using [`CallEval::run`].
+#[derive(Clone)]
+pub struct CallEval {
+    callee_stack: Stack,
+    head_span: Span,
+    callee_span: Span,
+    arg_index: usize,
+    named_args: Vec<String>,
+    rest_args: Vec<Value>,
+    /// After a list/null rest spread, further positionals go to rest (matches IR `always_spread`).
+    always_spread: bool,
+    eval: EvalBlockWithEarlyReturnFn,
+}
+
+impl CallEval {
+    /// Create a new [`CallEval`] context
+    pub fn new(
+        callee_stack: Stack,
+        call_head: Span,
+        callee_span: Span,
+        eval: EvalBlockWithEarlyReturnFn,
+    ) -> Self {
+        Self {
+            callee_stack,
+            head_span: call_head,
+            callee_span,
+            arg_index: 0,
+            named_args: Vec::new(),
+            rest_args: Vec::new(),
+            always_spread: false,
+            eval,
+        }
+    }
+
+    /// Add a positional argument to the call stack.
+    ///
+    /// Returns an error if the given `value` does not match the type of
+    /// the argument according to the signature (see [`CallEval::new`]).
+    pub fn add_positional(
+        &mut self,
+        signature: &Signature,
+        value: Cow<Value>,
+    ) -> Result<&mut Self, ShellError> {
+        // After a rest spread, further positionals always go to rest (IR parity).
+        if self.always_spread {
+            return self.push_rest(signature, value);
+        }
+
+        let maybe_param = match self
+            .arg_index
+            .checked_sub(signature.required_positional.len())
+        {
+            // arg_index < required_len
+            None => signature.required_positional.get(self.arg_index),
+            // required_len <= arg_index < (required_len + optional_len)
+            Some(opt_idx) if opt_idx < signature.optional_positional.len() => {
+                signature.optional_positional.get(opt_idx)
+            }
+            // (required_len + optional_len) <= arg_index
+            _ => None,
+        };
+
+        if let Some(param) = maybe_param {
+            let param_type = param.shape.to_type();
+            if !value.is_subtype_of(&param_type) {
+                return Err(ShellError::CantConvert {
+                    to_type: param_type.to_string(),
+                    from_type: value.get_type().to_string(),
+                    span: value.span(),
+                    help: None,
+                });
+            }
+
+            let var_id = param
+                .var_id
+                .expect("internal error: all custom parameters must have var_ids");
+            self.callee_stack.add_var(var_id, value.into_owned());
+            self.arg_index += 1;
+            Ok(self)
+        } else {
+            self.push_rest(signature, value)
+        }
+    }
+
+    fn push_rest(
+        &mut self,
+        signature: &Signature,
+        value: Cow<Value>,
+    ) -> Result<&mut Self, ShellError> {
+        let Some(rest_positional) = &signature.rest_positional else {
+            // We do not consider it an error if more arguments
+            // are added than the closure takes. This makes it possible
+            // to omit any unused arguments in the closure definition.
+            return Ok(self);
+        };
+
+        let param_type = rest_positional.shape.to_type();
+        if !value.is_subtype_of(&param_type) {
+            return Err(ShellError::CantConvert {
+                to_type: param_type.to_string(),
+                from_type: value.get_type().to_string(),
+                span: value.span(),
+                help: None,
+            });
+        }
+
+        self.rest_args.push(value.into_owned());
+        Ok(self)
+    }
+
+    /// Spread a list into rest (IR parity). Errors if required positionals remain unbound.
+    pub fn add_list_spread(
+        &mut self,
+        signature: &Signature,
+        vals: Vec<Value>,
+        spread_span: Span,
+    ) -> Result<&mut Self, ShellError> {
+        if self.arg_index < signature.required_positional.len() && !self.always_spread {
+            return Err(list_spread_before_required_error(spread_span));
+        }
+        for v in vals {
+            self.push_rest(signature, Cow::Owned(v))?;
+        }
+        self.always_spread = true;
+        Ok(self)
+    }
+
+    /// Null rest-mode spread (IR parity). Errors if required positionals remain unbound.
+    pub fn add_null_spread(
+        &mut self,
+        signature: &Signature,
+        spread_span: Span,
+    ) -> Result<&mut Self, ShellError> {
+        if self.arg_index < signature.required_positional.len() && !self.always_spread {
+            return Err(list_spread_before_required_error(spread_span));
+        }
+        self.always_spread = true;
+        Ok(self)
+    }
+
+    /// Add a named parameter to the call stack.
+    pub fn add_named(
+        &mut self,
+        signature: &Signature,
+        long: &str,
+        short: Option<String>,
+        value: Option<Cow<Value>>,
+    ) -> Result<&mut Self, ShellError> {
+        let named = signature.named.iter().find(|named| {
+            long == named.long
+                || short
+                    .as_deref()
+                    .zip(named.short)
+                    .is_some_and(|(arg, param)| {
+                        let mut buf = [0; 4];
+                        param.encode_utf8(&mut buf) == arg
+                    })
+        });
+
+        if let Some(named) = named {
+            let var_id = named
+                .var_id
+                .expect("internal error: all custom parameters must have var_ids");
+
+            let value = value
+                .or_else(|| named.default_value.as_ref().map(Cow::Borrowed))
+                .unwrap_or_else(|| Cow::Owned(Value::bool(true, self.head_span)));
+
+            self.callee_stack.add_var(var_id, value.into_owned());
+            self.named_args.push(long.to_string());
+        }
+
+        Ok(self)
+    }
+
+    /// Sets the environment variables for the call.
+    pub fn with_env(
+        &mut self,
+        env_vars: &[Arc<EnvVars>],
+        env_hidden: &Arc<HashMap<String, HashSet<EnvName>>>,
+    ) -> &mut Self {
+        self.callee_stack.with_env(env_vars, env_hidden);
+        self
+    }
+
+    /// Sets whether to enable debugging when evaluating the closure.
+    pub fn debug(&mut self, debug: bool) -> &mut Self {
+        if debug {
+            self.eval = eval_block_with_early_return::<WithDebug>
+        } else {
+            self.eval = eval_block_with_early_return::<WithoutDebug>
+        };
+        self
+    }
+
+    /// Run the given block.
+    pub fn run(
+        &mut self,
+        engine_state: &EngineState,
+        block: &Block,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        self.finalize_arguments(&block.signature)?;
+        self.arg_index = 0;
+        self.rest_args.clear();
+        (self.eval)(engine_state, &mut self.callee_stack, block, input).map(|p| p.body)
+    }
+
+    /// Finalize missing/default/rest arguments without evaluating the block yet.
+    ///
+    /// This is useful for callers that need to bind arguments against one signature and then
+    /// evaluate a modified copy of the block without re-running the argument finalization step.
+    pub fn finalize_for_signature(
+        &mut self,
+        signature: &Signature,
+    ) -> Result<&mut Self, ShellError> {
+        self.finalize_arguments(signature)?;
+        Ok(self)
+    }
+
+    /// Run a block after arguments have already been fully bound onto the callee stack.
+    pub fn run_prebound(
+        &mut self,
+        engine_state: &EngineState,
+        block: &Block,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        self.arg_index = 0;
+        self.rest_args.clear();
+        (self.eval)(engine_state, &mut self.callee_stack, block, input).map(|p| p.body)
+    }
+
+    /// Export the modified environment from callee to the caller.
+    pub fn redirect_env(&self, engine_state: &EngineState, stack: &mut Stack) {
+        redirect_env(engine_state, stack, &self.callee_stack);
+    }
+
+    /// Add default and rest values to the stack, raise error on
+    /// missing parameters.
+    fn finalize_arguments(&mut self, signature: &Signature) -> Result<(), ShellError> {
+        let remaining_positionals = signature
+            .required_positional
+            .iter()
+            .map(|p| (p, true))
+            .chain(signature.optional_positional.iter().map(|p| (p, false)))
+            // skip positional args added with add_positional
+            .skip(self.arg_index);
+
+        for (param, required) in remaining_positionals {
+            let var_id = param
+                .var_id
+                .expect("internal error: all custom parameters must have var_ids");
+
+            let maybe_value = param
+                .default_value
+                .clone()
+                .or((!required).then_some(Value::nothing(self.callee_span)));
+
+            if let Some(value) = maybe_value {
+                self.callee_stack.add_var(var_id, value);
+            } else {
+                return Err(ShellError::MissingParameter {
+                    param_name: param.name.to_string(),
+                    span: self.callee_span,
+                });
+            }
+        }
+
+        if let Some(rest_positional) = &signature.rest_positional {
+            let span = self
+                .rest_args
+                .first()
+                .map(|x| x.span())
+                .unwrap_or(self.callee_span);
+
+            self.callee_stack.add_var(
+                rest_positional
+                    .var_id
+                    .expect("Internal error: rest positional parameter lackes var_id"),
+                Value::list(self.rest_args.to_owned(), span),
+            );
+        }
+
+        let remaining_flags = signature
+            .named
+            .iter()
+            // Skip provided flags
+            .filter(|flag| !self.named_args.contains(&flag.long))
+            // Ignore named arguments without var_id.
+            // There is some code in nu_cli::completions that relies on this behavior of `eval_call`.
+            .filter_map(|flag| Some((flag.var_id?, flag)));
+
+        for (var_id, flag) in remaining_flags {
+            if flag.arg.is_none() {
+                self.callee_stack
+                    .add_var(var_id, Value::bool(false, self.head_span));
+            } else {
+                let value = flag
+                    .default_value
+                    .clone()
+                    .unwrap_or(Value::nothing(self.head_span));
+                self.callee_stack.add_var(var_id, value);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Evaluate a call to a command (builtin, custom or external)
+pub fn eval_call<D: DebugContext>(
     engine_state: &EngineState,
     caller_stack: &mut Stack,
     call: &Call,
     input: PipelineData,
 ) -> Result<PipelineData, ShellError> {
-    if nu_utils::ctrl_c::was_pressed(&engine_state.ctrlc) {
-        return Ok(Value::nothing(call.head).into_pipeline_data());
-    }
+    engine_state.signals().check(&call.head)?;
     let decl = engine_state.get_decl(call.decl_id);
 
     if !decl.is_known_external() && call.named_iter().any(|(flag, _, _)| flag.item == "help") {
-        let mut signature = engine_state.get_signature(decl);
-        signature.usage = decl.usage().to_string();
-        signature.extra_usage = decl.extra_usage().to_string();
-
-        let full_help = get_full_help(
-            &signature,
-            &decl.examples(),
-            engine_state,
-            caller_stack,
-            decl.is_parser_keyword(),
-        );
-        Ok(Value::string(full_help, call.head).into_pipeline_data())
-    } else if let Some(block_id) = decl.get_block_id() {
+        let help = get_full_help(decl, engine_state, caller_stack, call.head);
+        Ok(Value::string(help, call.head).into_pipeline_data())
+    } else if let Some(block_id) = decl.block_id() {
+        // call is a custom command
         let block = engine_state.get_block(block_id);
-
         let mut callee_stack = caller_stack.gather_captures(engine_state, &block.captures);
 
-        for (param_idx, (param, required)) in decl
-            .signature()
-            .required_positional
-            .iter()
-            .map(|p| (p, true))
-            .chain(
-                decl.signature()
-                    .optional_positional
-                    .iter()
-                    .map(|p| (p, false)),
-            )
-            .enumerate()
-        {
-            let var_id = param
-                .var_id
-                .expect("internal error: all custom parameters must have var_ids");
-
-            if let Some(arg) = call.positional_nth(param_idx) {
-                let result = eval_expression(engine_state, caller_stack, arg)?;
-                let param_type = param.shape.to_type();
-                if required && !result.get_type().is_subtype(&param_type) {
-                    // need to check if result is an empty list, and param_type is table or list
-                    // nushell needs to pass type checking for the case.
-                    let empty_list_matches = result
-                        .as_list()
-                        .map(|l| {
-                            l.is_empty() && matches!(param_type, Type::List(_) | Type::Table(_))
-                        })
-                        .unwrap_or(false);
-
-                    if !empty_list_matches {
-                        return Err(ShellError::CantConvert {
-                            to_type: param.shape.to_type().to_string(),
-                            from_type: result.get_type().to_string(),
-                            span: result.span(),
-                            help: None,
-                        });
-                    }
-                }
-                callee_stack.add_var(var_id, result);
-            } else if let Some(value) = &param.default_value {
-                callee_stack.add_var(var_id, value.to_owned());
-            } else {
-                callee_stack.add_var(var_id, Value::nothing(call.head));
-            }
+        // Rust does not check recursion limits outside of const evaluation.
+        // But nu programs run in the same process as the shell.
+        // To prevent a stack overflow in user code from crashing the shell,
+        // we limit the recursion depth of function calls.
+        // Picked 50 arbitrarily, should work on all architectures.
+        let maximum_call_stack_depth: u64 = engine_state.config.recursion_limit as u64;
+        callee_stack.recursion_count += 1;
+        if callee_stack.recursion_count > maximum_call_stack_depth {
+            callee_stack.recursion_count = 0;
+            return Err(ShellError::RecursionLimitReached {
+                recursion_limit: maximum_call_stack_depth,
+                span: block.span,
+            });
         }
 
-        if let Some(rest_positional) = decl.signature().rest_positional {
-            let mut rest_items = vec![];
-
-            for result in call.rest_iter_flattened(
-                decl.signature().required_positional.len()
-                    + decl.signature().optional_positional.len(),
-                |expr| eval_expression(engine_state, caller_stack, expr),
-            )? {
-                rest_items.push(result);
-            }
-
-            let span = if let Some(rest_item) = rest_items.first() {
-                rest_item.span()
-            } else {
-                call.head
-            };
-
-            callee_stack.add_var(
-                rest_positional
-                    .var_id
-                    .expect("Internal error: rest positional parameter lacks var_id"),
-                Value::list(rest_items, span),
-            )
-        }
-
-        for named in decl.signature().named {
-            if let Some(var_id) = named.var_id {
-                let mut found = false;
-                for call_named in call.named_iter() {
-                    if let (Some(spanned), Some(short)) = (&call_named.1, named.short) {
-                        if spanned.item == short.to_string() {
-                            if let Some(arg) = &call_named.2 {
-                                let result = eval_expression(engine_state, caller_stack, arg)?;
-
-                                callee_stack.add_var(var_id, result);
-                            } else if let Some(value) = &named.default_value {
-                                callee_stack.add_var(var_id, value.to_owned());
-                            } else {
-                                callee_stack.add_var(var_id, Value::bool(true, call.head))
-                            }
-                            found = true;
-                        }
-                    } else if call_named.0.item == named.long {
-                        if let Some(arg) = &call_named.2 {
-                            let result = eval_expression(engine_state, caller_stack, arg)?;
-
-                            callee_stack.add_var(var_id, result);
-                        } else if let Some(value) = &named.default_value {
-                            callee_stack.add_var(var_id, value.to_owned());
-                        } else {
-                            callee_stack.add_var(var_id, Value::bool(true, call.head))
-                        }
-                        found = true;
-                    }
-                }
-
-                if !found {
-                    if named.arg.is_none() {
-                        callee_stack.add_var(var_id, Value::bool(false, call.head))
-                    } else if let Some(value) = named.default_value {
-                        callee_stack.add_var(var_id, value);
-                    } else {
-                        callee_stack.add_var(var_id, Value::nothing(call.head))
-                    }
-                }
-            }
-        }
-
-        let result = eval_block_with_early_return(
-            engine_state,
-            &mut callee_stack,
-            block,
-            input,
-            call.redirect_stdout,
-            call.redirect_stderr,
+        let mut call_eval = CallEval::new(
+            callee_stack,
+            call.head,
+            block.span.unwrap_or(Span::unknown()),
+            eval_block_with_early_return::<D>,
         );
+        let signature = decl.signature();
+        // Walk all arguments in order so record/list spreads interleave with positionals/flags
+        // the same way the IR path does after normalize_call_arguments.
+        for arg in &call.arguments {
+            match arg {
+                AstArgument::Positional(expr) | AstArgument::Unknown(expr) => {
+                    let result = eval_expression::<D>(engine_state, caller_stack, expr)?;
+                    call_eval.add_positional(&signature, Cow::Owned(result))?;
+                }
+                AstArgument::Named((long, short, maybe_expr)) => {
+                    let result: Option<Cow<Value>> = if let Some(expr) = maybe_expr {
+                        let value = eval_expression::<D>(engine_state, caller_stack, expr)?;
+                        if value.is_nothing() {
+                            let accepts_nothing = signature
+                                .get_long_flag(&long.item)
+                                .or_else(|| {
+                                    short
+                                        .as_ref()
+                                        .and_then(|s| s.item.chars().next())
+                                        .and_then(|c| signature.get_short_flag(c))
+                                })
+                                .is_some_and(|flag| flag_type_accepts_nothing(&flag));
+                            if !accepts_nothing {
+                                continue;
+                            }
+                        }
+                        Some(Cow::Owned(value))
+                    } else {
+                        None
+                    };
+                    call_eval.add_named(
+                        &signature,
+                        &long.item,
+                        short.as_ref().map(|s| s.item.clone()),
+                        result,
+                    )?;
+                }
+                // Light AST path: keep custom-command spreads aligned with IR gather/normalize
+                // semantics. Normal scripts use IR (`eval_block` → IR); this path still matters
+                // for residual AST `eval_call` consumers.
+                AstArgument::Spread(expr) => {
+                    let val = eval_expression::<D>(engine_state, caller_stack, expr)?;
+                    match val {
+                        Value::Record { val, .. } => {
+                            for engine_arg in
+                                expand_flag_record(&signature, val.into_owned(), expr.span)?
+                            {
+                                match engine_arg {
+                                    EngineArgument::Flag { data, name, .. } => {
+                                        let long =
+                                            std::str::from_utf8(&data[name]).unwrap_or_default();
+                                        call_eval.add_named(&signature, long, None, None)?;
+                                    }
+                                    EngineArgument::Named {
+                                        data, name, val, ..
+                                    } => {
+                                        let long =
+                                            std::str::from_utf8(&data[name]).unwrap_or_default();
+                                        call_eval.add_named(
+                                            &signature,
+                                            long,
+                                            None,
+                                            Some(Cow::Owned(val)),
+                                        )?;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Value::List { vals, .. } => {
+                            if signature.rest_positional.is_none() && !signature.allows_unknown_args
+                            {
+                                return Err(ShellError::Generic(GenericError::new(
+                                    "Cannot spread a list into this command",
+                                    "This command has no ...rest parameter to receive a list spread. Use a record to spread named flags, e.g. ...{flag: value}",
+                                    expr.span,
+                                )));
+                            }
+                            call_eval.add_list_spread(&signature, vals.into_owned(), expr.span)?;
+                        }
+                        Value::Nothing { .. } => {
+                            call_eval.add_null_spread(&signature, expr.span)?;
+                        }
+                        Value::Error { error, .. } => return Err(*error),
+                        other => {
+                            return Err(ShellError::CannotSpreadAsList { span: other.span() });
+                        }
+                    }
+                }
+            }
+        }
+
+        let result = call_eval.run(engine_state, block, input);
 
         if block.redirect_env {
-            redirect_env(engine_state, caller_stack, &callee_stack);
+            call_eval.redirect_env(engine_state, caller_stack);
         }
 
         result
     } else {
-        // We pass caller_stack here with the knowledge that internal commands
-        // are going to be specifically looking for global state in the stack
-        // rather than any local state.
-        decl.run(engine_state, caller_stack, call, input)
+        // Builtin/plugin/external: normal scripts evaluate via IR, which runs
+        // `normalize_engine_arguments` for null omit and record flag spreads. This AST
+        // `eval_call` branch does not re-implement that path (IR-first).
+        decl.run(engine_state, caller_stack, &call.into(), input)
     }
 }
 
@@ -188,7 +495,7 @@ pub fn redirect_env(engine_state: &EngineState, caller_stack: &mut Stack, callee
     // (the callee hid them)
     for var in caller_env_vars.iter() {
         if !callee_stack.has_env_var(engine_state, var) {
-            caller_stack.remove_env_var(engine_state, var);
+            caller_stack.hide_env_var(engine_state, var);
         }
     }
 
@@ -196,30 +503,27 @@ pub fn redirect_env(engine_state: &EngineState, caller_stack: &mut Stack, callee
     for (var, value) in callee_stack.get_stack_env_vars() {
         caller_stack.add_env_var(var, value);
     }
+
+    // set config to callee config, to capture any updates to that
+    caller_stack.config.clone_from(&callee_stack.config);
 }
 
-enum RedirectTarget {
-    Piped(bool, bool),
-    CombinedPipe,
-}
-
-#[allow(clippy::too_many_arguments)]
 fn eval_external(
     engine_state: &EngineState,
     stack: &mut Stack,
     head: &Expression,
     args: &[ExternalArgument],
     input: PipelineData,
-    redirect_target: RedirectTarget,
-    is_subexpression: bool,
 ) -> Result<PipelineData, ShellError> {
     let decl_id = engine_state
         .find_decl("run-external".as_bytes(), &[])
-        .ok_or(ShellError::ExternalNotSupported { span: head.span })?;
+        .ok_or(ShellError::ExternalNotSupported {
+            span: head.span(&engine_state),
+        })?;
 
     let command = engine_state.get_decl(decl_id);
 
-    let mut call = Call::new(head.span);
+    let mut call = Call::new(head.span(&engine_state));
 
     call.add_positional(head.clone());
 
@@ -230,60 +534,16 @@ fn eval_external(
         }
     }
 
-    match redirect_target {
-        RedirectTarget::Piped(redirect_stdout, redirect_stderr) => {
-            if redirect_stdout {
-                call.add_named((
-                    Spanned {
-                        item: "redirect-stdout".into(),
-                        span: head.span,
-                    },
-                    None,
-                    None,
-                ))
-            }
-
-            if redirect_stderr {
-                call.add_named((
-                    Spanned {
-                        item: "redirect-stderr".into(),
-                        span: head.span,
-                    },
-                    None,
-                    None,
-                ))
-            }
-        }
-        RedirectTarget::CombinedPipe => call.add_named((
-            Spanned {
-                item: "redirect-combine".into(),
-                span: head.span,
-            },
-            None,
-            None,
-        )),
-    }
-
-    if is_subexpression {
-        call.add_named((
-            Spanned {
-                item: "trim-end-newline".into(),
-                span: head.span,
-            },
-            None,
-            None,
-        ))
-    }
-
-    command.run(engine_state, stack, &call, input)
+    command.run(engine_state, stack, &(&call).into(), input)
 }
 
-pub fn eval_expression(
+pub fn eval_expression<D: DebugContext>(
     engine_state: &EngineState,
     stack: &mut Stack,
     expr: &Expression,
 ) -> Result<Value, ShellError> {
-    <EvalRuntime as Eval>::eval(engine_state, stack, expr)
+    let stack = &mut stack.start_collect_value();
+    <EvalRuntime as Eval>::eval::<D>(engine_state, stack, expr)
 }
 
 /// Checks the expression to see if it's a internal or external call. If so, passes the input
@@ -292,58 +552,31 @@ pub fn eval_expression(
 ///
 /// It returns PipelineData with a boolean flag, indicating if the external failed to run.
 /// The boolean flag **may only be true** for external calls, for internal calls, it always to be false.
-pub fn eval_expression_with_input(
+pub fn eval_expression_with_input<D: DebugContext>(
     engine_state: &EngineState,
     stack: &mut Stack,
     expr: &Expression,
     mut input: PipelineData,
-    redirect_stdout: bool,
-    redirect_stderr: bool,
-) -> Result<(PipelineData, bool), ShellError> {
-    match expr {
-        Expression {
-            expr: Expr::Call(call),
-            ..
-        } => {
-            if !redirect_stdout || redirect_stderr {
-                // we're doing something different than the defaults
-                let mut call = call.clone();
-                call.redirect_stdout = redirect_stdout;
-                call.redirect_stderr = redirect_stderr;
-                input = eval_call(engine_state, stack, &call, input)?;
-            } else {
-                input = eval_call(engine_state, stack, call, input)?;
-            }
+) -> Result<PipelineData, ShellError> {
+    match &expr.expr {
+        Expr::Call(call) => {
+            input = eval_call::<D>(engine_state, stack, call, input)?;
         }
-        Expression {
-            expr: Expr::ExternalCall(head, args, is_subexpression),
-            ..
-        } => {
-            input = eval_external(
-                engine_state,
-                stack,
-                head,
-                args,
-                input,
-                RedirectTarget::Piped(redirect_stdout, redirect_stderr),
-                *is_subexpression,
-            )?;
+        Expr::ExternalCall(head, args) => {
+            input = eval_external(engine_state, stack, head, args, input)?;
         }
 
-        Expression {
-            expr: Expr::Subexpression(block_id),
-            ..
-        } => {
+        Expr::Collect(var_id, expr) => {
+            input = eval_collect::<D>(engine_state, stack, *var_id, expr, input)?;
+        }
+
+        Expr::Subexpression(block_id) => {
             let block = engine_state.get_block(*block_id);
-
             // FIXME: protect this collect with ctrl-c
-            input = eval_subexpression(engine_state, stack, block, input)?;
+            input = eval_subexpression::<D>(engine_state, stack, block, input)?;
         }
 
-        elem @ Expression {
-            expr: Expr::FullCellPath(full_cell_path),
-            ..
-        } => match &full_cell_path.head {
+        Expr::FullCellPath(full_cell_path) => match &full_cell_path.head {
             Expression {
                 expr: Expr::Subexpression(block_id),
                 span,
@@ -351,436 +584,120 @@ pub fn eval_expression_with_input(
             } => {
                 let block = engine_state.get_block(*block_id);
 
-                // FIXME: protect this collect with ctrl-c
-                input = eval_subexpression(engine_state, stack, block, input)?;
-                let value = input.into_value(*span);
-                input = value
-                    .follow_cell_path(&full_cell_path.tail, false)?
-                    .into_pipeline_data()
+                if !full_cell_path.tail.is_empty() {
+                    let stack = &mut stack.start_collect_value();
+                    // FIXME: protect this collect with ctrl-c
+                    input = eval_subexpression::<D>(engine_state, stack, block, input)?
+                        .into_value(*span)?
+                        .follow_cell_path(&full_cell_path.tail)?
+                        .into_owned()
+                        .into_pipeline_data()
+                } else {
+                    input = eval_subexpression::<D>(engine_state, stack, block, input)?;
+                }
             }
             _ => {
-                input = eval_expression(engine_state, stack, elem)?.into_pipeline_data();
+                let input_value = input.into_value(expr.span)?;
+                stack.add_var(nu_protocol::IN_VARIABLE_ID, input_value);
+                input = eval_expression::<D>(engine_state, stack, expr)?.into_pipeline_data();
             }
         },
 
-        elem => {
-            input = eval_expression(engine_state, stack, elem)?.into_pipeline_data();
+        Expr::StringInterpolation(_) | Expr::GlobInterpolation(_, _) => {
+            let input_value = input.into_value(expr.span)?;
+            stack.add_var(nu_protocol::IN_VARIABLE_ID, input_value);
+            let value = eval_expression::<D>(engine_state, stack, expr)?;
+            input = PipelineData::Value(value, None);
+        }
+
+        _ => {
+            let input_value = input.into_value(expr.span)?;
+            stack.add_var(nu_protocol::IN_VARIABLE_ID, input_value);
+            let value = eval_expression::<D>(engine_state, stack, expr)?;
+            input = PipelineData::Value(value, None);
         }
     };
-
-    Ok(might_consume_external_result(input))
-}
-
-// Try to catch and detect if external command runs to failed.
-fn might_consume_external_result(input: PipelineData) -> (PipelineData, bool) {
-    input.is_external_failed()
-}
-
-fn eval_element_with_input(
-    engine_state: &EngineState,
-    stack: &mut Stack,
-    element: &PipelineElement,
-    mut input: PipelineData,
-    redirect_stdout: bool,
-    redirect_stderr: bool,
-    stderr_writer_jobs: &mut Vec<DataSaveJob>,
-) -> Result<(PipelineData, bool), ShellError> {
-    match element {
-        PipelineElement::Expression(_, expr) => eval_expression_with_input(
-            engine_state,
-            stack,
-            expr,
-            input,
-            redirect_stdout,
-            redirect_stderr,
-        ),
-        PipelineElement::Redirection(span, redirection, expr, is_append_mode) => {
-            match &expr.expr {
-                Expr::String(_)
-                | Expr::FullCellPath(_)
-                | Expr::StringInterpolation(_)
-                | Expr::Filepath(_, _) => {
-                    let exit_code = match &mut input {
-                        PipelineData::ExternalStream { exit_code, .. } => exit_code.take(),
-                        _ => None,
-                    };
-
-                    // when nushell get Stderr Redirection, we want to take `stdout` part of `input`
-                    // so this stdout stream can be handled by next command.
-                    let (input, out_stream) = match (redirection, input) {
-                        (
-                            Redirection::Stderr,
-                            PipelineData::ExternalStream {
-                                stdout,
-                                stderr,
-                                exit_code,
-                                span,
-                                metadata,
-                                trim_end_newline,
-                            },
-                        ) => (
-                            PipelineData::ExternalStream {
-                                stdout: stderr,
-                                stderr: None,
-                                exit_code,
-                                span,
-                                metadata,
-                                trim_end_newline,
-                            },
-                            Some(stdout),
-                        ),
-                        (_, input) => (input, None),
-                    };
-
-                    if let Some(save_command) = engine_state.find_decl(b"save", &[]) {
-                        let save_call = gen_save_call(
-                            save_command,
-                            (*span, expr.clone(), *is_append_mode),
-                            None,
-                        );
-                        match out_stream {
-                            None => {
-                                eval_call(engine_state, stack, &save_call, input).map(|_| {
-                                    // save is internal command, normally it exists with non-ExternalStream
-                                    // but here in redirection context, we make it returns ExternalStream
-                                    // So nu handles exit_code correctly
-                                    //
-                                    // Also, we don't want to run remaining commands if this command exits with non-zero
-                                    // exit code, so we need to consume and check exit_code too
-                                    might_consume_external_result(PipelineData::ExternalStream {
-                                        stdout: None,
-                                        stderr: None,
-                                        exit_code,
-                                        span: *span,
-                                        metadata: None,
-                                        trim_end_newline: false,
-                                    })
-                                })
-                            }
-                            Some(out_stream) => {
-                                // delegate to a different thread
-                                // so nushell won't hang if external command generates both too much
-                                // stderr and stdout message
-                                let stderr_stack = stack.clone();
-                                let engine_state_clone = engine_state.clone();
-                                stderr_writer_jobs.push(DataSaveJob::spawn(
-                                    engine_state_clone,
-                                    stderr_stack,
-                                    save_call,
-                                    input,
-                                ));
-
-                                Ok(might_consume_external_result(
-                                    PipelineData::ExternalStream {
-                                        stdout: out_stream,
-                                        stderr: None,
-                                        exit_code,
-                                        span: *span,
-                                        metadata: None,
-                                        trim_end_newline: false,
-                                    },
-                                ))
-                            }
-                        }
-                    } else {
-                        Err(ShellError::CommandNotFound { span: *span })
-                    }
-                }
-                _ => Err(ShellError::CommandNotFound { span: *span }),
-            }
-        }
-        PipelineElement::SeparateRedirection {
-            out: (out_span, out_expr, out_append_mode),
-            err: (err_span, err_expr, err_append_mode),
-        } => match (&out_expr.expr, &err_expr.expr) {
-            (
-                Expr::String(_)
-                | Expr::FullCellPath(_)
-                | Expr::StringInterpolation(_)
-                | Expr::Filepath(_, _),
-                Expr::String(_)
-                | Expr::FullCellPath(_)
-                | Expr::StringInterpolation(_)
-                | Expr::Filepath(_, _),
-            ) => {
-                if let Some(save_command) = engine_state.find_decl(b"save", &[]) {
-                    let exit_code = match &mut input {
-                        PipelineData::ExternalStream { exit_code, .. } => exit_code.take(),
-                        _ => None,
-                    };
-                    let save_call = gen_save_call(
-                        save_command,
-                        (*out_span, out_expr.clone(), *out_append_mode),
-                        Some((*err_span, err_expr.clone(), *err_append_mode)),
-                    );
-
-                    eval_call(engine_state, stack, &save_call, input).map(|_| {
-                        // save is internal command, normally it exists with non-ExternalStream
-                        // but here in redirection context, we make it returns ExternalStream
-                        // So nu handles exit_code correctly
-                        might_consume_external_result(PipelineData::ExternalStream {
-                            stdout: None,
-                            stderr: None,
-                            exit_code,
-                            span: *out_span,
-                            metadata: None,
-                            trim_end_newline: false,
-                        })
-                    })
-                } else {
-                    Err(ShellError::CommandNotFound { span: *out_span })
-                }
-            }
-            (_out_other, err_other) => {
-                if let Expr::String(_) = err_other {
-                    Err(ShellError::CommandNotFound { span: *out_span })
-                } else {
-                    Err(ShellError::CommandNotFound { span: *err_span })
-                }
-            }
-        },
-        PipelineElement::SameTargetRedirection {
-            cmd: (cmd_span, cmd_exp),
-            redirection: (redirect_span, redirect_exp, is_append_mode),
-        } => {
-            // general idea: eval cmd and call save command to redirect stdout to result.
-            input = match &cmd_exp.expr {
-                Expr::ExternalCall(head, args, is_subexpression) => {
-                    // if cmd's expression is ExternalStream, then invoke run-external with
-                    // special --redirect-combine flag.
-                    eval_external(
-                        engine_state,
-                        stack,
-                        head,
-                        args,
-                        input,
-                        RedirectTarget::CombinedPipe,
-                        *is_subexpression,
-                    )?
-                }
-                _ => {
-                    // we need to redirect output, so the result can be saved and pass to `save` command.
-                    eval_element_with_input(
-                        engine_state,
-                        stack,
-                        &PipelineElement::Expression(*cmd_span, cmd_exp.clone()),
-                        input,
-                        true,
-                        redirect_stderr,
-                        stderr_writer_jobs,
-                    )
-                    .map(|x| x.0)?
-                }
-            };
-            eval_element_with_input(
-                engine_state,
-                stack,
-                &PipelineElement::Redirection(
-                    *redirect_span,
-                    Redirection::Stdout,
-                    redirect_exp.clone(),
-                    *is_append_mode,
-                ),
-                input,
-                redirect_stdout,
-                redirect_stderr,
-                stderr_writer_jobs,
-            )
-        }
-        PipelineElement::And(_, expr) => eval_expression_with_input(
-            engine_state,
-            stack,
-            expr,
-            input,
-            redirect_stdout,
-            redirect_stderr,
-        ),
-        PipelineElement::Or(_, expr) => eval_expression_with_input(
-            engine_state,
-            stack,
-            expr,
-            input,
-            redirect_stdout,
-            redirect_stderr,
-        ),
-    }
-}
-
-pub fn eval_block_with_early_return(
-    engine_state: &EngineState,
-    stack: &mut Stack,
-    block: &Block,
-    input: PipelineData,
-    redirect_stdout: bool,
-    redirect_stderr: bool,
-) -> Result<PipelineData, ShellError> {
-    match eval_block(
-        engine_state,
-        stack,
-        block,
-        input,
-        redirect_stdout,
-        redirect_stderr,
-    ) {
-        Err(ShellError::Return { span: _, value }) => Ok(PipelineData::Value(*value, None)),
-        x => x,
-    }
-}
-
-pub fn eval_block(
-    engine_state: &EngineState,
-    stack: &mut Stack,
-    block: &Block,
-    mut input: PipelineData,
-    redirect_stdout: bool,
-    redirect_stderr: bool,
-) -> Result<PipelineData, ShellError> {
-    // if Block contains recursion, make sure we don't recurse too deeply (to avoid stack overflow)
-    if let Some(recursive) = block.recursive {
-        // picked 50 arbitrarily, should work on all architectures
-        const RECURSION_LIMIT: u64 = 50;
-        if recursive {
-            if stack.recursion_count >= RECURSION_LIMIT {
-                stack.recursion_count = 0;
-                return Err(ShellError::RecursionLimitReached {
-                    recursion_limit: RECURSION_LIMIT,
-                    span: block.span,
-                });
-            }
-            stack.recursion_count += 1;
-        }
-    }
-
-    let num_pipelines = block.len();
-
-    for (pipeline_idx, pipeline) in block.pipelines.iter().enumerate() {
-        let mut stderr_writer_jobs = vec![];
-        let elements = &pipeline.elements;
-        let elements_length = elements.len();
-        for (idx, element) in elements.iter().enumerate() {
-            let mut redirect_stdout = redirect_stdout;
-            let mut redirect_stderr = redirect_stderr;
-            if !redirect_stderr && idx < elements_length - 1 {
-                let next_element = &elements[idx + 1];
-                if matches!(
-                    next_element,
-                    PipelineElement::Redirection(_, Redirection::Stderr, _, _)
-                        | PipelineElement::Redirection(_, Redirection::StdoutAndStderr, _, _)
-                        | PipelineElement::SeparateRedirection { .. }
-                ) {
-                    redirect_stderr = true;
-                }
-            }
-
-            if !redirect_stdout && idx < elements_length - 1 {
-                let next_element = &elements[idx + 1];
-                match next_element {
-                    // is next element a stdout relative redirection?
-                    PipelineElement::Redirection(_, Redirection::Stdout, _, _)
-                    | PipelineElement::Redirection(_, Redirection::StdoutAndStderr, _, _)
-                    | PipelineElement::SeparateRedirection { .. }
-                    | PipelineElement::Expression(..) => redirect_stdout = true,
-
-                    PipelineElement::Redirection(_, Redirection::Stderr, _, _) => {
-                        // a stderr redirection, but we still need to check for the next 2nd
-                        // element, to handle for the following case:
-                        // cat a.txt err> /dev/null | lines
-                        //
-                        // we only need to check the next 2nd element because we already make sure
-                        // that we don't have duplicate err> like this:
-                        // cat a.txt err> /dev/null err> /tmp/a
-                        if idx < elements_length - 2 {
-                            let next_2nd_element = &elements[idx + 2];
-                            if matches!(next_2nd_element, PipelineElement::Expression(..)) {
-                                redirect_stdout = true
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            // if eval internal command failed, it can just make early return with `Err(ShellError)`.
-            let eval_result = eval_element_with_input(
-                engine_state,
-                stack,
-                element,
-                input,
-                redirect_stdout,
-                redirect_stderr,
-                &mut stderr_writer_jobs,
-            );
-
-            match (eval_result, redirect_stderr) {
-                (Err(error), true) => {
-                    input = PipelineData::Value(
-                        Value::error(
-                            error,
-                            Span::unknown(), // FIXME: where does this span come from?
-                        ),
-                        None,
-                    )
-                }
-                (output, _) => {
-                    let output = output?;
-                    input = output.0;
-                    // external command may runs to failed
-                    // make early return so remaining commands will not be executed.
-                    // don't return `Err(ShellError)`, so nushell wouldn't show extra error message.
-                    if output.1 {
-                        return Ok(input);
-                    }
-                }
-            }
-        }
-
-        // `eval_element_with_input` may creates some threads
-        // to write stderr message to a file, here we need to wait and make sure that it's
-        // finished.
-        for h in stderr_writer_jobs {
-            let _ = h.join();
-        }
-        if pipeline_idx < (num_pipelines) - 1 {
-            match input {
-                PipelineData::Value(Value::Nothing { .. }, ..) => {}
-                PipelineData::ExternalStream {
-                    ref mut exit_code, ..
-                } => {
-                    let exit_code = exit_code.take();
-
-                    input.drain()?;
-
-                    if let Some(exit_code) = exit_code {
-                        let mut v: Vec<_> = exit_code.collect();
-
-                        if let Some(v) = v.pop() {
-                            let break_loop = !matches!(v.as_i64(), Ok(0));
-
-                            stack.add_env_var("LAST_EXIT_CODE".into(), v);
-                            if break_loop {
-                                input = PipelineData::empty();
-                                break;
-                            }
-                        }
-                    }
-                }
-                _ => input.drain()?,
-            }
-
-            input = PipelineData::empty()
-        }
-    }
 
     Ok(input)
 }
 
-pub fn eval_subexpression(
+pub fn eval_block<D: DebugContext>(
+    engine_state: &EngineState,
+    stack: &mut Stack,
+    block: &Block,
+    input: PipelineData,
+) -> Result<PipelineExecutionData, ShellError> {
+    let result = eval_ir_block::<D>(engine_state, stack, block, input);
+    if let Err(err) = &result {
+        stack.set_last_error(err);
+    }
+    result
+}
+
+/// Evaluate a block as an early return boundary.
+///
+/// A `return` is meant to end the command or closure it appears in and go no further. The
+/// "boundary" is the point where such a `return` stops propagating outward and becomes the
+/// block's normal result, instead of escaping to whatever called the command. This function is
+/// that point: an early `return` inside the block produces the block's result here, exactly like
+/// a value in tail position.
+///
+/// Concretely, [`eval_block`] runs the block and sets
+/// [`early_return`](PipelineExecutionData::early_return) to mark a result that came from a
+/// `return`; this function clears that flag, which is what "absorbs" the `return` so callers see
+/// an ordinary result.
+///
+/// This is used for blocks that `return` should not escape from, such as custom command bodies
+/// and closures: clearing the flag keeps an early `return` from leaking into the calling block.
+/// In contrast, [`eval_block`] leaves the flag intact, so its one consumer (top-level file
+/// evaluation) can see a top-level `return` and skip running `main`.
+pub fn eval_block_with_early_return<D: DebugContext>(
+    engine_state: &EngineState,
+    stack: &mut Stack,
+    block: &Block,
+    input: PipelineData,
+) -> Result<PipelineExecutionData, ShellError> {
+    let mut result = eval_block::<D>(engine_state, stack, block, input)?;
+    result.early_return = false;
+    Ok(result)
+}
+
+pub fn eval_collect<D: DebugContext>(
+    engine_state: &EngineState,
+    stack: &mut Stack,
+    var_id: VarId,
+    expr: &Expression,
+    mut input: PipelineData,
+) -> Result<PipelineData, ShellError> {
+    // Evaluate the expression with the variable set to the collected input
+    let span = input.span().unwrap_or(expr.span);
+
+    let metadata = input.take_metadata().and_then(|m| m.for_collect());
+
+    let input = input.into_value(span)?;
+
+    stack.add_var(var_id, input.clone());
+
+    let result = eval_expression_with_input::<D>(
+        engine_state,
+        stack,
+        expr,
+        // We still have to pass it as input
+        input.into_pipeline_data_with_metadata(metadata),
+    );
+
+    stack.remove_var(var_id);
+
+    result
+}
+
+pub fn eval_subexpression<D: DebugContext>(
     engine_state: &EngineState,
     stack: &mut Stack,
     block: &Block,
     input: PipelineData,
 ) -> Result<PipelineData, ShellError> {
-    eval_block(engine_state, stack, block, input, true, false)
+    eval_block::<D>(engine_state, stack, block, input).map(|p| p.body)
 }
 
 pub fn eval_variable(
@@ -813,108 +730,13 @@ pub fn eval_variable(
 
             Ok(Value::record(pairs.into_iter().collect(), span))
         }
+        // interactive last-result (e.g. `$ans`)
+        // Truncation warning is deferred until after print so data is visible first.
+        id if id == nu_protocol::LAST_VARIABLE_ID => {
+            stack.defer_last_result_truncation_warning();
+            stack.get_var(var_id, span)
+        }
         var_id => stack.get_var(var_id, span),
-    }
-}
-
-fn gen_save_call(
-    save_decl_id: DeclId,
-    out_info: (Span, Expression, bool),
-    err_info: Option<(Span, Expression, bool)>,
-) -> Call {
-    let (out_span, out_expr, out_append_mode) = out_info;
-    let mut call = Call {
-        decl_id: save_decl_id,
-        head: out_span,
-        arguments: vec![],
-        redirect_stdout: false,
-        redirect_stderr: false,
-        parser_info: HashMap::new(),
-    };
-
-    let mut args = vec![
-        Argument::Positional(out_expr),
-        Argument::Named((
-            Spanned {
-                item: "raw".into(),
-                span: out_span,
-            },
-            None,
-            None,
-        )),
-        Argument::Named((
-            Spanned {
-                item: "force".into(),
-                span: out_span,
-            },
-            None,
-            None,
-        )),
-    ];
-    if out_append_mode {
-        call.set_parser_info(
-            "out-append".to_string(),
-            Expression {
-                expr: Expr::Bool(true),
-                span: out_span,
-                ty: Type::Bool,
-                custom_completion: None,
-            },
-        );
-    }
-    if let Some((err_span, err_expr, err_append_mode)) = err_info {
-        args.push(Argument::Named((
-            Spanned {
-                item: "stderr".into(),
-                span: err_span,
-            },
-            None,
-            Some(err_expr),
-        )));
-        if err_append_mode {
-            call.set_parser_info(
-                "err-append".to_string(),
-                Expression {
-                    expr: Expr::Bool(true),
-                    span: err_span,
-                    ty: Type::Bool,
-                    custom_completion: None,
-                },
-            );
-        }
-    }
-
-    call.arguments.append(&mut args);
-    call
-}
-
-/// A job which saves `PipelineData` to a file in a child thread.
-struct DataSaveJob {
-    inner: JoinHandle<()>,
-}
-
-impl DataSaveJob {
-    pub fn spawn(
-        engine_state: EngineState,
-        mut stack: Stack,
-        save_call: Call,
-        input: PipelineData,
-    ) -> Self {
-        Self {
-            inner: thread::Builder::new()
-                .name("stderr saver".to_string())
-                .spawn(move || {
-                    let result = eval_call(&engine_state, &mut stack, &save_call, input);
-                    if let Err(err) = result {
-                        eprintln!("WARNING: error occurred when redirect to stderr: {:?}", err);
-                    }
-                })
-                .expect("Failed to create thread"),
-        }
-    }
-
-    pub fn join(self) -> thread::Result<()> {
-        self.inner.join()
     }
 }
 
@@ -925,44 +747,8 @@ impl Eval for EvalRuntime {
 
     type MutState = Stack;
 
-    fn get_config<'a>(engine_state: Self::State<'a>, stack: &mut Stack) -> Cow<'a, Config> {
-        Cow::Owned(get_config(engine_state, stack))
-    }
-
-    fn eval_filepath(
-        engine_state: &EngineState,
-        stack: &mut Stack,
-        path: String,
-        quoted: bool,
-        span: Span,
-    ) -> Result<Value, ShellError> {
-        if quoted {
-            Ok(Value::string(path, span))
-        } else {
-            let cwd = current_dir_str(engine_state, stack)?;
-            let path = expand_path_with(path, cwd);
-
-            Ok(Value::string(path.to_string_lossy(), span))
-        }
-    }
-
-    fn eval_directory(
-        engine_state: Self::State<'_>,
-        stack: &mut Self::MutState,
-        path: String,
-        quoted: bool,
-        span: Span,
-    ) -> Result<Value, ShellError> {
-        if path == "-" {
-            Ok(Value::string("-", span))
-        } else if quoted {
-            Ok(Value::string(path, span))
-        } else {
-            let cwd = current_dir_str(engine_state, stack)?;
-            let path = expand_path_with(path, cwd);
-
-            Ok(Value::string(path.to_string_lossy(), span))
-        }
+    fn get_config(engine_state: Self::State<'_>, stack: &mut Stack) -> Arc<Config> {
+        stack.get_config(engine_state)
     }
 
     fn eval_var(
@@ -974,14 +760,14 @@ impl Eval for EvalRuntime {
         eval_variable(engine_state, stack, var_id, span)
     }
 
-    fn eval_call(
+    fn eval_call<D: DebugContext>(
         engine_state: &EngineState,
         stack: &mut Stack,
         call: &Call,
         _: Span,
     ) -> Result<Value, ShellError> {
         // FIXME: protect this collect with ctrl-c
-        Ok(eval_call(engine_state, stack, call, PipelineData::empty())?.into_value(call.head))
+        eval_call::<D>(engine_state, stack, call, PipelineData::empty())?.into_value(call.head)
     }
 
     fn eval_external_call(
@@ -989,33 +775,34 @@ impl Eval for EvalRuntime {
         stack: &mut Stack,
         head: &Expression,
         args: &[ExternalArgument],
-        is_subexpression: bool,
         _: Span,
     ) -> Result<Value, ShellError> {
-        let span = head.span;
+        let span = head.span(&engine_state);
         // FIXME: protect this collect with ctrl-c
-        Ok(eval_external(
-            engine_state,
-            stack,
-            head,
-            args,
-            PipelineData::empty(),
-            RedirectTarget::Piped(false, false),
-            is_subexpression,
-        )?
-        .into_value(span))
+        eval_external(engine_state, stack, head, args, PipelineData::empty())?.into_value(span)
     }
 
-    fn eval_subexpression(
+    fn eval_collect<D: DebugContext>(
         engine_state: &EngineState,
         stack: &mut Stack,
-        block_id: usize,
+        var_id: VarId,
+        expr: &Expression,
+    ) -> Result<Value, ShellError> {
+        // It's a little bizarre, but the expression can still have some kind of result even with
+        // nothing input
+        eval_collect::<D>(engine_state, stack, var_id, expr, PipelineData::empty())?
+            .into_value(expr.span)
+    }
+
+    fn eval_subexpression<D: DebugContext>(
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        block_id: BlockId,
         span: Span,
     ) -> Result<Value, ShellError> {
         let block = engine_state.get_block(block_id);
-
         // FIXME: protect this collect with ctrl-c
-        Ok(eval_subexpression(engine_state, stack, block, PipelineData::empty())?.into_value(span))
+        eval_subexpression::<D>(engine_state, stack, block, PipelineData::empty())?.into_value(span)
     }
 
     fn regex_match(
@@ -1029,7 +816,7 @@ impl Eval for EvalRuntime {
         lhs.regex_match(engine_state, op_span, rhs, invert, expr_span)
     }
 
-    fn eval_assignment(
+    fn eval_assignment<D: DebugContext>(
         engine_state: &EngineState,
         stack: &mut Stack,
         lhs: &Expression,
@@ -1038,29 +825,29 @@ impl Eval for EvalRuntime {
         op_span: Span,
         _expr_span: Span,
     ) -> Result<Value, ShellError> {
-        let rhs = eval_expression(engine_state, stack, rhs)?;
+        let rhs = eval_expression::<D>(engine_state, stack, rhs)?;
 
         let rhs = match assignment {
             Assignment::Assign => rhs,
-            Assignment::PlusAssign => {
-                let lhs = eval_expression(engine_state, stack, lhs)?;
+            Assignment::AddAssign => {
+                let lhs = eval_expression::<D>(engine_state, stack, lhs)?;
                 lhs.add(op_span, &rhs, op_span)?
             }
-            Assignment::MinusAssign => {
-                let lhs = eval_expression(engine_state, stack, lhs)?;
+            Assignment::SubtractAssign => {
+                let lhs = eval_expression::<D>(engine_state, stack, lhs)?;
                 lhs.sub(op_span, &rhs, op_span)?
             }
             Assignment::MultiplyAssign => {
-                let lhs = eval_expression(engine_state, stack, lhs)?;
+                let lhs = eval_expression::<D>(engine_state, stack, lhs)?;
                 lhs.mul(op_span, &rhs, op_span)?
             }
             Assignment::DivideAssign => {
-                let lhs = eval_expression(engine_state, stack, lhs)?;
+                let lhs = eval_expression::<D>(engine_state, stack, lhs)?;
                 lhs.div(op_span, &rhs, op_span)?
             }
-            Assignment::AppendAssign => {
-                let lhs = eval_expression(engine_state, stack, lhs)?;
-                lhs.append(op_span, &rhs, op_span)?
+            Assignment::ConcatenateAssign => {
+                let lhs = eval_expression::<D>(engine_state, stack, lhs)?;
+                lhs.concat(op_span, &rhs, op_span)?
             }
         };
 
@@ -1069,9 +856,11 @@ impl Eval for EvalRuntime {
                 let var_info = engine_state.get_var(*var_id);
                 if var_info.mutable {
                     stack.add_var(*var_id, rhs);
-                    Ok(Value::nothing(lhs.span))
+                    Ok(Value::nothing(lhs.span(&engine_state)))
                 } else {
-                    Err(ShellError::AssignmentRequiresMutableVar { lhs_span: lhs.span })
+                    Err(ShellError::AssignmentRequiresMutableVar {
+                        lhs_span: lhs.span(&engine_state),
+                    })
                 }
             }
             Expr::FullCellPath(cell_path) => {
@@ -1081,76 +870,108 @@ impl Eval for EvalRuntime {
                         // As such, give it special treatment here.
                         let is_env = var_id == &ENV_VARIABLE_ID;
                         if is_env || engine_state.get_var(*var_id).mutable {
-                            let mut lhs = eval_expression(engine_state, stack, &cell_path.head)?;
-
-                            lhs.upsert_data_at_cell_path(&cell_path.tail, rhs)?;
                             if is_env {
+                                let mut lhs =
+                                    eval_expression::<D>(engine_state, stack, &cell_path.head)?;
+
+                                // Reject attempts to assign to the entire $env
                                 if cell_path.tail.is_empty() {
                                     return Err(ShellError::CannotReplaceEnv {
-                                        span: cell_path.head.span,
+                                        span: cell_path.head.span(&engine_state),
                                     });
                                 }
 
-                                // The special $env treatment: for something like $env.config.history.max_size = 2000,
-                                // get $env.config (or whichever one it is) AFTER the above mutation, and set it
-                                // as the "config" environment variable.
-                                let vardata =
-                                    lhs.follow_cell_path(&[cell_path.tail[0].clone()], false)?;
-                                match &cell_path.tail[0] {
-                                    PathMember::String { val, span, .. } => {
-                                        if val == "FILE_PWD"
-                                            || val == "CURRENT_FILE"
-                                            || val == "PWD"
-                                        {
-                                            return Err(ShellError::AutomaticEnvVarSetManually {
-                                                envvar_name: val.to_string(),
-                                                span: *span,
-                                            });
-                                        } else {
-                                            stack.add_env_var(val.to_string(), vardata);
-                                        }
-                                    }
-                                    // In case someone really wants an integer env-var
-                                    PathMember::Int { val, .. } => {
-                                        stack.add_env_var(val.to_string(), vardata);
-                                    }
+                                // Updating environment variables should be case-preserving,
+                                // so we need to figure out the original key before we do anything.
+                                let (key, span) = match &cell_path.tail[0] {
+                                    PathMember::String { val, span, .. } => (val.to_string(), span),
+                                    PathMember::Int { val, span, .. } => (val.to_string(), span),
+                                };
+                                let original_key = if let Value::Record { val: record, .. } = &lhs {
+                                    record
+                                        .iter()
+                                        .rev()
+                                        .map(|(k, _)| k)
+                                        .find(|x| x.eq_ignore_case(&key))
+                                        .cloned()
+                                        .unwrap_or(key)
+                                } else {
+                                    key
+                                };
+
+                                // Retrieve the updated environment value.
+                                lhs.upsert_data_at_cell_path(&cell_path.tail, rhs)?;
+                                let value = lhs.follow_cell_path(&[{
+                                    let mut pm = cell_path.tail[0].clone();
+                                    pm.make_insensitive();
+                                    pm
+                                }])?;
+
+                                // Reject attempts to set automatic environment variables.
+                                if is_automatic_env_var(&original_key) {
+                                    return Err(ShellError::AutomaticEnvVarSetManually {
+                                        envvar_name: original_key,
+                                        span: *span,
+                                    });
+                                }
+
+                                let is_config = original_key == "config";
+
+                                stack.add_env_var(original_key, value.into_owned());
+
+                                // Trigger the update to config, if we modified that.
+                                if is_config {
+                                    stack.update_config(engine_state)?;
                                 }
                             } else {
-                                stack.add_var(*var_id, lhs);
+                                // Optimized: mutate the variable in-place on the stack,
+                                // avoiding the clone from lookup_var and the move-back from add_var.
+                                stack.upsert_var_cell_path(
+                                    *var_id,
+                                    &cell_path.tail,
+                                    rhs,
+                                    cell_path.head.span(&engine_state),
+                                )?;
                             }
-                            Ok(Value::nothing(cell_path.head.span))
+                            Ok(Value::nothing(cell_path.head.span(&engine_state)))
                         } else {
-                            Err(ShellError::AssignmentRequiresMutableVar { lhs_span: lhs.span })
+                            Err(ShellError::AssignmentRequiresMutableVar {
+                                lhs_span: lhs.span(&engine_state),
+                            })
                         }
                     }
-                    _ => Err(ShellError::AssignmentRequiresVar { lhs_span: lhs.span }),
+                    _ => Err(ShellError::AssignmentRequiresVar {
+                        lhs_span: lhs.span(&engine_state),
+                    }),
                 }
             }
-            _ => Err(ShellError::AssignmentRequiresVar { lhs_span: lhs.span }),
+            _ => Err(ShellError::AssignmentRequiresVar {
+                lhs_span: lhs.span(&engine_state),
+            }),
         }
     }
 
     fn eval_row_condition_or_closure(
         engine_state: &EngineState,
         stack: &mut Stack,
-        block_id: usize,
+        block_id: BlockId,
         span: Span,
     ) -> Result<Value, ShellError> {
         let captures = engine_state
             .get_block(block_id)
             .captures
             .iter()
-            .map(|&id| {
+            .map(|(id, span)| {
                 stack
-                    .get_var(id, span)
+                    .get_var(*id, *span)
                     .or_else(|_| {
                         engine_state
-                            .get_var(id)
+                            .get_var(*id)
                             .const_val
                             .clone()
-                            .ok_or(ShellError::VariableNotFoundAtRuntime { span })
+                            .ok_or(ShellError::VariableNotFoundAtRuntime { span: *span })
                     })
-                    .map(|var| (id, var))
+                    .map(|var| (*id, var))
             })
             .collect::<Result<_, _>>()?;
 
@@ -1163,7 +984,23 @@ impl Eval for EvalRuntime {
         Ok(Value::string(name, span))
     }
 
-    fn unreachable(expr: &Expression) -> Result<Value, ShellError> {
-        Ok(Value::nothing(expr.span))
+    fn unreachable(engine_state: &EngineState, expr: &Expression) -> Result<Value, ShellError> {
+        Ok(Value::nothing(expr.span(&engine_state)))
     }
+}
+
+/// Returns whether a string, when used as the name of an environment variable,
+/// is considered an automatic environment variable.
+///
+/// An automatic environment variable cannot be assigned to by user code.
+/// Current there are three of them: $env.PWD, $env.FILE_PWD, $env.CURRENT_FILE
+pub(crate) fn is_automatic_env_var(var: &str) -> bool {
+    let names = ["PWD", "FILE_PWD", "CURRENT_FILE"];
+    names.iter().any(|&name| {
+        if cfg!(windows) {
+            name.eq_ignore_case(var)
+        } else {
+            name.eq(var)
+        }
+    })
 }

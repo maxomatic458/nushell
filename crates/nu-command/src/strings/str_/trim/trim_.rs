@@ -1,14 +1,9 @@
-use nu_cmd_base::input_handler::{operate, CmdArgument};
-use nu_engine::CallExt;
-use nu_protocol::{
-    ast::{Call, CellPath},
-    engine::{Command, EngineState, Stack},
-    Category, Example, PipelineData, ShellError, Signature, Span, Spanned, SyntaxShape, Type,
-    Value,
-};
+use nu_cmd_base::input_handler::{CmdArgument, operate};
+use nu_engine::command_prelude::*;
+use nu_protocol::shell_error::generic::GenericError;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct StrTrim;
 
 struct Arguments {
     to_trim: Option<char>,
@@ -29,7 +24,7 @@ pub enum TrimSide {
     Both,
 }
 
-impl Command for SubCommand {
+impl Command for StrTrim {
     fn name(&self) -> &str {
         "str trim"
     }
@@ -42,8 +37,8 @@ impl Command for SubCommand {
                     Type::List(Box::new(Type::String)),
                     Type::List(Box::new(Type::String)),
                 ),
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true)
             .rest(
@@ -54,27 +49,31 @@ impl Command for SubCommand {
             .named(
                 "char",
                 SyntaxShape::String,
-                "character to trim (default: whitespace)",
+                "Character to trim (default: whitespace).",
                 Some('c'),
             )
             .switch(
                 "left",
-                "trims characters only from the beginning of the string",
+                "Trims characters only from the beginning of the string.",
                 Some('l'),
             )
             .switch(
                 "right",
-                "trims characters only from the end of the string",
+                "Trims characters only from the end of the string.",
                 Some('r'),
             )
             .category(Category::Strings)
     }
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Trim whitespace or specific character."
     }
 
     fn search_terms(&self) -> Vec<&str> {
         vec!["whitespace", "strip", "lstrip", "rstrip"]
+    }
+
+    fn is_const(&self) -> bool {
+        true
     }
 
     fn run(
@@ -85,75 +84,113 @@ impl Command for SubCommand {
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let character = call.get_flag::<Spanned<String>>(engine_state, stack, "char")?;
-        let to_trim = match character.as_ref() {
-            Some(v) => {
-                if v.item.chars().count() > 1 {
-                    return Err(ShellError::GenericError {
-                        error: "Trim only works with single character".into(),
-                        msg: "needs single character".into(),
-                        span: Some(v.span),
-                        help: None,
-                        inner: vec![],
-                    });
-                }
-                v.item.chars().next()
-            }
-            None => None,
-        };
         let cell_paths: Vec<CellPath> = call.rest(engine_state, stack, 0)?;
-        let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
-        let mode = match cell_paths {
-            None => ActionMode::Global,
-            Some(_) => ActionMode::Local,
-        };
-
         let left = call.has_flag(engine_state, stack, "left")?;
         let right = call.has_flag(engine_state, stack, "right")?;
-        let trim_side = match (left, right) {
-            (true, true) => TrimSide::Both,
-            (true, false) => TrimSide::Left,
-            (false, true) => TrimSide::Right,
-            (false, false) => TrimSide::Both,
-        };
-
-        let args = Arguments {
-            to_trim,
-            trim_side,
+        run(
+            character,
             cell_paths,
-            mode,
-        };
-        operate(action, args, input, call.head, engine_state.ctrlc.clone())
+            (left, right),
+            call,
+            input,
+            engine_state,
+        )
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn run_const(
+        &self,
+        working_set: &StateWorkingSet,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let character = call.get_flag_const::<Spanned<String>>(working_set, stack, "char")?;
+        let cell_paths: Vec<CellPath> = call.rest_const(working_set, stack, 0)?;
+        let left = call.has_flag_const(working_set, stack, "left")?;
+        let right = call.has_flag_const(working_set, stack, "right")?;
+        run(
+            character,
+            cell_paths,
+            (left, right),
+            call,
+            input,
+            working_set.permanent(),
+        )
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Trim whitespace",
+                description: "Trim whitespace.",
                 example: "'Nu shell ' | str trim",
                 result: Some(Value::test_string("Nu shell")),
             },
             Example {
-                description: "Trim a specific character (not the whitespace)",
+                description: "Trim a specific character (not the whitespace).",
                 example: "'=== Nu shell ===' | str trim --char '='",
                 result: Some(Value::test_string(" Nu shell ")),
             },
             Example {
-                description: "Trim whitespace from the beginning of string",
+                description: "Trim whitespace from the beginning of string.",
                 example: "' Nu shell ' | str trim --left",
                 result: Some(Value::test_string("Nu shell ")),
             },
             Example {
-                description: "Trim whitespace from the end of string",
+                description: "Trim whitespace from the end of string.",
                 example: "' Nu shell ' | str trim --right",
                 result: Some(Value::test_string(" Nu shell")),
             },
             Example {
-                description: "Trim a specific character only from the end of the string",
+                description: "Trim a specific character only from the end of the string.",
                 example: "'=== Nu shell ===' | str trim --right --char '='",
                 result: Some(Value::test_string("=== Nu shell ")),
             },
         ]
     }
+}
+
+fn run(
+    character: Option<Spanned<String>>,
+    cell_paths: Vec<CellPath>,
+    (left, right): (bool, bool),
+    call: &Call,
+    input: PipelineData,
+    engine_state: &EngineState,
+) -> Result<PipelineData, ShellError> {
+    let to_trim = match character.as_ref() {
+        Some(v) => {
+            if v.item.chars().count() > 1 {
+                return Err(ShellError::Generic(GenericError::new(
+                    "Trim only works with single character",
+                    "needs single character",
+                    v.span,
+                )));
+            }
+            v.item.chars().next()
+        }
+        None => None,
+    };
+
+    let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
+    let mode = match cell_paths {
+        None => ActionMode::Global,
+        Some(_) => ActionMode::Local,
+    };
+
+    let trim_side = match (left, right) {
+        (true, true) => TrimSide::Both,
+        (true, false) => TrimSide::Left,
+        (false, true) => TrimSide::Right,
+        (false, false) => TrimSide::Both,
+    };
+
+    let args = Arguments {
+        to_trim,
+        trim_side,
+        cell_paths,
+        mode,
+    };
+    operate(action, args, input, call.head, engine_state.signals())
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -232,10 +269,8 @@ mod tests {
     use nu_protocol::{Span, Value};
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StrTrim)
     }
 
     fn make_record(cols: Vec<&str>, vals: Vec<&str>) -> Value {

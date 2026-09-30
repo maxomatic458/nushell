@@ -1,8 +1,5 @@
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, PipelineData, ShellError, Signature, SyntaxShape, Type, Value,
-};
+use nu_engine::command_prelude::*;
+use nu_protocol::engine::CommandType;
 
 #[derive(Clone)]
 pub struct ExportModule;
@@ -12,7 +9,7 @@ impl Command for ExportModule {
         "export module"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Export a custom module from a module."
     }
 
@@ -29,13 +26,13 @@ impl Command for ExportModule {
             .category(Category::Core)
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"This command is a parser keyword. For details, check:
-  https://www.nushell.sh/book/thinking_in_nu.html"#
+    fn extra_description(&self) -> &str {
+        "This command is a parser keyword. For details, check:
+  https://www.nushell.sh/book/thinking_in_nu.html"
     }
 
-    fn is_parser_keyword(&self) -> bool {
-        true
+    fn command_type(&self) -> CommandType {
+        CommandType::Keyword
     }
 
     fn run(
@@ -48,9 +45,9 @@ impl Command for ExportModule {
         Ok(PipelineData::empty())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
-            description: "Define a custom command in a submodule of a module and call it",
+            description: "Define a custom command in a submodule of a module and call it.",
             example: r#"module spam {
         export module eggs {
             export def foo [] { "foo" }
@@ -67,9 +64,7 @@ impl Command for ExportModule {
 mod test {
     use super::*;
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(ExportModule {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(ExportModule)
     }
 }

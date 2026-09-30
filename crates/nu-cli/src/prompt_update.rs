@@ -1,12 +1,13 @@
 use crate::NushellPrompt;
-use log::trace;
-use nu_engine::eval_subexpression;
-use nu_protocol::report_error;
+use log::{info, trace};
+use nu_engine::ClosureEvalOnce;
 use nu_protocol::{
-    engine::{EngineState, Stack, StateWorkingSet},
     Config, PipelineData, Value,
+    engine::{EngineState, PromptContents, Stack},
+    report_shell_error,
 };
 use reedline::Prompt;
+use std::sync::Arc;
 
 // Name of environment variable where the prompt could be stored
 pub(crate) const PROMPT_COMMAND: &str = "PROMPT_COMMAND";
@@ -24,10 +25,29 @@ pub(crate) const TRANSIENT_PROMPT_INDICATOR_VI_NORMAL: &str =
     "TRANSIENT_PROMPT_INDICATOR_VI_NORMAL";
 pub(crate) const TRANSIENT_PROMPT_MULTILINE_INDICATOR: &str =
     "TRANSIENT_PROMPT_MULTILINE_INDICATOR";
-// According to Daniel Imms @Tyriar, we need to do these this way:
-// <133 A><prompt><133 B><command><133 C><command output>
-pub(crate) const PRE_PROMPT_MARKER: &str = "\x1b]133;A\x1b\\";
-pub(crate) const POST_PROMPT_MARKER: &str = "\x1b]133;B\x1b\\";
+
+// ────────────────────────────────────────────────────────────────────────────────
+// OSC 133 / OSC 633 COMMAND EXECUTION MARKERS
+// ────────────────────────────────────────────────────────────────────────────────
+// These escape sequences are used by the shell to mark command execution boundaries.
+// Note: A/B/P markers for prompts are now handled by reedline.
+
+// Command execution markers (C = pre-exec, D = post-exec with exit code)
+pub(crate) const PRE_EXECUTION_MARKER: &str = "\x1b]133;C\x1b\\";
+pub(crate) const POST_EXECUTION_MARKER_PREFIX: &str = "\x1b]133;D;";
+pub(crate) const POST_EXECUTION_MARKER_SUFFIX: &str = "\x1b\\";
+
+// VS Code specific markers (OSC 633)
+pub(crate) const VSCODE_PRE_EXECUTION_MARKER: &str = "\x1b]633;C\x1b\\";
+pub(crate) const VSCODE_POST_EXECUTION_MARKER_PREFIX: &str = "\x1b]633;D;";
+pub(crate) const VSCODE_POST_EXECUTION_MARKER_SUFFIX: &str = "\x1b\\";
+pub(crate) const VSCODE_COMMANDLINE_MARKER_PREFIX: &str = "\x1b]633;E;";
+pub(crate) const VSCODE_COMMANDLINE_MARKER_SUFFIX: &str = "\x1b\\";
+pub(crate) const VSCODE_CWD_PROPERTY_MARKER_PREFIX: &str = "\x1b]633;P;Cwd=";
+pub(crate) const VSCODE_CWD_PROPERTY_MARKER_SUFFIX: &str = "\x1b\\";
+
+// Reset terminal application mode sequence
+pub(crate) const RESET_APPLICATION_MODE: &str = "\x1b[?1l";
 
 fn get_prompt_string(
     prompt: &str,
@@ -35,164 +55,152 @@ fn get_prompt_string(
     engine_state: &EngineState,
     stack: &mut Stack,
 ) -> Option<String> {
-    stack
-        .get_env_var(engine_state, prompt)
-        .and_then(|v| match v {
-            Value::Closure { val, .. } => {
-                let block = engine_state.get_block(val.block_id);
-                let mut stack = stack.captures_to_stack(val.captures);
-                // Use eval_subexpression to force a redirection of output, so we can use everything in prompt
-                let ret_val =
-                    eval_subexpression(engine_state, &mut stack, block, PipelineData::empty());
-                trace!(
-                    "get_prompt_string (block) {}:{}:{}",
-                    file!(),
-                    line!(),
-                    column!()
-                );
+    let mut output = match stack.get_env_var(engine_state, prompt)? {
+        Value::String { val, .. } => val.clone(),
+        Value::Closure { val, .. } => {
+            let result = ClosureEvalOnce::new(engine_state, stack, val.as_ref().clone())
+                .run_with_input(PipelineData::empty());
 
-                ret_val
-                    .map_err(|err| {
-                        let working_set = StateWorkingSet::new(engine_state);
-                        report_error(&working_set, &err);
-                    })
-                    .ok()
-            }
-            Value::Block { val: block_id, .. } => {
-                let block = engine_state.get_block(block_id);
-                // Use eval_subexpression to force a redirection of output, so we can use everything in prompt
-                let ret_val = eval_subexpression(engine_state, stack, block, PipelineData::empty());
-                trace!(
-                    "get_prompt_string (block) {}:{}:{}",
-                    file!(),
-                    line!(),
-                    column!()
-                );
+            trace!(
+                "get_prompt_string (block) {}:{}:{}",
+                file!(),
+                line!(),
+                column!()
+            );
 
-                ret_val
-                    .map_err(|err| {
-                        let working_set = StateWorkingSet::new(engine_state);
-                        report_error(&working_set, &err);
-                    })
-                    .ok()
-            }
-            Value::String { .. } => Some(PipelineData::Value(v.clone(), None)),
-            _ => None,
-        })
-        .and_then(|pipeline_data| {
-            let output = pipeline_data.collect_string("", config).ok();
+            let result_string = result
+                .map_err(|err| report_shell_error(None, engine_state, &err))
+                .ok()
+                .and_then(|pd| pd.collect_string("", config).ok());
 
-            output.map(|mut x| {
-                // Just remove the very last newline.
-                if x.ends_with('\n') {
-                    x.pop();
-                }
-
-                if x.ends_with('\r') {
-                    x.pop();
-                }
-                x
-            })
-        })
-}
-
-pub(crate) fn update_prompt(
-    config: &Config,
-    engine_state: &EngineState,
-    stack: &Stack,
-    nu_prompt: &mut NushellPrompt,
-) {
-    let mut stack = stack.clone();
-
-    let left_prompt_string = get_prompt_string(PROMPT_COMMAND, config, engine_state, &mut stack);
-
-    // Now that we have the prompt string lets ansify it.
-    // <133 A><prompt><133 B><command><133 C><command output>
-    let left_prompt_string = if config.shell_integration {
-        if let Some(prompt_string) = left_prompt_string {
-            Some(format!(
-                "{PRE_PROMPT_MARKER}{prompt_string}{POST_PROMPT_MARKER}"
-            ))
-        } else {
-            left_prompt_string
+            result_string?
         }
-    } else {
-        left_prompt_string
+        _ => return None,
     };
 
-    let right_prompt_string =
-        get_prompt_string(PROMPT_COMMAND_RIGHT, config, engine_state, &mut stack);
+    // Always reset the color at the start of the right prompt
+    // to ensure there is no ansi bleed over
+    if output.is_empty() && prompt == PROMPT_COMMAND_RIGHT {
+        output.insert_str(0, "\x1b[0m")
+    };
 
-    let prompt_indicator_string =
-        get_prompt_string(PROMPT_INDICATOR, config, engine_state, &mut stack);
+    // Let's keep this for debugging purposes with nu --log-level warn
+    info!("{}:{}:{} {:?}", file!(), line!(), column!(), output);
 
-    let prompt_multiline_string =
-        get_prompt_string(PROMPT_MULTILINE_INDICATOR, config, engine_state, &mut stack);
+    Some(output)
+}
 
-    let prompt_vi_insert_string =
-        get_prompt_string(PROMPT_INDICATOR_VI_INSERT, config, engine_state, &mut stack);
+/// Re-evaluate `$env.PROMPT_COMMAND` and friends and install the result as the
+/// prompt's per-cycle baseline. This overwrites anything a background job pushed
+/// during the previous cycle, resetting the prompt for the next line.
+pub fn update_prompt(config: &Config, engine_state: &EngineState, stack: &mut Stack) {
+    let new_contents = build_prompt_contents(config, engine_state, stack);
 
-    let prompt_vi_normal_string =
-        get_prompt_string(PROMPT_INDICATOR_VI_NORMAL, config, engine_state, &mut stack);
+    // reedline handles semantic markers itself.
+    engine_state.prompt_state.set_contents(new_contents);
 
-    // apply the other indicators
-    nu_prompt.update_all_prompt_strings(
-        left_prompt_string,
-        right_prompt_string,
-        prompt_indicator_string,
-        prompt_multiline_string,
-        (prompt_vi_insert_string, prompt_vi_normal_string),
-        config.render_right_prompt_on_last_line,
-    );
     trace!("update_prompt {}:{}:{}", file!(), line!(), column!());
 }
 
-/// Construct the transient prompt based on the normal nu_prompt
+fn build_prompt_contents(
+    config: &Config,
+    engine_state: &EngineState,
+    stack: &mut Stack,
+) -> PromptContents {
+    let mut fetch_prompt =
+        |prompt_type| get_prompt_string(prompt_type, config, engine_state, stack).map(Arc::from);
+
+    PromptContents {
+        left: fetch_prompt(PROMPT_COMMAND),
+        right: fetch_prompt(PROMPT_COMMAND_RIGHT),
+        indicator: fetch_prompt(PROMPT_INDICATOR),
+        vi_insert: fetch_prompt(PROMPT_INDICATOR_VI_INSERT),
+        vi_normal: fetch_prompt(PROMPT_INDICATOR_VI_NORMAL),
+        multiline: fetch_prompt(PROMPT_MULTILINE_INDICATOR),
+        render_right_on_last_line: config.render_right_prompt_on_last_line,
+    }
+}
+
+/// Construct the transient prompt based on the normal nu_prompt.
+/// Note: Transient prompts do NOT emit semantic markers since they replace
+/// the actual prompt after command execution (which already has markers).
+///
+/// The transient prompt is drawn only once the line is submitted, which can
+/// be long after this function runs. Rather than freezing a snapshot of the
+/// baseline now, we resolve only the `TRANSIENT_PROMPT_*` overrides here and
+/// read the baseline live at render time, so a background job's late
+/// `commandline set-prompt` pushes still show up.
 pub(crate) fn make_transient_prompt(
     config: &Config,
     engine_state: &EngineState,
     stack: &mut Stack,
-    nu_prompt: &NushellPrompt,
 ) -> Box<dyn Prompt> {
-    let mut nu_prompt = nu_prompt.clone();
+    let mut fetch_transient =
+        |env_var| get_prompt_string(env_var, config, engine_state, stack).map(Arc::from);
 
-    if let Some(s) = get_prompt_string(TRANSIENT_PROMPT_COMMAND, config, engine_state, stack) {
-        nu_prompt.update_prompt_left(Some(s))
+    let overrides = PromptContents {
+        left: fetch_transient(TRANSIENT_PROMPT_COMMAND),
+        right: fetch_transient(TRANSIENT_PROMPT_COMMAND_RIGHT),
+        indicator: fetch_transient(TRANSIENT_PROMPT_INDICATOR),
+        vi_insert: fetch_transient(TRANSIENT_PROMPT_INDICATOR_VI_INSERT),
+        vi_normal: fetch_transient(TRANSIENT_PROMPT_INDICATOR_VI_NORMAL),
+        multiline: fetch_transient(TRANSIENT_PROMPT_MULTILINE_INDICATOR),
+        // Not overridable by a `TRANSIENT_PROMPT_*` var; falls back to the
+        // live baseline via `PromptContents::overridden_by`.
+        render_right_on_last_line: false,
+    };
+
+    Box::new(NushellPrompt::transient(
+        engine_state.prompt_state.clone(),
+        overrides,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nu_protocol::Span;
+
+    #[test]
+    fn update_prompt_does_not_embed_osc_markers() {
+        let mut config = Config::default();
+        config.shell_integration.osc133 = true;
+
+        let engine_state = EngineState::new();
+        let mut stack = Stack::new();
+        stack.add_env_var(
+            PROMPT_COMMAND.into(),
+            Value::string("test", Span::test_data()),
+        );
+
+        update_prompt(&config, &engine_state, &mut stack);
+
+        let nu_prompt = NushellPrompt::shared(engine_state.prompt_state.clone());
+        assert_eq!(nu_prompt.render_prompt_left(), "test");
     }
 
-    if let Some(s) = get_prompt_string(TRANSIENT_PROMPT_COMMAND_RIGHT, config, engine_state, stack)
-    {
-        nu_prompt.update_prompt_right(Some(s), config.render_right_prompt_on_last_line)
-    }
+    #[test]
+    fn transient_prompt_override_still_wins_over_the_live_baseline() {
+        use nu_protocol::engine::PromptSegment;
 
-    if let Some(s) = get_prompt_string(TRANSIENT_PROMPT_INDICATOR, config, engine_state, stack) {
-        nu_prompt.update_prompt_indicator(Some(s))
-    }
-    if let Some(s) = get_prompt_string(
-        TRANSIENT_PROMPT_INDICATOR_VI_INSERT,
-        config,
-        engine_state,
-        stack,
-    ) {
-        nu_prompt.update_prompt_vi_insert(Some(s))
-    }
-    if let Some(s) = get_prompt_string(
-        TRANSIENT_PROMPT_INDICATOR_VI_NORMAL,
-        config,
-        engine_state,
-        stack,
-    ) {
-        nu_prompt.update_prompt_vi_normal(Some(s))
-    }
+        let config = Config::default();
+        let engine_state = EngineState::new();
+        let mut stack = Stack::new();
+        stack.add_env_var(
+            TRANSIENT_PROMPT_INDICATOR.into(),
+            Value::string("transient> ", Span::test_data()),
+        );
 
-    if let Some(s) = get_prompt_string(
-        TRANSIENT_PROMPT_MULTILINE_INDICATOR,
-        config,
-        engine_state,
-        stack,
-    ) {
-        nu_prompt.update_prompt_multiline(Some(s))
-    }
+        let transient_prompt = make_transient_prompt(&config, &engine_state, &mut stack);
 
-    Box::new(nu_prompt)
+        // The configured TRANSIENT_PROMPT_INDICATOR beats a later live change.
+        engine_state
+            .prompt_state
+            .set(PromptSegment::Indicator, "live> ");
+
+        assert_eq!(
+            transient_prompt.render_prompt_indicator(reedline::PromptEditMode::Emacs),
+            "transient> "
+        );
+    }
 }

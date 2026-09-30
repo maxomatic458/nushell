@@ -1,10 +1,7 @@
-use nu_engine::{eval_block, CallExt};
-use nu_protocol::ast::{Block, Call, CellPath, PathMember};
-use nu_protocol::engine::{Closure, Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, FromValue, IntoInterruptiblePipelineData, IntoPipelineData,
-    PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value,
-};
+use std::borrow::Cow;
+
+use nu_engine::{ClosureEval, ClosureEvalOnce, command_prelude::*};
+use nu_protocol::ast::PathMember;
 
 #[derive(Clone)]
 pub struct Insert;
@@ -17,8 +14,8 @@ impl Command for Insert {
     fn signature(&self) -> Signature {
         Signature::build("insert")
             .input_output_types(vec![
-                (Type::Record(vec![]), Type::Record(vec![])),
-                (Type::Table(vec![]), Type::Table(vec![])),
+                (Type::record(), Type::record()),
+                (Type::table(), Type::table()),
                 (
                     Type::List(Box::new(Type::Any)),
                     Type::List(Box::new(Type::Any)),
@@ -38,8 +35,13 @@ impl Command for Insert {
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Insert a new column, using an expression or closure to create each row's values."
+    }
+
+    fn extra_description(&self) -> &str {
+        "When inserting a column, the closure will be run for each row, and the current row will be passed as the first argument.
+When inserting into a specific index, the closure will instead get the current value at the index or null if inserting at the end of a list/table."
     }
 
     fn search_terms(&self) -> Vec<&str> {
@@ -56,13 +58,13 @@ impl Command for Insert {
         insert(engine_state, stack, call, input)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "Insert a new entry into a single record",
                 example: "{'name': 'nu', 'stars': 5} | insert alias 'Nushell'",
                 result: Some(Value::test_record(record! {
-                    "name" =>  Value::test_string("nu"),
+                    "name" => Value::test_string("nu"),
                     "stars" => Value::test_int(5),
                     "alias" => Value::test_string("Nushell"),
                 })),
@@ -72,8 +74,8 @@ impl Command for Insert {
                 example: "[[project, lang]; ['Nushell', 'Rust']] | insert type 'shell'",
                 result: Some(Value::test_list(vec![Value::test_record(record! {
                     "project" => Value::test_string("Nushell"),
-                    "lang" =>    Value::test_string("Rust"),
-                    "type" =>    Value::test_string("shell"),
+                    "lang" => Value::test_string("Rust"),
+                    "type" => Value::test_string("shell"),
                 })])),
             },
             Example {
@@ -114,69 +116,51 @@ impl Command for Insert {
                     Value::test_int(4),
                 ])),
             },
+            Example {
+                description: "Insert into a nested path, creating new values as needed",
+                example: "[{} {a: [{}]}] | insert a.0.b \"value\"",
+                result: Some(Value::test_list(vec![
+                    Value::test_record(record!(
+                        "a" => Value::test_record(record!(
+                            "b" => Value::test_string("value"),
+                        )),
+                    )),
+                    Value::test_record(record!(
+                        "a" => Value::test_list(vec![Value::test_record(record!(
+                        ))]),
+                    )),
+                ])),
+            },
         ]
     }
 }
 
-fn insert(
+fn insert_recursive(
     engine_state: &EngineState,
     stack: &mut Stack,
-    call: &Call,
+    head_span: Span,
+    replacement: Value,
     input: PipelineData,
+    cell_paths: &[PathMember],
 ) -> Result<PipelineData, ShellError> {
-    let span = call.head;
-
-    let cell_path: CellPath = call.req(engine_state, stack, 0)?;
-    let replacement: Value = call.req(engine_state, stack, 1)?;
-
-    let redirect_stdout = call.redirect_stdout;
-    let redirect_stderr = call.redirect_stderr;
-
-    let ctrlc = engine_state.ctrlc.clone();
-
     match input {
+        // Propagate errors in the pipeline
+        PipelineData::Value(Value::Error { error, .. }, ..) => Err(*error),
         PipelineData::Value(mut value, metadata) => {
-            if replacement.as_block().is_ok() {
-                match (cell_path.members.first(), &mut value) {
-                    (Some(PathMember::String { .. }), Value::List { vals, .. }) => {
-                        let span = replacement.span();
-                        let capture_block = Closure::from_value(replacement)?;
-                        let block = engine_state.get_block(capture_block.block_id);
-                        let stack = stack.captures_to_stack(capture_block.captures.clone());
-                        for val in vals {
-                            let mut stack = stack.clone();
-                            insert_value_by_closure(
-                                val,
-                                span,
-                                engine_state,
-                                &mut stack,
-                                redirect_stdout,
-                                redirect_stderr,
-                                block,
-                                &cell_path.members,
-                                false,
-                            )?;
-                        }
-                    }
-                    (first, _) => {
-                        insert_single_value_by_closure(
-                            &mut value,
-                            replacement,
-                            engine_state,
-                            stack,
-                            redirect_stdout,
-                            redirect_stderr,
-                            &cell_path.members,
-                            matches!(first, Some(PathMember::Int { .. })),
-                        )?;
-                    }
-                }
+            if let Value::Closure { val, .. } = replacement {
+                insert_single_value_by_closure(
+                    &mut value,
+                    ClosureEvalOnce::new(engine_state, stack, *val),
+                    head_span,
+                    cell_paths,
+                    false,
+                )?;
             } else {
-                value.insert_data_at_cell_path(&cell_path.members, replacement, span)?;
+                value.insert_data_at_cell_path(cell_paths, replacement, head_span)?;
             }
             Ok(value.into_pipeline_data_with_metadata(metadata))
         }
-        PipelineData::ListStream(mut stream, metadata) => {
+        PipelineData::ListStream(stream, metadata) => {
             if let Some((
                 &PathMember::Int {
                     val,
@@ -184,8 +168,9 @@ fn insert(
                     ..
                 },
                 path,
-            )) = cell_path.members.split_first()
+            )) = cell_paths.split_first()
             {
+                let mut stream = stream.into_iter();
                 let mut pre_elems = vec![];
 
                 for idx in 0..val {
@@ -200,31 +185,15 @@ fn insert(
                 }
 
                 if path.is_empty() {
-                    if replacement.as_block().is_ok() {
-                        let span = replacement.span();
+                    if let Value::Closure { val, .. } = replacement {
                         let value = stream.next();
                         let end_of_stream = value.is_none();
-                        let value = value.unwrap_or(Value::nothing(span));
-                        let capture_block = Closure::from_value(replacement)?;
-                        let block = engine_state.get_block(capture_block.block_id);
-                        let mut stack = stack.captures_to_stack(capture_block.captures);
+                        let value = value.unwrap_or(Value::nothing(head_span));
+                        let new_value = ClosureEvalOnce::new(engine_state, stack, *val)
+                            .run_with_value(value.clone())?
+                            .into_value(head_span)?;
 
-                        if let Some(var) = block.signature.get_positional(0) {
-                            if let Some(var_id) = &var.var_id {
-                                stack.add_var(*var_id, value.clone())
-                            }
-                        }
-
-                        let output = eval_block(
-                            engine_state,
-                            &mut stack,
-                            block,
-                            value.clone().into_pipeline_data(),
-                            redirect_stdout,
-                            redirect_stderr,
-                        )?;
-
-                        pre_elems.push(output.into_value(span));
+                        pre_elems.push(new_value);
                         if !end_of_stream {
                             pre_elems.push(value);
                         }
@@ -232,21 +201,20 @@ fn insert(
                         pre_elems.push(replacement);
                     }
                 } else if let Some(mut value) = stream.next() {
-                    if replacement.as_block().is_ok() {
+                    if let Value::Closure { val, .. } = replacement {
                         insert_single_value_by_closure(
                             &mut value,
-                            replacement,
-                            engine_state,
-                            stack,
-                            redirect_stdout,
-                            redirect_stderr,
+                            ClosureEvalOnce::new(engine_state, stack, *val),
+                            head_span,
                             path,
                             true,
                         )?;
                     } else {
-                        value.insert_data_at_cell_path(path, replacement, span)?;
+                        value.insert_data_at_cell_path(path, replacement, head_span)?;
                     }
                     pre_elems.push(value)
+                } else if pre_elems.is_empty() {
+                    return Err(ShellError::AccessEmptyContent { span: path_span });
                 } else {
                     return Err(ShellError::AccessBeyondEnd {
                         max_idx: pre_elems.len() - 1,
@@ -257,136 +225,111 @@ fn insert(
                 Ok(pre_elems
                     .into_iter()
                     .chain(stream)
-                    .into_pipeline_data_with_metadata(metadata, ctrlc))
-            } else if replacement.as_block().is_ok() {
-                let engine_state = engine_state.clone();
-                let replacement_span = replacement.span();
-                let capture_block = Closure::from_value(replacement)?;
-                let block = engine_state.get_block(capture_block.block_id).clone();
-                let stack = stack.captures_to_stack(capture_block.captures.clone());
+                    .into_pipeline_data_with_metadata(
+                        head_span,
+                        engine_state.signals().clone(),
+                        metadata,
+                    ))
+            } else if let Some(new_cell_paths) = Value::try_put_int_path_member_on_top(cell_paths) {
+                insert_recursive(
+                    engine_state,
+                    stack,
+                    head_span,
+                    replacement,
+                    PipelineData::ListStream(stream, metadata),
+                    &new_cell_paths,
+                )
+            } else if let Value::Closure { val, .. } = replacement {
+                let mut closure = ClosureEval::new(engine_state, stack, *val);
+                let cell_paths = cell_paths.to_vec();
+                let stream = stream.map(move |mut value| {
+                    let err =
+                        insert_value_by_closure(&mut value, &mut closure, head_span, &cell_paths);
 
-                Ok(stream
-                    .map(move |mut input| {
-                        // Recreate the stack for each iteration to
-                        // isolate environment variable changes, etc.
-                        let mut stack = stack.clone();
-
-                        let err = insert_value_by_closure(
-                            &mut input,
-                            replacement_span,
-                            &engine_state,
-                            &mut stack,
-                            redirect_stdout,
-                            redirect_stderr,
-                            &block,
-                            &cell_path.members,
-                            false,
-                        );
-
-                        if let Err(e) = err {
-                            Value::error(e, span)
-                        } else {
-                            input
-                        }
-                    })
-                    .into_pipeline_data_with_metadata(metadata, ctrlc))
+                    if let Err(e) = err {
+                        Value::error(e, head_span)
+                    } else {
+                        value
+                    }
+                });
+                Ok(PipelineData::list_stream(stream, metadata))
             } else {
-                Ok(stream
-                    .map(move |mut input| {
-                        if let Err(e) = input.insert_data_at_cell_path(
-                            &cell_path.members,
-                            replacement.clone(),
-                            span,
-                        ) {
-                            Value::error(e, span)
-                        } else {
-                            input
-                        }
-                    })
-                    .into_pipeline_data_with_metadata(metadata, ctrlc))
+                let cell_paths = cell_paths.to_vec();
+                let stream = stream.map(move |mut value| {
+                    if let Err(e) =
+                        value.insert_data_at_cell_path(&cell_paths, replacement.clone(), head_span)
+                    {
+                        Value::error(e, head_span)
+                    } else {
+                        value
+                    }
+                });
+
+                Ok(PipelineData::list_stream(stream, metadata))
             }
         }
         PipelineData::Empty => Err(ShellError::IncompatiblePathAccess {
             type_name: "empty pipeline".to_string(),
-            span,
+            span: head_span,
         }),
-        PipelineData::ExternalStream { .. } => Err(ShellError::IncompatiblePathAccess {
-            type_name: "external stream".to_string(),
-            span,
+        PipelineData::ByteStream(stream, ..) => Err(ShellError::IncompatiblePathAccess {
+            type_name: stream.type_().describe().into(),
+            span: head_span,
         }),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn insert_value_by_closure(
-    value: &mut Value,
-    span: Span,
+fn insert(
     engine_state: &EngineState,
     stack: &mut Stack,
-    redirect_stdout: bool,
-    redirect_stderr: bool,
-    block: &Block,
-    cell_path: &[PathMember],
-    first_path_member_int: bool,
-) -> Result<(), ShellError> {
-    let input_at_path = value.clone().follow_cell_path(cell_path, false);
+    call: &Call,
+    input: PipelineData,
+) -> Result<PipelineData, ShellError> {
+    let head = call.head;
+    let cell_path: CellPath = call.req(engine_state, stack, 0)?;
+    let replacement: Value = call.req(engine_state, stack, 1)?;
+    let input = input.into_stream_or_original(engine_state);
 
-    if let Some(var) = block.signature.get_positional(0) {
-        if let Some(var_id) = &var.var_id {
-            stack.add_var(
-                *var_id,
-                if first_path_member_int {
-                    input_at_path.clone().unwrap_or(Value::nothing(span))
-                } else {
-                    value.clone()
-                },
-            )
-        }
-    }
-
-    let input_at_path = input_at_path
-        .map(IntoPipelineData::into_pipeline_data)
-        .unwrap_or(PipelineData::Empty);
-
-    let output = eval_block(
+    insert_recursive(
         engine_state,
         stack,
-        block,
-        input_at_path,
-        redirect_stdout,
-        redirect_stderr,
-    )?;
-
-    value.insert_data_at_cell_path(cell_path, output.into_value(span), span)
+        head,
+        replacement,
+        input,
+        &cell_path.members,
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
+fn insert_value_by_closure(
+    value: &mut Value,
+    closure: &mut ClosureEval,
+    span: Span,
+    cell_path: &[PathMember],
+) -> Result<(), ShellError> {
+    let new_value = closure.run_with_value(value.clone())?.into_value(span)?;
+    value.insert_data_at_cell_path(cell_path, new_value, span)
+}
+
 fn insert_single_value_by_closure(
     value: &mut Value,
-    replacement: Value,
-    engine_state: &EngineState,
-    stack: &mut Stack,
-    redirect_stdout: bool,
-    redirect_stderr: bool,
+    closure: ClosureEvalOnce,
+    span: Span,
     cell_path: &[PathMember],
-    first_path_member_int: bool,
+    cell_value_as_arg: bool,
 ) -> Result<(), ShellError> {
-    let span = replacement.span();
-    let capture_block = Closure::from_value(replacement)?;
-    let block = engine_state.get_block(capture_block.block_id);
-    let mut stack = stack.captures_to_stack(capture_block.captures);
-
-    insert_value_by_closure(
-        value,
-        span,
-        engine_state,
-        &mut stack,
-        redirect_stdout,
-        redirect_stderr,
-        block,
-        cell_path,
-        first_path_member_int,
-    )
+    // FIXME: this leads to inconsistent behaviors between
+    // `{a: b} | insert c {|x| print $x}` and
+    // `[{a: b}] | insert 0.c {|x| print $x}`
+    let arg = if cell_value_as_arg {
+        value
+            .follow_cell_path(cell_path)
+            .map(Cow::into_owned)
+            .unwrap_or(Value::nothing(span))
+    } else {
+        value.clone()
+    };
+    let new_value = closure.run_with_value(arg)?.into_value(span)?;
+    value.insert_data_at_cell_path(cell_path, new_value, span)
 }
 
 #[cfg(test)]
@@ -394,9 +337,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Insert {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Insert)
     }
 }

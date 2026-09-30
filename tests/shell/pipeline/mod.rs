@@ -1,11 +1,14 @@
 mod commands;
 
-use nu_test_support::nu;
-use pretty_assertions::assert_eq;
+use nu_test_support::prelude::*;
 
 #[test]
-fn doesnt_break_on_utf8() {
-    let actual = nu!("echo ö");
+fn doesnt_break_on_utf8() -> Result {
+    test().run("echo ö").expect_value_eq("ö")
+}
 
-    assert_eq!(actual.out, "ö", "'{}' should contain ö", actual.out);
+#[test]
+#[deps(TESTBIN_IECHO)]
+fn infinite_output_piped_to_value() -> Result {
+    test().run("iecho x | 1").expect_value_eq(1)
 }

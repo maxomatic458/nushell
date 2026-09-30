@@ -1,11 +1,4 @@
-use nu_engine::CallExt;
-
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, IntoInterruptiblePipelineData, PipelineData, ShellError, Signature, Span,
-    SyntaxShape, Type, Value,
-};
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
 pub struct Every;
@@ -28,17 +21,17 @@ impl Command for Every {
             )
             .switch(
                 "skip",
-                "skip the rows that would be returned, instead of selecting them",
+                "Skip the rows that would be returned, instead of selecting them.",
                 Some('s'),
             )
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Show (or skip) every n-th row, starting from the first one."
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 example: "[1 2 3 4 5] | every 2",
@@ -64,7 +57,7 @@ impl Command for Every {
         engine_state: &EngineState,
         stack: &mut Stack,
         call: &Call,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let stride = match call.req::<usize>(engine_state, stack, 0)? {
             0 => 1,
@@ -73,7 +66,7 @@ impl Command for Every {
 
         let skip = call.has_flag(engine_state, stack, "skip")?;
 
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
 
         Ok(input
             .into_iter()
@@ -85,7 +78,7 @@ impl Command for Every {
                     None
                 }
             })
-            .into_pipeline_data_with_metadata(metadata, engine_state.ctrlc.clone()))
+            .into_pipeline_data_with_metadata(call.head, engine_state.signals().clone(), metadata))
     }
 }
 
@@ -94,9 +87,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Every {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Every)
     }
 }

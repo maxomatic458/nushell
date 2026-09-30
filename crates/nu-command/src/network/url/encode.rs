@@ -1,16 +1,26 @@
-use nu_cmd_base::input_handler::{operate, CellPathOnlyArgs};
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::ast::CellPath;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::Category;
-use nu_protocol::{Example, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value};
-use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use nu_cmd_base::input_handler::{CmdArgument, operate};
+use nu_engine::command_prelude::*;
+
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_encode, utf8_percent_encode};
+
+struct Arguments {
+    cell_paths: Option<Vec<CellPath>>,
+    ascii_set: &'static AsciiSet,
+}
+
+static ASCII_SET_ALL: &AsciiSet = NON_ALPHANUMERIC;
+static ASCII_SET_NOT_ALL: &AsciiSet = &NON_ALPHANUMERIC.remove(b'/').remove(b':').remove(b'.');
+
+impl CmdArgument for Arguments {
+    fn take_cell_paths(&mut self) -> Option<Vec<CellPath>> {
+        self.cell_paths.take()
+    }
+}
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct UrlEncode;
 
-impl Command for SubCommand {
+impl Command for UrlEncode {
     fn name(&self) -> &str {
         "url encode"
     }
@@ -19,14 +29,15 @@ impl Command for SubCommand {
         Signature::build("url encode")
             .input_output_types(vec![
                 (Type::String, Type::String),
-                (Type::List(Box::new(Type::String)), Type::List(Box::new(Type::String))),
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::Binary, Type::String),
+                (Type::List(Box::new(Type::one_of([Type::String, Type::Binary]))), Type::List(Box::new(Type::String))),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true)
             .switch(
             "all",
-            "encode all non-alphanumeric chars including `/`, `.`, `:`",
+            "Encode all non-alphanumeric chars including `/`, `.`, `:`.",
             Some('a'))
             .rest(
                 "rest",
@@ -36,7 +47,7 @@ impl Command for SubCommand {
             .category(Category::Strings)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Converts a string to a percent encoded web safe string."
     }
 
@@ -52,72 +63,62 @@ impl Command for SubCommand {
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let cell_paths: Vec<CellPath> = call.rest(engine_state, stack, 0)?;
-        let args = CellPathOnlyArgs::from(cell_paths);
-        if call.has_flag(engine_state, stack, "all")? {
-            operate(
-                action_all,
-                args,
-                input,
-                call.head,
-                engine_state.ctrlc.clone(),
-            )
-        } else {
-            operate(action, args, input, call.head, engine_state.ctrlc.clone())
-        }
+        let cell_paths = Some(cell_paths).filter(|v| !v.is_empty());
+        let ascii_set = match call.has_flag(engine_state, stack, "all")? {
+            true => ASCII_SET_ALL,
+            false => ASCII_SET_NOT_ALL,
+        };
+        let args = Arguments {
+            cell_paths,
+            ascii_set,
+        };
+        operate(action, args, input, call.head, engine_state.signals())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Encode a url with escape characters",
+                description: "Encode a URL with escape characters.",
                 example: "'https://example.com/foo bar' | url encode",
                 result: Some(Value::test_string("https://example.com/foo%20bar")),
             },
             Example {
-                description: "Encode multiple urls with escape characters in list",
+                description: "Encode multiple URLs with escape characters in list.",
                 example: "['https://example.com/foo bar' 'https://example.com/a>b' '中文字/eng/12 34'] | url encode",
                 result: Some(Value::list(
-                     vec![
+                    vec![
                         Value::test_string("https://example.com/foo%20bar"),
                         Value::test_string("https://example.com/a%3Eb"),
                         Value::test_string("%E4%B8%AD%E6%96%87%E5%AD%97/eng/12%2034"),
                     ],
-                     Span::test_data(),
+                    Span::test_data(),
                 )),
             },
             Example {
-                description: "Encode all non alphanumeric chars with all flag",
+                description: "Encode all non alphanumeric chars with all flag.",
                 example: "'https://example.com/foo bar' | url encode --all",
-                result: Some(Value::test_string("https%3A%2F%2Fexample%2Ecom%2Ffoo%20bar")),
+                result: Some(Value::test_string(
+                    "https%3A%2F%2Fexample%2Ecom%2Ffoo%20bar",
+                )),
+            },
+            Example {
+                description: "Encode a iso-8859-1 encoded string.",
+                example: "'£ rates' | encode iso-8859-1 | url encode",
+                result: Some(Value::test_string("%A3%20rates")),
             },
         ]
     }
 }
 
-fn action_all(input: &Value, _arg: &CellPathOnlyArgs, head: Span) -> Value {
+fn action(input: &Value, args: &Arguments, head: Span) -> Value {
     match input {
         Value::String { val, .. } => {
-            const FRAGMENT: &AsciiSet = NON_ALPHANUMERIC;
-            Value::string(utf8_percent_encode(val, FRAGMENT).to_string(), head)
+            let utf8_percent_encode = utf8_percent_encode(val, args.ascii_set);
+            Value::string(utf8_percent_encode.to_string(), head)
         }
-        Value::Error { .. } => input.clone(),
-        _ => Value::error(
-            ShellError::OnlySupportsThisInputType {
-                exp_input_type: "string".into(),
-                wrong_type: input.get_type().to_string(),
-                dst_span: head,
-                src_span: input.span(),
-            },
-            head,
-        ),
-    }
-}
-
-fn action(input: &Value, _arg: &CellPathOnlyArgs, head: Span) -> Value {
-    match input {
-        Value::String { val, .. } => {
-            const FRAGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'/').remove(b':').remove(b'.');
-            Value::string(utf8_percent_encode(val, FRAGMENT).to_string(), head)
+        Value::Binary { val, .. } => {
+            let utf8_percent_encode = percent_encode(val, args.ascii_set);
+            Value::string(utf8_percent_encode.to_string(), head)
         }
         Value::Error { .. } => input.clone(),
         _ => Value::error(
@@ -137,9 +138,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(UrlEncode)
     }
 }

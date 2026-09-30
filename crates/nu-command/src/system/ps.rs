@@ -1,27 +1,12 @@
+#[cfg(target_os = "macos")]
+use chrono::{Local, TimeZone};
 #[cfg(windows)]
 use itertools::Itertools;
-use nu_engine::CallExt;
-#[cfg(all(
-    unix,
-    not(target_os = "macos"),
-    not(target_os = "windows"),
-    not(target_os = "android"),
-))]
-use nu_protocol::Span;
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    Category, Example, IntoInterruptiblePipelineData, PipelineData, Record, ShellError, Signature,
-    Type, Value,
-};
-#[cfg(all(
-    unix,
-    not(target_os = "macos"),
-    not(target_os = "windows"),
-    not(target_os = "android"),
-))]
-use procfs::WithCurrentSystemInfo;
+use nu_engine::command_prelude::*;
 
+use nu_protocol::PipelineMetadata;
+#[cfg(target_os = "linux")]
+use procfs::WithCurrentSystemInfo;
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -34,22 +19,29 @@ impl Command for Ps {
 
     fn signature(&self) -> Signature {
         Signature::build("ps")
-            .input_output_types(vec![(Type::Nothing, Type::Table(vec![]))])
+            .input_output_types(vec![(Type::Nothing, Type::table())])
             .switch(
                 "long",
-                "list all available columns for each entry",
+                "List all available columns for each entry.",
                 Some('l'),
             )
             .filter()
             .category(Category::System)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "View information about system processes."
     }
 
     fn search_terms(&self) -> Vec<&str> {
-        vec!["procedures", "operations", "tasks", "ops"]
+        vec![
+            "procedures",
+            "operations",
+            "tasks",
+            "ops",
+            "top",
+            "tasklist",
+        ]
     }
 
     fn run(
@@ -62,7 +54,7 @@ impl Command for Ps {
         run_ps(engine_state, stack, call)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "List the system processes",
@@ -121,37 +113,27 @@ fn run_ps(
 
         if long {
             record.push("command", Value::string(proc.command(), span));
-            #[cfg(all(
-                unix,
-                not(target_os = "macos"),
-                not(target_os = "windows"),
-                not(target_os = "android"),
-            ))]
+            #[cfg(target_os = "linux")]
             {
-                let proc_stat = proc
-                    .curr_proc
-                    .stat()
-                    .map_err(|e| ShellError::GenericError {
-                        error: "Error getting process stat".into(),
-                        msg: e.to_string(),
-                        span: Some(Span::unknown()),
-                        help: None,
-                        inner: vec![],
-                    })?;
-                // If we can't get the start time, just use the current time
-                let proc_start = proc_stat
-                    .starttime()
-                    .get()
-                    .unwrap_or_else(|_| chrono::Local::now());
-                record.push("start_time", Value::date(proc_start.into(), span));
+                let Ok(proc_stat) = proc.curr_proc.stat() else {
+                    continue;
+                };
+                record.push(
+                    "start_time",
+                    match proc_stat.starttime().get() {
+                        Ok(ts) => Value::date(ts.into(), span),
+                        Err(_) => Value::nothing(span),
+                    },
+                );
                 record.push("user_id", Value::int(proc.curr_proc.owner() as i64, span));
-                // These work and may be helpful, but it just seemed crowded
-                // record.push("group_id", Value::int(proc_stat.pgrp as i64, span));
-                // record.push("session_id", Value::int(proc_stat.session as i64, span));
+                record.push("process_group_id", Value::int(proc_stat.pgrp as i64, span));
+                record.push("session_id", Value::int(proc_stat.session as i64, span));
                 // This may be helpful for ctrl+z type of checking, once we get there
                 // record.push("tpg_id", Value::int(proc_stat.tpgid as i64, span));
                 record.push("priority", Value::int(proc_stat.priority, span));
                 record.push("process_threads", Value::int(proc_stat.num_threads, span));
+                record.push("working", Value::filesize(proc.working_size() as i64, span));
+                record.push("paged", Value::filesize(proc.paged_size() as i64, span));
                 record.push("cwd", Value::string(proc.cwd(), span));
             }
             #[cfg(windows)]
@@ -182,6 +164,8 @@ fn run_ps(
                     ),
                 );
                 record.push("priority", Value::int(proc.priority as i64, span));
+                record.push("working", Value::filesize(proc.working_size() as i64, span));
+                record.push("paged", Value::filesize(proc.paged_size() as i64, span));
                 record.push("cwd", Value::string(proc.cwd(), span));
                 record.push(
                     "environment",
@@ -196,6 +180,13 @@ fn run_ps(
             }
             #[cfg(target_os = "macos")]
             {
+                let timestamp = Local
+                    .timestamp_nanos(proc.start_time * 1_000_000_000)
+                    .into();
+                record.push("start_time", Value::date(timestamp, span));
+                record.push("user_id", Value::int(proc.user_id, span));
+                record.push("priority", Value::int(proc.priority, span));
+                record.push("process_threads", Value::int(proc.task_thread_num, span));
                 record.push("cwd", Value::string(proc.cwd(), span));
             }
         }
@@ -203,7 +194,20 @@ fn run_ps(
         output.push(Value::record(record, span));
     }
 
-    Ok(output
-        .into_iter()
-        .into_pipeline_data(engine_state.ctrlc.clone()))
+    Ok(output.into_pipeline_data_with_metadata(
+        span,
+        engine_state.signals().clone(),
+        ps_pipeline_metadata(long, span),
+    ))
+}
+
+/// Builds `ps` output metadata with table width-priority hints.
+fn ps_pipeline_metadata(long: bool, span: Span) -> PipelineMetadata {
+    let width_priority_columns: &[&str] = if long {
+        &["command", "name"]
+    } else {
+        &["name"]
+    };
+
+    PipelineMetadata::default().with_table_width_priority_columns(span, width_priority_columns)
 }

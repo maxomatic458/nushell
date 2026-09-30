@@ -1,9 +1,5 @@
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, PipelineData, ShellError, Signature, SyntaxShape, Type, Value,
-};
+use nu_engine::command_prelude::*;
+use nu_protocol::engine::CommandType;
 
 #[derive(Clone)]
 pub struct Return;
@@ -13,8 +9,8 @@ impl Command for Return {
         "return"
     }
 
-    fn usage(&self) -> &str {
-        "Return early from a function."
+    fn description(&self) -> &str {
+        "Return early from a custom command."
     }
 
     fn signature(&self) -> nu_protocol::Signature {
@@ -28,40 +24,34 @@ impl Command for Return {
             .category(Category::Core)
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"This command is a parser keyword. For details, check:
-  https://www.nushell.sh/book/thinking_in_nu.html"#
+    fn extra_description(&self) -> &str {
+        "This command is a parser keyword. For details, check:
+  https://www.nushell.sh/book/thinking_in_nu.html"
     }
 
-    fn is_parser_keyword(&self) -> bool {
-        true
+    fn command_type(&self) -> CommandType {
+        CommandType::Keyword
     }
 
     fn run(
         &self,
-        engine_state: &EngineState,
-        stack: &mut Stack,
-        call: &Call,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        _call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let return_value: Option<Value> = call.opt(engine_state, stack, 0)?;
-        if let Some(value) = return_value {
-            Err(ShellError::Return {
-                span: call.head,
-                value: Box::new(value),
-            })
-        } else {
-            Err(ShellError::Return {
-                span: call.head,
-                value: Box::new(Value::nothing(call.head)),
-            })
-        }
+        // This is compiled specially by the IR compiler. The code here is never used when
+        // running in IR mode.
+        eprintln!(
+            "Tried to execute 'run' for the 'return' command: this code path should never be reached in IR mode"
+        );
+        unreachable!()
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
-            description: "Return early",
-            example: r#"def foo [] { return }"#,
+            description: "Return early.",
+            example: "def foo [] { return }",
             result: None,
         }]
     }

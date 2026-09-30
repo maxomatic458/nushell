@@ -1,7 +1,4 @@
-use nu_engine::scope::ScopeData;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{Category, Example, IntoPipelineData, PipelineData, ShellError, Signature, Type};
+use nu_engine::{command_prelude::*, scope::ScopeData};
 
 #[derive(Clone)]
 pub struct ScopeEngineStats;
@@ -18,8 +15,8 @@ impl Command for ScopeEngineStats {
             .category(Category::Core)
     }
 
-    fn usage(&self) -> &str {
-        "Output stats on the engine in the current state."
+    fn description(&self) -> &str {
+        "Output stats on the engine in the current state, including interactive last-result size info."
     }
 
     fn run(
@@ -36,9 +33,9 @@ impl Command for ScopeEngineStats {
         Ok(scope_data.collect_engine_state(span).into_pipeline_data())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
-            description: "Show the stats on the current engine state",
+            description: "Show the stats on the current engine state (includes last_result size limit and memory use).",
             example: "scope engine-stats",
             result: None,
         }]
@@ -50,9 +47,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(ScopeEngineStats {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(ScopeEngineStats)
     }
 }

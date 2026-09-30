@@ -1,9 +1,5 @@
 use super::hex::{operate, ActionType};
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value,
-};
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
 pub struct DecodeHex;
@@ -21,23 +17,23 @@ impl Command for DecodeHex {
                     Type::List(Box::new(Type::String)),
                     Type::List(Box::new(Type::Binary)),
                 ),
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true)
             .rest(
                 "rest",
                 SyntaxShape::CellPath,
-                "For a data structure input, decode data at the given cell paths",
+                "For a data structure input, decode data at the given cell paths.",
             )
             .category(Category::Formats)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Hex decode a value."
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "Hex decode a value and output as binary",
@@ -74,7 +70,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        crate::test_examples(DecodeHex)
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(DecodeHex)
     }
 }

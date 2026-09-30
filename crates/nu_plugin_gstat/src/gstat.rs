@@ -1,9 +1,6 @@
-use git2::{Branch, BranchType, DescribeOptions, Repository};
-use nu_plugin::LabeledError;
-use nu_protocol::{record, Span, Spanned, Value};
-use std::fmt::Write;
-use std::ops::BitAnd;
-use std::path::PathBuf;
+use git2::{Branch, BranchType, Oid, Repository};
+use nu_protocol::{IntoSpanned, LabeledError, Span, Spanned, Value, record};
+use std::{collections::HashMap, fmt::Write, ops::BitAnd, path::Path};
 
 // git status
 // https://github.com/git/git/blob/9875c515535860450bafd1a177f64f0a478900fa/Documentation/git-status.txt
@@ -19,104 +16,67 @@ impl GStat {
         Default::default()
     }
 
-    pub fn usage() -> &'static str {
-        "Usage: gstat"
-    }
-
     pub fn gstat(
         &self,
         value: &Value,
+        current_dir: &str,
         path: Option<Spanned<String>>,
+        calculate_tag: bool,
         span: Span,
     ) -> Result<Value, LabeledError> {
         // use std::any::Any;
         // eprintln!("input type: {:?} value: {:#?}", &value.type_id(), &value);
         // eprintln!("path type: {:?} value: {:#?}", &path.type_id(), &path);
 
-        // This is a flag to let us know if we're using the input value (value)
-        // or using the path specified (path)
-        let mut using_input_value = false;
-
-        // let's get the input value as a string
-        let piped_value = match value.as_string() {
-            Ok(s) => {
-                using_input_value = true;
-                s
+        // If the path isn't set, get it from input, and failing that, set to "."
+        let path = match path {
+            Some(path) => path,
+            None => {
+                if !value.is_nothing() {
+                    value.coerce_string()?.into_spanned(value.span())
+                } else {
+                    String::from(".").into_spanned(span)
+                }
             }
-            _ => String::new(),
         };
 
-        // now let's get the path string
-        let mut a_path = match path {
-            Some(p) => {
-                // should we check for input and path? nah.
-                using_input_value = false;
-                p
-            }
-            None => Spanned {
-                item: ".".to_string(),
-                span,
-            },
-        };
-
-        // If there was no path specified and there is a piped in value, let's use the piped in value
-        if a_path.item == "." && piped_value.chars().count() > 0 {
-            a_path.item = piped_value;
-        }
+        // Make the path absolute based on the current_dir
+        let absolute_path = Path::new(current_dir).join(&path.item);
 
         // This path has to exist
-        // TODO: If the path is relative, it will be expanded using `std::env::current_dir` and not
-        // the "PWD" environment variable. We would need a way to read the engine's environment
-        // variables here.
-        if !std::path::Path::new(&a_path.item).exists() {
-            return Err(LabeledError {
-                label: "error with path".to_string(),
-                msg: format!("path does not exist [{}]", &a_path.item),
-                span: if using_input_value {
-                    Some(value.span())
-                } else {
-                    Some(a_path.span)
-                },
-            });
+        if !absolute_path.exists() {
+            return Err(LabeledError::new("error with path").with_label(
+                format!("path does not exist [{}]", absolute_path.display()),
+                path.span,
+            ));
         }
-        let metadata = std::fs::metadata(&a_path.item).map_err(|e| LabeledError {
-            label: "error with metadata".to_string(),
-            msg: format!(
-                "unable to get metadata for [{}], error: {}",
-                &a_path.item, e
-            ),
-            span: if using_input_value {
-                Some(value.span())
-            } else {
-                Some(a_path.span)
-            },
+        let metadata = std::fs::metadata(&absolute_path).map_err(|e| {
+            LabeledError::new("error with metadata").with_label(
+                format!(
+                    "unable to get metadata for [{}], error: {}",
+                    absolute_path.display(),
+                    e
+                ),
+                path.span,
+            )
         })?;
 
         // This path has to be a directory
         if !metadata.is_dir() {
-            return Err(LabeledError {
-                label: "error with directory".to_string(),
-                msg: format!("path is not a directory [{}]", &a_path.item),
-                span: if using_input_value {
-                    Some(value.span())
-                } else {
-                    Some(a_path.span)
-                },
-            });
+            return Err(LabeledError::new("error with directory").with_label(
+                format!("path is not a directory [{}]", absolute_path.display()),
+                path.span,
+            ));
         }
 
-        let repo_path = match PathBuf::from(&a_path.item).canonicalize() {
+        let repo_path = match absolute_path.canonicalize() {
             Ok(p) => p,
             Err(e) => {
-                return Err(LabeledError {
-                    label: format!("error canonicalizing [{}]", a_path.item),
-                    msg: e.to_string(),
-                    span: if using_input_value {
-                        Some(value.span())
-                    } else {
-                        Some(a_path.span)
-                    },
-                });
+                return Err(LabeledError::new(format!(
+                    "error canonicalizing [{}]",
+                    absolute_path.display()
+                ))
+                .with_label(e.to_string(), path.span));
             }
         };
 
@@ -133,14 +93,10 @@ impl GStat {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "".to_string());
 
-        let mut desc_opts = DescribeOptions::new();
-        desc_opts.describe_tags();
-
-        let tag = if let Ok(Ok(s)) = repo.describe(&desc_opts).map(|d| d.format(None)) {
-            s
-        } else {
-            "no_tag".to_string()
-        };
+        let tag = calculate_tag
+            .then(|| nearest_tag(&repo))
+            .flatten()
+            .unwrap_or_else(|| "no_tag".to_string());
 
         // Leave this in case we want to turn it into a table instead of a list
         // Ok(Value::List {
@@ -173,6 +129,7 @@ impl GStat {
                 "tag" => Value::string(tag, span),
                 "branch" => Value::string(stats.branch, span),
                 "remote" => Value::string(stats.remote, span),
+                "state" => Value::string(stats.state, span),
             },
             span,
         ))
@@ -200,6 +157,7 @@ impl GStat {
                 "tag" => Value::string("no_tag", span),
                 "branch" => Value::string("no_branch", span),
                 "remote" => Value::string("no_remote", span),
+                "state" => Value::string("no_state", span),
             },
             span,
         )
@@ -246,6 +204,10 @@ pub struct Stats {
     pub branch: String,
     /// The of the upstream branch
     pub remote: String,
+
+    /// State of the repository (Clean, Merge, Rebase, etc.)
+    /// See all states at https://docs.rs/git2/latest/git2/enum.RepositoryState.html
+    pub state: String,
 }
 
 impl Stats {
@@ -254,6 +216,7 @@ impl Stats {
         let mut st: Stats = Default::default();
 
         st.read_branch(repo);
+        st.state = format!("{:?}", repo.state()).to_lowercase();
 
         let mut opts = git2::StatusOptions::new();
 
@@ -321,13 +284,13 @@ impl Stats {
     fn read_branch(&mut self, repo: &Repository) {
         self.branch = match repo.head() {
             Ok(head) => {
-                if let Some(name) = head.shorthand() {
+                if let Ok(name) = head.shorthand() {
                     // try to use first 8 characters or so of the ID in detached HEAD
                     if name == "HEAD" {
                         if let Ok(commit) = head.peel_to_commit() {
                             let mut id = String::new();
                             for byte in &commit.id().as_bytes()[..4] {
-                                write!(&mut id, "{byte:x}").unwrap();
+                                write!(&mut id, "{byte:02x}").ok();
                             }
                             id
                         } else {
@@ -375,11 +338,11 @@ impl Stats {
 
     /// Read ahead-behind information between the local and upstream branches
     fn read_ahead_behind(&mut self, repo: &Repository, local: &Branch, upstream: &Branch) {
-        if let (Some(local), Some(upstream)) = (local.get().target(), upstream.get().target()) {
-            if let Ok((ahead, behind)) = repo.graph_ahead_behind(local, upstream) {
-                self.ahead = ahead as u16;
-                self.behind = behind as u16;
-            }
+        if let (Some(local), Some(upstream)) = (local.get().target(), upstream.get().target())
+            && let Ok((ahead, behind)) = repo.graph_ahead_behind(local, upstream)
+        {
+            self.ahead = ahead as u16;
+            self.behind = behind as u16;
         }
     }
 }
@@ -402,6 +365,50 @@ impl Stats {
 
 /// Check the bits of a flag against the value to see if they are set
 #[inline]
+/// The closest tag reachable from `HEAD`, formatted like `git describe --tags`: the tag itself
+/// when `HEAD` is tagged, otherwise `<tag>-<commits since the tag>-g<abbreviated hash>`.
+///
+/// libgit2's own `describe` walks the entire commit history looking for candidate tags, which
+/// cost hundreds of milliseconds on large repositories every time a prompt was drawn. Tags are
+/// few, so this maps every tag to the commit it points at once and then walks back from `HEAD`
+/// only until the first tagged commit.
+fn nearest_tag(repo: &Repository) -> Option<String> {
+    let mut tagged_commits: HashMap<Oid, String> = HashMap::new();
+    for reference in repo.references_glob("refs/tags/*").ok()?.flatten() {
+        if let (Ok(name), Ok(commit)) = (reference.shorthand(), reference.peel_to_commit()) {
+            tagged_commits
+                .entry(commit.id())
+                .or_insert_with(|| name.to_string());
+        }
+    }
+    if tagged_commits.is_empty() {
+        return None;
+    }
+
+    let head = repo.head().ok()?.peel_to_commit().ok()?.id();
+    if let Some(tag) = tagged_commits.get(&head) {
+        return Some(tag.clone());
+    }
+
+    // The default walk order yields commits lazily; a topological sort would load the whole
+    // history first.
+    let mut walk = repo.revwalk().ok()?;
+    walk.push(head).ok()?;
+    let tagged = walk.flatten().find(|id| tagged_commits.contains_key(id))?;
+
+    // Like `git describe`, count the commits reachable from HEAD but not from the tag.
+    let mut walk = repo.revwalk().ok()?;
+    walk.push(head).ok()?;
+    walk.hide(tagged).ok()?;
+    let distance = walk.count();
+
+    let abbreviated_head = head.to_string().chars().take(7).collect::<String>();
+    Some(format!(
+        "{}-{distance}-g{abbreviated_head}",
+        tagged_commits[&tagged]
+    ))
+}
+
 fn check<B>(val: B, flag: B) -> bool
 where
     B: BitAnd<Output = B> + PartialEq + Copy,

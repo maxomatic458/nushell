@@ -1,13 +1,10 @@
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    record, Category, Example, IntoPipelineData, PipelineData, ShellError, Signature, Span, Type,
-    Value,
-};
+use crate::reedline_config::{display_edit_command, display_edit_mode, display_reedline_event};
+use nu_engine::command_prelude::*;
 use reedline::{
-    get_reedline_edit_commands, get_reedline_keybinding_modifiers, get_reedline_keycodes,
-    get_reedline_prompt_edit_modes, get_reedline_reedline_events,
+    EditCommandDiscriminants, PromptEditModeDiscriminants, ReedlineEventDiscriminants,
+    get_reedline_keybinding_modifiers, get_reedline_keycodes,
 };
+use strum::IntoEnumIterator;
 
 #[derive(Clone)]
 pub struct KeybindingsList;
@@ -19,20 +16,20 @@ impl Command for KeybindingsList {
 
     fn signature(&self) -> Signature {
         Signature::build(self.name())
-            .input_output_types(vec![(Type::Nothing, Type::Table(vec![]))])
-            .switch("modifiers", "list of modifiers", Some('m'))
-            .switch("keycodes", "list of keycodes", Some('k'))
-            .switch("modes", "list of edit modes", Some('o'))
-            .switch("events", "list of reedline event", Some('e'))
-            .switch("edits", "list of edit commands", Some('d'))
+            .input_output_types(vec![(Type::Nothing, Type::table())])
+            .switch("modifiers", "List of modifiers.", Some('m'))
+            .switch("keycodes", "List of keycodes.", Some('k'))
+            .switch("modes", "List of edit modes.", Some('o'))
+            .switch("events", "List of reedline event.", Some('e'))
+            .switch("edits", "List of edit commands.", Some('d'))
             .category(Category::Platform)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "List available options that can be used to create keybindings."
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "Get list of key modifiers",
@@ -54,22 +51,26 @@ impl Command for KeybindingsList {
 
     fn run(
         &self,
-        _engine_state: &EngineState,
-        _stack: &mut Stack,
+        engine_state: &EngineState,
+        stack: &mut Stack,
         call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let records = if call.named_len() == 0 {
-            let all_options = ["modifiers", "keycodes", "edits", "modes", "events"];
-            all_options
-                .iter()
-                .flat_map(|argument| get_records(argument, call.head))
-                .collect()
-        } else {
-            call.named_iter()
-                .flat_map(|(argument, _, _)| get_records(argument.item.as_str(), call.head))
-                .collect()
-        };
+        let all_options = ["modifiers", "keycodes", "edits", "modes", "events"];
+
+        let presence = all_options
+            .iter()
+            .map(|option| call.has_flag(engine_state, stack, option))
+            .collect::<Result<Vec<_>, ShellError>>()?;
+
+        let no_option_specified = presence.iter().all(|present| !*present);
+
+        let records = all_options
+            .iter()
+            .zip(presence)
+            .filter(|(_, present)| no_option_specified || *present)
+            .flat_map(|(option, _)| get_records(option, call.head))
+            .collect();
 
         Ok(Value::list(records, call.head).into_pipeline_data())
     }
@@ -86,13 +87,30 @@ fn get_records(entry_type: &str, span: Span) -> Vec<Value> {
     };
 
     values
-        .iter()
-        .map(|edit| edit.split('\n'))
-        .flat_map(|edit| edit.map(|edit| convert_to_record(edit, entry_type, span)))
+        .into_iter()
+        .map(|edit| convert_to_record(edit, entry_type, span))
         .collect()
 }
 
-fn convert_to_record(edit: &str, entry_type: &str, span: Span) -> Value {
+fn get_reedline_edit_commands() -> Vec<String> {
+    EditCommandDiscriminants::iter()
+        .filter_map(|edit| display_edit_command(edit).map(|s| s.to_string()))
+        .collect()
+}
+
+fn get_reedline_prompt_edit_modes() -> Vec<String> {
+    PromptEditModeDiscriminants::iter()
+        .filter_map(display_edit_mode)
+        .collect()
+}
+
+fn get_reedline_reedline_events() -> Vec<String> {
+    ReedlineEventDiscriminants::iter()
+        .filter_map(|event| display_reedline_event(event).map(|s| s.to_string()))
+        .collect()
+}
+
+fn convert_to_record(edit: String, entry_type: &str, span: Span) -> Value {
     Value::record(
         record! {
             "type" => Value::string(entry_type, span),

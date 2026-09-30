@@ -1,16 +1,12 @@
-use nu_engine::CallExt;
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    record, Category, Example, PipelineData, Record, ShellError, Signature, Span, Spanned,
-    SyntaxShape, Type, Value,
-};
-use regex::Regex;
+use fancy_regex::{Regex, escape};
+use nu_engine::command_prelude::*;
+
+use super::split;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct SplitColumn;
 
-impl Command for SubCommand {
+impl Command for SplitColumn {
     fn name(&self) -> &str {
         "split column"
     }
@@ -18,11 +14,11 @@ impl Command for SubCommand {
     fn signature(&self) -> Signature {
         Signature::build("split column")
             .input_output_types(vec![
-                (Type::String, Type::Table(vec![])),
+                (Type::String, Type::table()),
                 (
                     // TODO: no test coverage (is this behavior a bug or a feature?)
                     Type::List(Box::new(Type::String)),
-                    Type::Table(vec![]),
+                    Type::table(),
                 ),
             ])
             .required(
@@ -30,8 +26,19 @@ impl Command for SubCommand {
                 SyntaxShape::String,
                 "The character or string that denotes what separates columns.",
             )
-            .switch("collapse-empty", "remove empty columns", Some('c'))
-            .switch("regex", "separator is a regular expression", Some('r'))
+            .switch("collapse-empty", "Remove empty columns.", Some('c'))
+            .named(
+                "number",
+                SyntaxShape::Int,
+                "Split into maximum number of columns.",
+                Some('n'),
+            )
+            .switch(
+                "right",
+                "When `--number` is used, collect the remainder in the leftmost column.",
+                None,
+            )
+            .switch("regex", "Separator is a regular expression.", Some('r'))
             .rest(
                 "rest",
                 SyntaxShape::String,
@@ -40,12 +47,99 @@ impl Command for SubCommand {
             .category(Category::Strings)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Split a string into multiple columns using a separator."
     }
 
     fn search_terms(&self) -> Vec<&str> {
         vec!["separate", "divide", "regex"]
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![
+            Example {
+                description: "Split a string into columns by the specified separator.",
+                example: "'a--b--c' | split column '--'",
+                result: Some(Value::test_list(vec![Value::test_record(record! {
+                        "column0" => Value::test_string("a"),
+                        "column1" => Value::test_string("b"),
+                        "column2" => Value::test_string("c"),
+                })])),
+            },
+            Example {
+                description: "Split a string into columns of char and remove the empty columns.",
+                example: "'abc' | split column --collapse-empty ''",
+                result: Some(Value::test_list(vec![Value::test_record(record! {
+                        "column0" => Value::test_string("a"),
+                        "column1" => Value::test_string("b"),
+                        "column2" => Value::test_string("c"),
+                })])),
+            },
+            Example {
+                description: "Split a list of strings into a table.",
+                example: "['a-b' 'c-d'] | split column -",
+                result: Some(Value::test_list(vec![
+                    Value::test_record(record! {
+                        "column0" => Value::test_string("a"),
+                        "column1" => Value::test_string("b"),
+                    }),
+                    Value::test_record(record! {
+                        "column0" => Value::test_string("c"),
+                        "column1" => Value::test_string("d"),
+                    }),
+                ])),
+            },
+            Example {
+                description: "Split a list of strings into a table, ignoring padding.",
+                example: r"['a -  b' 'c  -    d'] | split column --regex '\s*-\s*'",
+                result: Some(Value::test_list(vec![
+                    Value::test_record(record! {
+                        "column0" => Value::test_string("a"),
+                        "column1" => Value::test_string("b"),
+                    }),
+                    Value::test_record(record! {
+                        "column0" => Value::test_string("c"),
+                        "column1" => Value::test_string("d"),
+                    }),
+                ])),
+            },
+            Example {
+                description: "Split into columns, last column may contain the delimiter.",
+                example: "['author: Salina Yoon' r#'title: Where's Ellie?: A Hide-and-Seek Book'#] | split column --number 2 ': ' key value",
+                result: Some(Value::test_list(vec![
+                    Value::test_record(record! {
+                        "key" => Value::test_string("author"),
+                        "value" => Value::test_string("Salina Yoon"),
+                    }),
+                    Value::test_record(record! {
+                        "key" => Value::test_string("title"),
+                        "value" => Value::test_string("Where's Ellie?: A Hide-and-Seek Book"),
+                    }),
+                ])),
+            },
+            Example {
+                description: "Split into columns, first column may contain the delimiter.",
+                example: "['some-package-1.2.3' 'pkg2-1.0' 'do-smart-things-0.9.1'] | split column --number 2 --right '-' name version",
+                result: Some(Value::test_list(vec![
+                    Value::test_record(record! {
+                        "name" => Value::test_string("some-package"),
+                        "version" => Value::test_string("1.2.3"),
+                    }),
+                    Value::test_record(record! {
+                        "name" => Value::test_string("pkg2"),
+                        "version" => Value::test_string("1.0"),
+                    }),
+                    Value::test_record(record! {
+                        "name" => Value::test_string("do-smart-things"),
+                        "version" => Value::test_string("0.9.1"),
+                    }),
+                ])),
+            },
+        ]
+    }
+
+    fn is_const(&self) -> bool {
+        true
     }
 
     fn run(
@@ -55,89 +149,86 @@ impl Command for SubCommand {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        split_column(engine_state, stack, call, input)
+        let separator: Spanned<String> = call.req(engine_state, stack, 0)?;
+        let rest: Vec<Spanned<String>> = call.rest(engine_state, stack, 1)?;
+        let collapse_empty = call.has_flag(engine_state, stack, "collapse-empty")?;
+        let max_split: Option<usize> = call.get_flag(engine_state, stack, "number")?;
+        let split_from_right = call.has_flag(engine_state, stack, "right")?;
+        let has_regex = call.has_flag(engine_state, stack, "regex")?;
+
+        let args = Arguments {
+            separator,
+            rest,
+            collapse_empty,
+            max_split,
+            split_from_right,
+            has_regex,
+        };
+        split_column(engine_state, call, input, args)
     }
 
-    fn examples(&self) -> Vec<Example> {
-        vec![
-            Example {
-                description: "Split a string into columns by the specified separator",
-                example: "'a--b--c' | split column '--'",
-                result: Some(Value::test_list(vec![Value::test_record(record! {
-                        "column1" => Value::test_string("a"),
-                        "column2" => Value::test_string("b"),
-                        "column3" => Value::test_string("c"),
-                })])),
-            },
-            Example {
-                description: "Split a string into columns of char and remove the empty columns",
-                example: "'abc' | split column --collapse-empty ''",
-                result: Some(Value::test_list(vec![Value::test_record(record! {
-                        "column1" => Value::test_string("a"),
-                        "column2" => Value::test_string("b"),
-                        "column3" => Value::test_string("c"),
-                })])),
-            },
-            Example {
-                description: "Split a list of strings into a table",
-                example: "['a-b' 'c-d'] | split column -",
-                result: Some(Value::test_list(vec![
-                    Value::test_record(record! {
-                        "column1" => Value::test_string("a"),
-                        "column2" => Value::test_string("b"),
-                    }),
-                    Value::test_record(record! {
-                        "column1" => Value::test_string("c"),
-                        "column2" => Value::test_string("d"),
-                    }),
-                ])),
-            },
-            Example {
-                description: "Split a list of strings into a table, ignoring padding",
-                example: r"['a -  b' 'c  -    d'] | split column --regex '\s*-\s*'",
-                result: Some(Value::test_list(vec![
-                    Value::test_record(record! {
-                        "column1" => Value::test_string("a"),
-                        "column2" => Value::test_string("b"),
-                    }),
-                    Value::test_record(record! {
-                        "column1" => Value::test_string("c"),
-                        "column2" => Value::test_string("d"),
-                    }),
-                ])),
-            },
-        ]
+    fn run_const(
+        &self,
+        working_set: &StateWorkingSet,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let separator: Spanned<String> = call.req_const(working_set, stack, 0)?;
+        let rest: Vec<Spanned<String>> = call.rest_const(working_set, stack, 1)?;
+        let collapse_empty = call.has_flag_const(working_set, stack, "collapse-empty")?;
+        let max_split: Option<usize> = call.get_flag_const(working_set, stack, "number")?;
+        let split_from_right = call.has_flag_const(working_set, stack, "right")?;
+        let has_regex = call.has_flag_const(working_set, stack, "regex")?;
+
+        let args = Arguments {
+            separator,
+            rest,
+            collapse_empty,
+            max_split,
+            split_from_right,
+            has_regex,
+        };
+        split_column(working_set.permanent(), call, input, args)
     }
+}
+
+struct Arguments {
+    separator: Spanned<String>,
+    rest: Vec<Spanned<String>>,
+    collapse_empty: bool,
+    max_split: Option<usize>,
+    split_from_right: bool,
+    has_regex: bool,
 }
 
 fn split_column(
     engine_state: &EngineState,
-    stack: &mut Stack,
     call: &Call,
     input: PipelineData,
+    args: Arguments,
 ) -> Result<PipelineData, ShellError> {
     let name_span = call.head;
-    let separator: Spanned<String> = call.req(engine_state, stack, 0)?;
-    let rest: Vec<Spanned<String>> = call.rest(engine_state, stack, 1)?;
-    let collapse_empty = call.has_flag(engine_state, stack, "collapse-empty")?;
-
-    let regex = if call.has_flag(engine_state, stack, "regex")? {
-        Regex::new(&separator.item)
+    let pattern = if args.has_regex {
+        std::borrow::Cow::Borrowed(args.separator.item.as_str())
     } else {
-        let escaped = regex::escape(&separator.item);
-        Regex::new(&escaped)
-    }
-    .map_err(|e| ShellError::GenericError {
-        error: "Error with regular expression".into(),
-        msg: e.to_string(),
-        span: Some(separator.span),
-        help: None,
-        inner: vec![],
-    })?;
+        escape(&args.separator.item)
+    };
+    let regex = engine_state.compile_regex(&pattern, args.separator.span)?;
 
     input.flat_map(
-        move |x| split_column_helper(&x, &regex, &rest, collapse_empty, name_span),
-        engine_state.ctrlc.clone(),
+        move |x| {
+            split_column_helper(
+                &x,
+                &regex,
+                &args.rest,
+                args.collapse_empty,
+                args.max_split,
+                args.split_from_right,
+                name_span,
+            )
+        },
+        engine_state.signals(),
     )
 }
 
@@ -146,13 +237,33 @@ fn split_column_helper(
     separator: &Regex,
     rest: &[Spanned<String>],
     collapse_empty: bool,
+    max_split: Option<usize>,
+    split_from_right: bool,
     head: Span,
 ) -> Vec<Value> {
-    if let Ok(s) = v.as_string() {
-        let split_result: Vec<_> = separator
-            .split(&s)
-            .filter(|x| !(collapse_empty && x.is_empty()))
-            .collect();
+    if let Ok(s) = v.as_str() {
+        let split_result: Vec<_> = match (max_split, split_from_right) {
+            (Some(0), _) => vec![],
+            (Some(max_split), true) => {
+                let sep_bounds: Vec<_> = separator
+                    .find_iter(s)
+                    .filter_map(|x| x.ok())
+                    .map(|x| (x.start(), x.end()))
+                    .collect();
+                // get the last `max_split` separators and split `s` with them
+                split(s, sep_bounds.into_iter().rev().take(max_split - 1).rev()).collect()
+            }
+            (Some(max_split), false) => separator
+                .splitn(s, max_split)
+                .filter_map(|x| x.ok())
+                .filter(|x| !(collapse_empty && x.is_empty()))
+                .collect(),
+            (None, _) => separator
+                .split(s)
+                .filter_map(|x| x.ok())
+                .filter(|x| !(collapse_empty && x.is_empty()))
+                .collect(),
+        };
         let positional: Vec<_> = rest.iter().map(|f| f.item.clone()).collect();
 
         // If they didn't provide column names, make up our own
@@ -160,7 +271,7 @@ fn split_column_helper(
         if positional.is_empty() {
             let mut gen_columns = vec![];
             for i in 0..split_result.len() {
-                gen_columns.push(format!("column{}", i + 1));
+                gen_columns.push(format!("column{}", i));
             }
 
             for (&k, v) in split_result.iter().zip(&gen_columns) {
@@ -180,8 +291,9 @@ fn split_column_helper(
             v => {
                 let span = v.span();
                 vec![Value::error(
-                    ShellError::PipelineMismatch {
+                    ShellError::OnlySupportsThisInputType {
                         exp_input_type: "string".into(),
+                        wrong_type: v.get_type().to_string(),
                         dst_span: head,
                         src_span: span,
                     },
@@ -197,9 +309,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(SplitColumn)
     }
 }

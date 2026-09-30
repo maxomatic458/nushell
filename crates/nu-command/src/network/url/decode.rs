@@ -1,15 +1,25 @@
-use nu_cmd_base::input_handler::{operate, CellPathOnlyArgs};
-use nu_engine::CallExt;
-use nu_protocol::ast::{Call, CellPath};
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::Category;
-use nu_protocol::{Example, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value};
+use std::borrow::Cow;
+
+use nu_cmd_base::input_handler::{CmdArgument, operate};
+use nu_engine::command_prelude::*;
+
 use percent_encoding::percent_decode_str;
 
-#[derive(Clone)]
-pub struct SubCommand;
+struct Arguments {
+    cell_paths: Option<Vec<CellPath>>,
+    binary: bool,
+}
 
-impl Command for SubCommand {
+impl CmdArgument for Arguments {
+    fn take_cell_paths(&mut self) -> Option<Vec<CellPath>> {
+        self.cell_paths.take()
+    }
+}
+
+#[derive(Clone)]
+pub struct UrlDecode;
+
+impl Command for UrlDecode {
     fn name(&self) -> &str {
         "url decode"
     }
@@ -18,14 +28,24 @@ impl Command for SubCommand {
         Signature::build("url decode")
             .input_output_types(vec![
                 (Type::String, Type::String),
+                (Type::String, Type::Binary),
                 (
                     Type::List(Box::new(Type::String)),
                     Type::List(Box::new(Type::String)),
                 ),
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (
+                    Type::List(Box::new(Type::String)),
+                    Type::List(Box::new(Type::Binary)),
+                ),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true)
+            .switch(
+                "binary",
+                "Return a binary value, to allow decoding non UTF-8 text.",
+                Some('b'),
+            )
             .rest(
                 "rest",
                 SyntaxShape::CellPath,
@@ -34,7 +54,7 @@ impl Command for SubCommand {
             .category(Category::Strings)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Converts a percent-encoded web safe string to a string."
     }
 
@@ -50,19 +70,21 @@ impl Command for SubCommand {
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let cell_paths: Vec<CellPath> = call.rest(engine_state, stack, 0)?;
-        let args = CellPathOnlyArgs::from(cell_paths);
-        operate(action, args, input, call.head, engine_state.ctrlc.clone())
+        let cell_paths = Some(cell_paths).filter(|v| !v.is_empty());
+        let binary = call.has_flag(engine_state, stack, "binary")?;
+        let args = Arguments { cell_paths, binary };
+        operate(action, args, input, call.head, engine_state.signals())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Decode a url with escape characters",
+                description: "Decode a URL with escape characters.",
                 example: "'https://example.com/foo%20bar' | url decode",
                 result: Some(Value::test_string("https://example.com/foo bar")),
             },
             Example {
-                description: "Decode multiple urls with escape characters in list",
+                description: "Decode multiple URLs with escape characters in list.",
                 example: "['https://example.com/foo%20bar' 'https://example.com/a%3Eb' '%E4%B8%AD%E6%96%87%E5%AD%97/eng/12%2034'] | url decode",
                 result: Some(Value::list(
                     vec![
@@ -73,27 +95,41 @@ impl Command for SubCommand {
                     Span::test_data(),
                 )),
             },
+            Example {
+                description: "Decode a percent-encoded iso-8859-1 string.",
+                example: "'%A3%20rates' | url decode --binary | decode iso-8859-1",
+                result: Some(Value::test_string("£ rates")),
+            },
         ]
     }
 }
 
-fn action(input: &Value, _arg: &CellPathOnlyArgs, head: Span) -> Value {
+fn action(input: &Value, args: &Arguments, head: Span) -> Value {
     let input_span = input.span();
     match input {
         Value::String { val, .. } => {
-            let val = percent_decode_str(val).decode_utf8();
-            match val {
-                Ok(val) => Value::string(val, head),
-                Err(e) => Value::error(
-                    ShellError::GenericError {
-                        error: "Failed to decode string".into(),
-                        msg: e.to_string(),
-                        span: Some(input_span),
-                        help: None,
-                        inner: vec![],
-                    },
-                    head,
-                ),
+            let percent_decode_str = percent_decode_str(val);
+            match args.binary {
+                true => {
+                    let data: Cow<'_, [u8]> = percent_decode_str.into();
+                    Value::binary(data, head)
+                }
+                false => {
+                    let val = percent_decode_str.decode_utf8();
+                    match val {
+                        Ok(val) => Value::string(val, head),
+                        Err(_) => Value::error(
+                            ShellError::NonUtf8Custom {
+                                msg: "\
+                                    Input is not UTF-8 encoded.\n\
+                                    Try using the `--binary` flag together with `decode`."
+                                    .into(),
+                                span: input_span,
+                            },
+                            head,
+                        ),
+                    }
+                }
             }
         }
         Value::Error { .. } => input.clone(),
@@ -114,9 +150,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(UrlDecode)
     }
 }

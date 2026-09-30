@@ -1,14 +1,14 @@
 use miette::IntoDiagnostic;
 use nu_cli::NuCompleter;
-use nu_parser::{flatten_block, parse, FlatShape};
+use nu_parser::{FlatShape, flatten_block, parse};
 use nu_protocol::{
+    DeclId, ShellError, Span, Value, VarId,
     engine::{EngineState, Stack, StateWorkingSet},
-    eval_const::create_nu_constant,
-    report_error, DeclId, ShellError, Span, Value, VarId, NU_VARIABLE_ID,
+    report_shell_error,
+    shell_error::io::{IoError, IoErrorExt, NotFound},
 };
-use reedline::Completer;
-use serde_json::{json, Value as JsonValue};
-use std::sync::Arc;
+use serde_json::{Value as JsonValue, json};
+use std::{fmt::Write, path::PathBuf, sync::Arc};
 
 #[derive(Debug)]
 enum Id {
@@ -23,12 +23,14 @@ fn find_id(
     file: &[u8],
     location: &Value,
 ) -> Option<(Id, usize, Span)> {
-    let file_id = working_set.add_file(file_path.to_string(), file);
-    let offset = working_set.get_span_for_file(file_id).start;
+    let file_id = working_set.add_file(file_path, file);
+    let file_span = working_set.get_span_for_file(file_id);
+    let offset = file_span.start;
+    let _ = working_set.files.push(file_path.into(), file_span);
     let block = parse(working_set, Some(file_path), file, false);
     let flattened = flatten_block(working_set, &block);
 
-    if let Ok(location) = location.as_i64() {
+    if let Ok(location) = location.as_int() {
         let location = location as usize + offset;
         for item in flattened {
             if location >= item.0.start && location < item.0.end {
@@ -53,98 +55,102 @@ fn read_in_file<'a>(
     engine_state: &'a mut EngineState,
     file_path: &str,
 ) -> (Vec<u8>, StateWorkingSet<'a>) {
+    // No source span — this is the IDE entry point reading the file from disk
     let file = std::fs::read(file_path)
-        .into_diagnostic()
-        .unwrap_or_else(|e| {
-            let working_set = StateWorkingSet::new(engine_state);
-            report_error(
-                &working_set,
-                &ShellError::FileNotFoundCustom {
-                    msg: format!("Could not read file '{}': {:?}", file_path, e.to_string()),
-                    span: Span::unknown(),
-                },
-            );
+        .map_err(|err| {
+            ShellError::Io(IoError::new_with_additional_context(
+                err.not_found_as(NotFound::File),
+                Span::unknown(),
+                PathBuf::from(file_path),
+                "Could not read file",
+            ))
+        })
+        .unwrap_or_else(|err| {
+            report_shell_error(None, engine_state, &err);
             std::process::exit(1);
         });
 
-    engine_state.start_in_file(Some(file_path));
+    engine_state.file = Some(PathBuf::from(file_path));
 
     let working_set = StateWorkingSet::new(engine_state);
 
     (file, working_set)
 }
 
-pub fn check(engine_state: &mut EngineState, file_path: &str, max_errors: &Value) {
+pub fn check(
+    engine_state: &mut EngineState,
+    file_path: &str,
+    max_errors: &Value,
+) -> Result<(), ShellError> {
     let cwd = std::env::current_dir().expect("Could not get current working directory.");
     engine_state.add_env_var("PWD".into(), Value::test_string(cwd.to_string_lossy()));
-    let working_set = StateWorkingSet::new(engine_state);
-
-    let nu_const = match create_nu_constant(engine_state, Span::unknown()) {
-        Ok(nu_const) => nu_const,
-        Err(err) => {
-            report_error(&working_set, &err);
-            std::process::exit(1);
-        }
-    };
-    engine_state.set_variable_const_val(NU_VARIABLE_ID, nu_const);
+    engine_state.generate_nu_constant();
 
     let mut working_set = StateWorkingSet::new(engine_state);
-    let file = std::fs::read(file_path);
+    let contents = std::fs::read(file_path).map_err(|err| {
+        ShellError::Io(IoError::new_internal_with_path(
+            err.not_found_as(NotFound::File),
+            "Could not read file",
+            PathBuf::from(file_path),
+        ))
+    })?;
 
-    let max_errors = if let Ok(max_errors) = max_errors.as_i64() {
+    let max_errors = if let Ok(max_errors) = max_errors.as_int() {
         max_errors as usize
     } else {
         100
     };
 
-    if let Ok(contents) = file {
-        let offset = working_set.next_span_start();
-        let block = parse(&mut working_set, Some(file_path), &contents, false);
+    let offset = working_set.next_span_start();
+    // Top-level IDE check — no source location triggered this file load
+    let _ = working_set.files.push(file_path.into(), Span::unknown());
+    let block = parse(&mut working_set, Some(file_path), &contents, false);
 
-        for (idx, err) in working_set.parse_errors.iter().enumerate() {
-            if idx >= max_errors {
-                // eprintln!("Too many errors, stopping here. idx: {idx} max_errors: {max_errors}");
-                break;
-            }
-            let mut span = err.span();
-            span.start -= offset;
-            span.end -= offset;
+    for (idx, err) in working_set.parse_errors.iter().enumerate() {
+        if idx >= max_errors {
+            // eprintln!("Too many errors, stopping here. idx: {idx} max_errors: {max_errors}");
+            break;
+        }
+        let mut span = err.span();
+        span.start -= offset;
+        span.end -= offset;
 
-            let msg = err.to_string();
+        let msg = err.to_string();
 
+        println!(
+            "{}",
+            json!({
+                "type": "diagnostic",
+                "severity": "Error",
+                "message": msg,
+                "span": {
+                    "start": span.start,
+                    "end": span.end
+                }
+            })
+        );
+    }
+
+    let flattened = flatten_block(&working_set, &block);
+
+    for flat in flattened {
+        if let FlatShape::VarDecl(var_id) = flat.1 {
+            let var = working_set.get_variable(var_id);
             println!(
                 "{}",
                 json!({
-                    "type": "diagnostic",
-                    "severity": "Error",
-                    "message": msg,
-                    "span": {
-                        "start": span.start,
-                        "end": span.end
+                    "type": "hint",
+                    "typename": var.ty.to_string(),
+                    "position": {
+                        "start": flat.0.start - offset,
+                        "end": flat.0.end - offset
                     }
                 })
             );
         }
-
-        let flattened = flatten_block(&working_set, &block);
-
-        for flat in flattened {
-            if let FlatShape::VarDecl(var_id) = flat.1 {
-                let var = working_set.get_variable(var_id);
-                println!(
-                    "{}",
-                    json!({
-                        "type": "hint",
-                        "typename": var.ty.to_string(),
-                        "position": {
-                            "start": flat.0.start - offset,
-                            "end": flat.0.end - offset
-                        }
-                    })
-                );
-            }
-        }
     }
+
+    Ok(())
 }
 
 pub fn goto_def(engine_state: &mut EngineState, file_path: &str, location: &Value) {
@@ -156,18 +162,18 @@ pub fn goto_def(engine_state: &mut EngineState, file_path: &str, location: &Valu
     match find_id(&mut working_set, file_path, &file, location) {
         Some((Id::Declaration(decl_id), ..)) => {
             let result = working_set.get_decl(decl_id);
-            if let Some(block_id) = result.get_block_id() {
+            if let Some(block_id) = result.block_id() {
                 let block = working_set.get_block(block_id);
                 if let Some(span) = &block.span {
                     for file in working_set.files() {
-                        if span.start >= file.1 && span.start < file.2 {
+                        if file.covered_span.contains(span.start) {
                             println!(
                                 "{}",
                                 json!(
                                     {
-                                        "file": file.0,
-                                        "start": span.start - file.1,
-                                        "end": span.end - file.1
+                                        "file": &*file.name,
+                                        "start": span.start - file.covered_span.start,
+                                        "end": span.end - file.covered_span.start,
                                     }
                                 )
                             );
@@ -180,14 +186,14 @@ pub fn goto_def(engine_state: &mut EngineState, file_path: &str, location: &Valu
         Some((Id::Variable(var_id), ..)) => {
             let var = working_set.get_variable(var_id);
             for file in working_set.files() {
-                if var.declaration_span.start >= file.1 && var.declaration_span.start < file.2 {
+                if file.covered_span.contains(var.declaration_span.start) {
                     println!(
                         "{}",
                         json!(
                             {
-                                "file": file.0,
-                                "start": var.declaration_span.start - file.1,
-                                "end": var.declaration_span.end - file.1
+                                "file": &*file.name,
+                                "start": var.declaration_span.start - file.covered_span.start,
+                                "end": var.declaration_span.end - file.covered_span.start,
                             }
                         )
                     );
@@ -211,32 +217,36 @@ pub fn hover(engine_state: &mut EngineState, file_path: &str, location: &Value) 
         Some((Id::Declaration(decl_id), offset, span)) => {
             let decl = working_set.get_decl(decl_id);
 
-            //let mut description = "```\n### Signature\n```\n".to_string();
-            let mut description = "```\n".to_string();
+            let mut description = String::new();
 
             // first description
-            description.push_str(&format!("{}\n", decl.usage()));
+            writeln!(description, "{}", decl.description())
+                .expect("writing to a String is infallible");
 
             // additional description
-            if !decl.extra_usage().is_empty() {
-                description.push_str(&format!("\n{}\n", decl.extra_usage()));
+            if !decl.extra_description().is_empty() {
+                write!(description, "\n{}\n", decl.extra_description())
+                    .expect("writing to a String is infallible");
             }
 
             // Usage
             description.push_str("### Usage\n```\n");
             let signature = decl.signature();
-            description.push_str(&format!("  {}", signature.name));
+            write!(description, "  {}", signature.name).expect("writing to a String is infallible");
             if !signature.named.is_empty() {
                 description.push_str(" {flags}")
             }
             for required_arg in &signature.required_positional {
-                description.push_str(&format!(" <{}>", required_arg.name));
+                write!(description, " <{}>", required_arg.name)
+                    .expect("writing to a String is infallible");
             }
             for optional_arg in &signature.optional_positional {
-                description.push_str(&format!(" <{}?>", optional_arg.name));
+                write!(description, " <{}?>", optional_arg.name)
+                    .expect("writing to a String is infallible");
             }
             if let Some(arg) = &signature.rest_positional {
-                description.push_str(&format!(" <...{}>", arg.name));
+                write!(description, " <...{}>", arg.name)
+                    .expect("writing to a String is infallible");
             }
 
             description.push_str("\n```\n");
@@ -254,22 +264,26 @@ pub fn hover(engine_state: &mut EngineState, file_path: &str, location: &Value) 
                     }
                     description.push_str("  ");
                     if let Some(short_flag) = &named.short {
-                        description.push_str(&format!("`-{}`", short_flag));
+                        write!(description, "`-{short_flag}`")
+                            .expect("writing to a String is infallible");
                     }
 
                     if !named.long.is_empty() {
                         if named.short.is_some() {
                             description.push_str(", ")
                         }
-                        description.push_str(&format!("`--{}`", named.long));
+                        write!(description, "`--{}`", named.long)
+                            .expect("writing to a String is infallible");
                     }
 
                     if let Some(arg) = &named.arg {
-                        description.push_str(&format!(" `<{}>`", arg.to_type()))
+                        write!(description, " `<{}>`", arg.to_type())
+                            .expect("writing to a String is infallible");
                     }
 
                     if !named.desc.is_empty() {
-                        description.push_str(&format!(" - {}", named.desc));
+                        write!(description, " - {}", named.desc)
+                            .expect("writing to a String is infallible");
                     }
                 }
                 description.push('\n');
@@ -289,13 +303,16 @@ pub fn hover(engine_state: &mut EngineState, file_path: &str, location: &Value) 
                         first = false;
                     }
 
-                    description.push_str(&format!(
+                    write!(
+                        description,
                         "  `{}: {}`",
                         required_arg.name,
                         required_arg.shape.to_type()
-                    ));
+                    )
+                    .expect("writing to a String is infallible");
                     if !required_arg.desc.is_empty() {
-                        description.push_str(&format!(" - {}", required_arg.desc));
+                        write!(description, " - {}", required_arg.desc)
+                            .expect("writing to a String is infallible");
                     }
                     description.push('\n');
                 }
@@ -306,13 +323,16 @@ pub fn hover(engine_state: &mut EngineState, file_path: &str, location: &Value) 
                         first = false;
                     }
 
-                    description.push_str(&format!(
+                    write!(
+                        description,
                         "  `{}: {}`",
                         optional_arg.name,
                         optional_arg.shape.to_type()
-                    ));
+                    )
+                    .expect("writing to a String is infallible");
                     if !optional_arg.desc.is_empty() {
-                        description.push_str(&format!(" - {}", optional_arg.desc));
+                        write!(description, " - {}", optional_arg.desc)
+                            .expect("writing to a String is infallible");
                     }
                     description.push('\n');
                 }
@@ -321,9 +341,11 @@ pub fn hover(engine_state: &mut EngineState, file_path: &str, location: &Value) 
                         description.push_str("\\\n");
                     }
 
-                    description.push_str(&format!(" `...{}: {}`", arg.name, arg.shape.to_type()));
+                    write!(description, " `...{}: {}`", arg.name, arg.shape.to_type())
+                        .expect("writing to a String is infallible");
                     if !arg.desc.is_empty() {
-                        description.push_str(&format!(" - {}", arg.desc));
+                        write!(description, " - {}", arg.desc)
+                            .expect("writing to a String is infallible");
                     }
                     description.push('\n');
                 }
@@ -337,7 +359,8 @@ pub fn hover(engine_state: &mut EngineState, file_path: &str, location: &Value) 
 
                 description.push_str("\n```\n");
                 for input_output in &signature.input_output_types {
-                    description.push_str(&format!("  {} | {}\n", input_output.0, input_output.1));
+                    writeln!(description, "  {} | {}", input_output.0, input_output.1)
+                        .expect("writing to a String is infallible");
                 }
                 description.push_str("\n```\n");
             }
@@ -347,10 +370,12 @@ pub fn hover(engine_state: &mut EngineState, file_path: &str, location: &Value) 
                 description.push_str("### Example(s)\n```\n");
 
                 for example in decl.examples() {
-                    description.push_str(&format!(
+                    write!(
+                        description,
                         "```\n  {}\n```\n  {}\n\n",
                         example.description, example.example
-                    ));
+                    )
+                    .expect("writing to a String is infallible");
                 }
             }
 
@@ -410,13 +435,13 @@ pub fn hover(engine_state: &mut EngineState, file_path: &str, location: &Value) 
                     }
                 })
             ),
-            FlatShape::External => println!(
+            FlatShape::External(alias_span) => println!(
                 "{}",
                 json!({
                     "hover": "external",
                     "span": {
-                        "start": span.start - offset,
-                        "end": span.end - offset
+                        "start": alias_span.start - offset,
+                        "end": alias_span.end - offset
                     }
                 })
             ),
@@ -570,6 +595,16 @@ pub fn hover(engine_state: &mut EngineState, file_path: &str, location: &Value) 
                     }
                 })
             ),
+            FlatShape::RawString => println!(
+                "{}",
+                json!({
+                    "hover": "raw-string",
+                    "span": {
+                        "start": span.start - offset,
+                        "end": span.end - offset
+                    }
+                })
+            ),
             FlatShape::StringInterpolation => println!(
                 "{}",
                 json!({
@@ -597,8 +632,7 @@ pub fn hover(engine_state: &mut EngineState, file_path: &str, location: &Value) 
 }
 
 pub fn complete(engine_reference: Arc<EngineState>, file_path: &str, location: &Value) {
-    let stack = Stack::new();
-    let mut completer = NuCompleter::new(engine_reference, stack);
+    let mut completer = NuCompleter::new(engine_reference, Arc::new(Stack::new()));
 
     let file = std::fs::read(file_path)
         .into_diagnostic()
@@ -606,14 +640,14 @@ pub fn complete(engine_reference: Arc<EngineState>, file_path: &str, location: &
             std::process::exit(1);
         });
 
-    if let Ok(location) = location.as_i64() {
-        let results = completer.complete(
+    if let Ok(location) = location.as_int() {
+        let results = completer.complete_blocking(
             &String::from_utf8_lossy(&file)[..location as usize],
             location as usize,
         );
         print!("{{\"completions\": [");
         let mut first = true;
-        for result in results {
+        for result in results.iter() {
             if !first {
                 print!(", ")
             } else {
@@ -634,6 +668,8 @@ pub fn ast(engine_state: &mut EngineState, file_path: &str) {
 
     if let Ok(contents) = file {
         let offset = working_set.next_span_start();
+        // Top-level IDE ast dump — no source location triggered this file load
+        let _ = working_set.files.push(file_path.into(), Span::unknown());
         let parsed_block = parse(&mut working_set, Some(file_path), &contents, false);
 
         let flat = flatten_block(&working_set, &parsed_block);
@@ -645,8 +681,8 @@ pub fn ast(engine_state: &mut EngineState, file_path: &str) {
                 {
                     "type": "ast",
                     "span": {
-                        "start": span.start - offset,
-                        "end": span.end - offset,
+                        "start": span.start.checked_sub(offset),
+                        "end": span.end.checked_sub(offset),
                     },
                     "shape": shape.to_string(),
                     "content": content // may not be necessary, but helpful for debugging
@@ -664,15 +700,15 @@ pub fn ast(engine_state: &mut EngineState, file_path: &str) {
 
 fn json_merge(a: &mut JsonValue, b: &JsonValue) {
     match (a, b) {
-        (JsonValue::Object(ref mut a), JsonValue::Object(b)) => {
+        (JsonValue::Object(a), JsonValue::Object(b)) => {
             for (k, v) in b {
                 json_merge(a.entry(k).or_insert(JsonValue::Null), v);
             }
         }
-        (JsonValue::Array(ref mut a), JsonValue::Array(b)) => {
+        (JsonValue::Array(a), JsonValue::Array(b)) => {
             a.extend(b.clone());
         }
-        (JsonValue::Array(ref mut a), JsonValue::Object(b)) => {
+        (JsonValue::Array(a), JsonValue::Object(b)) => {
             a.extend([JsonValue::Object(b.clone())]);
         }
         (a, b) => {

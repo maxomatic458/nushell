@@ -1,9 +1,6 @@
-use crate::database::{SQLiteDatabase, MEMORY_DB};
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    Category, Example, IntoPipelineData, PipelineData, ShellError, Signature, Span, Type, Value,
-};
+use crate::database::{MEMORY_DB, SQLiteDatabase, get_shared_mem_conn};
+use nu_engine::command_prelude::*;
+use nu_protocol::shell_error::generic::GenericError;
 
 #[derive(Clone)]
 pub struct StorReset;
@@ -15,12 +12,12 @@ impl Command for StorReset {
 
     fn signature(&self) -> Signature {
         Signature::build("stor reset")
-            .input_output_types(vec![(Type::Nothing, Type::Table(vec![]))])
+            .input_output_types(vec![(Type::Nothing, Type::table())])
             .allow_variants_without_examples(true)
             .category(Category::Database)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Reset the in-memory database by dropping all tables."
     }
 
@@ -28,7 +25,7 @@ impl Command for StorReset {
         vec!["sqlite", "remove", "table", "saving", "drop"]
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
             description: "Reset the in-memory sqlite database",
             example: "stor reset",
@@ -38,28 +35,42 @@ impl Command for StorReset {
 
     fn run(
         &self,
-        _engine_state: &EngineState,
+        engine_state: &EngineState,
         _stack: &mut Stack,
         call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let span = call.head;
 
-        // Open the in-mem database
-        let db = Box::new(SQLiteDatabase::new(std::path::Path::new(MEMORY_DB), None));
+        let conn = get_shared_mem_conn()?;
+        conn.execute("PRAGMA foreign_keys = OFF", [])
+            .map_err(|err| {
+                ShellError::Generic(GenericError::new_internal(
+                    "Failed to turn off foreign_key protections for reset",
+                    err.to_string(),
+                ))
+            })?;
+        let db = Box::new(SQLiteDatabase::new(
+            std::path::Path::new(MEMORY_DB),
+            engine_state.signals().clone(),
+        ));
+        // Always restore foreign_keys: this connection is process-global.
+        let drop_result = db.drop_all_tables(&conn);
+        let restore_result = conn.execute("PRAGMA foreign_keys = ON", []);
+        drop_result.map_err(|err| {
+            ShellError::Generic(GenericError::new_internal(
+                "Failed to drop all tables in memory from reset",
+                err.to_string(),
+            ))
+        })?;
+        restore_result.map_err(|err| {
+            ShellError::Generic(GenericError::new_internal(
+                "Failed to turn on foreign_key protections for reset",
+                err.to_string(),
+            ))
+        })?;
 
-        if let Ok(conn) = db.open_connection() {
-            db.drop_all_tables(&conn)
-                .map_err(|err| ShellError::GenericError {
-                    error: "Failed to open SQLite connection in memory from reset".into(),
-                    msg: err.to_string(),
-                    span: Some(Span::test_data()),
-                    help: None,
-                    inner: vec![],
-                })?;
-        }
-        // dbg!(db.clone());
-        Ok(Value::custom_value(db, span).into_pipeline_data())
+        Ok(Value::custom(db, span).into_pipeline_data())
     }
 }
 
@@ -68,9 +79,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(StorReset {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StorReset)
     }
 }

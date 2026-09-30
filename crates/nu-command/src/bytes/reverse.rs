@@ -1,13 +1,7 @@
-use nu_cmd_base::input_handler::{operate, CellPathOnlyArgs};
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::ast::CellPath;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::Category;
-use nu_protocol::{Example, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value};
+use nu_cmd_base::input_handler::{CellPathOnlyArgs, operate};
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
-
 pub struct BytesReverse;
 
 impl Command for BytesReverse {
@@ -19,8 +13,8 @@ impl Command for BytesReverse {
         Signature::build("bytes reverse")
             .input_output_types(vec![
                 (Type::Binary, Type::Binary),
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true)
             .rest(
@@ -31,7 +25,7 @@ impl Command for BytesReverse {
             .category(Category::Bytes)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Reverse the bytes in the pipeline."
     }
 
@@ -48,13 +42,13 @@ impl Command for BytesReverse {
     ) -> Result<PipelineData, ShellError> {
         let cell_paths: Vec<CellPath> = call.rest(engine_state, stack, 0)?;
         let arg = CellPathOnlyArgs::from(cell_paths);
-        operate(reverse, arg, input, call.head, engine_state.ctrlc.clone())
+        operate(reverse, arg, input, call.head, engine_state.signals())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Reverse bytes `0x[1F FF AA AA]`",
+                description: "Reverse bytes `0x[1F FF AA AA]`.",
                 example: "0x[1F FF AA AA] | bytes reverse",
                 result: Some(Value::binary(
                     vec![0xAA, 0xAA, 0xFF, 0x1F],
@@ -62,7 +56,7 @@ impl Command for BytesReverse {
                 )),
             },
             Example {
-                description: "Reverse bytes `0x[FF AA AA]`",
+                description: "Reverse bytes `0x[FF AA AA]`.",
                 example: "0x[FF AA AA] | bytes reverse",
                 result: Some(Value::binary(vec![0xAA, 0xAA, 0xFF], Span::test_data())),
             },
@@ -97,9 +91,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(BytesReverse {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(BytesReverse)
     }
 }

@@ -1,9 +1,5 @@
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, PipelineData, ShellError, Signature, Spanned, SyntaxShape, Type,
-};
+use nu_engine::{command_prelude::*, redirect_env};
+use nu_protocol::engine::CommandType;
 
 #[derive(Clone)]
 pub struct OverlayNew;
@@ -13,7 +9,7 @@ impl Command for OverlayNew {
         "overlay new"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Create an empty overlay."
     }
 
@@ -22,6 +18,11 @@ impl Command for OverlayNew {
             .input_output_types(vec![(Type::Nothing, Type::Nothing)])
             .allow_variants_without_examples(true)
             .required("name", SyntaxShape::String, "Name of the overlay.")
+            .switch(
+                "reload",
+                "If the overlay already exists, reload its environment.",
+                Some('r'),
+            )
             // TODO:
             // .switch(
             //     "prefix",
@@ -31,35 +32,42 @@ impl Command for OverlayNew {
             .category(Category::Core)
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"The command will first create an empty module, then add it as an overlay.
+    fn extra_description(&self) -> &str {
+        "The command will first create an empty module, then add it as an overlay.
 
 This command is a parser keyword. For details, check:
-  https://www.nushell.sh/book/thinking_in_nu.html"#
+  https://www.nushell.sh/book/thinking_in_nu.html"
     }
 
-    fn is_parser_keyword(&self) -> bool {
-        true
+    fn command_type(&self) -> CommandType {
+        CommandType::Keyword
     }
 
     fn run(
         &self,
         engine_state: &EngineState,
-        stack: &mut Stack,
+        caller_stack: &mut Stack,
         call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let name_arg: Spanned<String> = call.req(engine_state, stack, 0)?;
+        let name_arg: Spanned<String> = call.req(engine_state, caller_stack, 0)?;
+        let reload = call.has_flag(engine_state, caller_stack, "reload")?;
 
-        stack.add_overlay(name_arg.item);
+        if reload {
+            let callee_stack = caller_stack.clone();
+            caller_stack.add_overlay(name_arg.item);
+            redirect_env(engine_state, caller_stack, &callee_stack);
+        } else {
+            caller_stack.add_overlay(name_arg.item);
+        }
 
         Ok(PipelineData::empty())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
-            description: "Create an empty overlay",
-            example: r#"overlay new spam"#,
+            description: "Create an empty overlay.",
+            example: "overlay new spam",
             result: None,
         }]
     }
@@ -70,9 +78,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(OverlayNew {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(OverlayNew)
     }
 }

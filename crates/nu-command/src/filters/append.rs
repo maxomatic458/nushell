@@ -1,10 +1,4 @@
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, IntoInterruptiblePipelineData, IntoPipelineData, PipelineData, ShellError,
-    Signature, SyntaxShape, Type, Value,
-};
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
 pub struct Append;
@@ -22,30 +16,31 @@ impl Command for Append {
                 SyntaxShape::Any,
                 "The row, list, or table to append.",
             )
+            .rest("rest", SyntaxShape::Any, "Additional values to append.")
             .allow_variants_without_examples(true)
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Append any number of rows to a table."
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"Be aware that this command 'unwraps' lists passed to it. So, if you pass a variable to it,
+    fn extra_description(&self) -> &str {
+        "Be aware that this command 'unwraps' lists passed to it. So, if you pass a variable to it,
 and you want the variable's contents to be appended without being unwrapped, it's wise to
 pre-emptively wrap the variable in a list, like so: `append [$val]`. This way, `append` will
-only unwrap the outer list, and leave the variable's contents untouched."#
+only unwrap the outer list, and leave the variable's contents untouched."
     }
 
     fn search_terms(&self) -> Vec<&str> {
-        vec!["add", "concatenate"]
+        vec!["add", "concatenate", "push"]
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 example: "[0 1 2 3] | append 4",
-                description: "Append one int to a list",
+                description: "Append one int to a list.",
                 result: Some(Value::test_list(vec![
                     Value::test_int(0),
                     Value::test_int(1),
@@ -56,7 +51,7 @@ only unwrap the outer list, and leave the variable's contents untouched."#
             },
             Example {
                 example: "0 | append [1 2 3]",
-                description: "Append a list to an item",
+                description: "Append a list to an item.",
                 result: Some(Value::test_list(vec![
                     Value::test_int(0),
                     Value::test_int(1),
@@ -66,26 +61,15 @@ only unwrap the outer list, and leave the variable's contents untouched."#
             },
             Example {
                 example: r#""a" | append ["b"] "#,
-                description: "Append a list of string to a string",
+                description: "Append a list of string to a string.",
                 result: Some(Value::test_list(vec![
                     Value::test_string("a"),
                     Value::test_string("b"),
                 ])),
             },
             Example {
-                example: "[0 1] | append [2 3 4]",
-                description: "Append three int items",
-                result: Some(Value::test_list(vec![
-                    Value::test_int(0),
-                    Value::test_int(1),
-                    Value::test_int(2),
-                    Value::test_int(3),
-                    Value::test_int(4),
-                ])),
-            },
-            Example {
                 example: "[0 1] | append [2 nu 4 shell]",
-                description: "Append ints and strings",
+                description: "Append ints and strings.",
                 result: Some(Value::test_list(vec![
                     Value::test_int(0),
                     Value::test_int(1),
@@ -97,7 +81,18 @@ only unwrap the outer list, and leave the variable's contents untouched."#
             },
             Example {
                 example: "[0 1] | append 2..4",
-                description: "Append a range of ints to a list",
+                description: "Append a range of ints to a list.",
+                result: Some(Value::test_list(vec![
+                    Value::test_int(0),
+                    Value::test_int(1),
+                    Value::test_int(2),
+                    Value::test_int(3),
+                    Value::test_int(4),
+                ])),
+            },
+            Example {
+                example: "[0] | append [1 2] [3] [] 4",
+                description: "Append multiple lists and values.",
                 result: Some(Value::test_list(vec![
                     Value::test_int(0),
                     Value::test_int(1),
@@ -114,15 +109,20 @@ only unwrap the outer list, and leave the variable's contents untouched."#
         engine_state: &EngineState,
         stack: &mut Stack,
         call: &Call,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let other: Value = call.req(engine_state, stack, 0)?;
-        let metadata = input.metadata();
+        let rest: Vec<Value> = call.rest(engine_state, stack, 1)?;
+        let metadata = input.take_metadata();
 
         Ok(input
             .into_iter()
             .chain(other.into_pipeline_data())
-            .into_pipeline_data_with_metadata(metadata, engine_state.ctrlc.clone()))
+            .chain(
+                rest.into_iter()
+                    .flat_map(|value| value.into_pipeline_data()),
+            )
+            .into_pipeline_data_with_metadata(call.head, engine_state.signals().clone(), metadata))
     }
 }
 
@@ -131,9 +131,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Append {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Append)
     }
 }

@@ -1,15 +1,16 @@
-use nu_protocol::{
-    ast::{MatchPattern, Pattern},
-    engine::StateWorkingSet,
-    ParseError, Span, SyntaxShape, Type, VarId,
-};
+#![allow(clippy::byte_char_slices)]
 
 use crate::{
-    lex, lite_parse,
-    parser::{is_variable, parse_value},
-    LiteElement,
+    TokenContents, lex, lite_parse,
+    parse_helpers::is_variable,
+    parser::{ensure_not_reserved_variable_name, parse_value},
 };
-
+use nu_protocol::{
+    ParseError, Span, SyntaxShape, Type, VarId,
+    ast::{Expr, MatchPattern, Pattern},
+    engine::StateWorkingSet,
+    eval_const::eval_constant,
+};
 pub fn garbage(span: Span) -> MatchPattern {
     MatchPattern {
         pattern: Pattern::Garbage,
@@ -37,13 +38,34 @@ pub fn parse_pattern(working_set: &mut StateWorkingSet, span: Span) -> MatchPatt
             span,
         }
     } else {
-        // Literal value
-        let value = parse_value(working_set, span, &SyntaxShape::Any);
+        // Literal / expression pattern (including parenthesized const expressions).
+        // `parse_value` already routes `(` through `parse_paren_expr`.
+        parse_value_pattern(working_set, span)
+    }
+}
 
-        MatchPattern {
-            pattern: Pattern::Value(value),
+/// Parse a non-structural match pattern and const-evaluate it to [`Pattern::Value`].
+///
+/// Parenthesized expressions, bare literals, and ranges all go through the normal value
+/// parser, then `eval_constant`. Non-constant expressions become parse errors rather than
+/// silently failing to match at runtime.
+fn parse_value_pattern(working_set: &mut StateWorkingSet, span: Span) -> MatchPattern {
+    let expr = parse_value(working_set, span, &SyntaxShape::Any, None);
+
+    // Avoid stacking a const-eval error on top of an existing parse failure.
+    if matches!(expr.expr, Expr::Garbage) {
+        return garbage(span);
+    }
+
+    match eval_constant(working_set, &expr) {
+        Ok(val) => MatchPattern {
+            pattern: Pattern::Value(val),
             guard: None,
             span,
+        },
+        Err(e) => {
+            working_set.error(e.wrap(working_set, span));
+            garbage(span)
         }
     }
 }
@@ -55,8 +77,10 @@ fn parse_variable_pattern_helper(working_set: &mut StateWorkingSet, span: Span) 
         if let Some(var_id) = working_set.find_variable_in_current_frame(bytes) {
             Some(var_id)
         } else {
-            let var_id = working_set.add_variable(bytes.to_vec(), span, Type::Any, false);
+            let name = bytes.to_vec();
+            ensure_not_reserved_variable_name(working_set, &name, span);
 
+            let var_id = working_set.add_variable(name, span, Type::Any, false);
             Some(var_id)
         }
     } else {
@@ -89,7 +113,8 @@ pub fn parse_list_pattern(working_set: &mut StateWorkingSet, span: Span) -> Matc
     if bytes.ends_with(b"]") {
         end -= 1;
     } else {
-        working_set.error(ParseError::Unclosed("]".into(), Span::new(end, end)));
+        let open = ParseError::opener_span(span, 1);
+        working_set.error(ParseError::unclosed("]", open, Span::new(end, end)));
     }
 
     let inner_span = Span::new(start, end);
@@ -100,7 +125,19 @@ pub fn parse_list_pattern(working_set: &mut StateWorkingSet, span: Span) -> Matc
         working_set.error(err);
     }
 
-    let (output, err) = lite_parse(&output);
+    if let Some(token) = output
+        .iter()
+        .find(|token| token.contents == TokenContents::Semicolon)
+    {
+        working_set.error(ParseError::LabeledErrorWithHelp {
+            error: "Unexpected semicolon in list pattern".into(),
+            label: "not a valid list separator".into(),
+            help: "Use commas or whitespace to separate list items.".into(),
+            span: token.span,
+        });
+    }
+
+    let (output, err) = lite_parse(&output, working_set);
     if let Some(err) = err {
         working_set.error(err);
     }
@@ -108,48 +145,46 @@ pub fn parse_list_pattern(working_set: &mut StateWorkingSet, span: Span) -> Matc
     let mut args = vec![];
 
     if !output.block.is_empty() {
-        for arg in &output.block[0].commands {
+        for command in &output.block[0].commands {
             let mut spans_idx = 0;
 
-            if let LiteElement::Command(_, command) = arg {
-                while spans_idx < command.parts.len() {
-                    let contents = working_set.get_span_contents(command.parts[spans_idx]);
-                    if contents == b".." {
+            while spans_idx < command.parts.len() {
+                let contents = working_set.get_span_contents(command.parts[spans_idx]);
+                if contents == b".." {
+                    args.push(MatchPattern {
+                        pattern: Pattern::IgnoreRest,
+                        guard: None,
+                        span: command.parts[spans_idx],
+                    });
+                    break;
+                } else if contents.starts_with(b"..$") {
+                    if let Some(var_id) = parse_variable_pattern_helper(
+                        working_set,
+                        Span::new(
+                            command.parts[spans_idx].start + 2,
+                            command.parts[spans_idx].end,
+                        ),
+                    ) {
                         args.push(MatchPattern {
-                            pattern: Pattern::IgnoreRest,
+                            pattern: Pattern::Rest(var_id),
                             guard: None,
                             span: command.parts[spans_idx],
                         });
                         break;
-                    } else if contents.starts_with(b"..$") {
-                        if let Some(var_id) = parse_variable_pattern_helper(
-                            working_set,
-                            Span::new(
-                                command.parts[spans_idx].start + 2,
-                                command.parts[spans_idx].end,
-                            ),
-                        ) {
-                            args.push(MatchPattern {
-                                pattern: Pattern::Rest(var_id),
-                                guard: None,
-                                span: command.parts[spans_idx],
-                            });
-                            break;
-                        } else {
-                            args.push(garbage(command.parts[spans_idx]));
-                            working_set.error(ParseError::Expected(
-                                "valid variable name",
-                                command.parts[spans_idx],
-                            ));
-                        }
                     } else {
-                        let arg = parse_pattern(working_set, command.parts[spans_idx]);
+                        args.push(garbage(command.parts[spans_idx]));
+                        working_set.error(ParseError::Expected(
+                            "valid variable name",
+                            command.parts[spans_idx],
+                        ));
+                    }
+                } else {
+                    let arg = parse_pattern(working_set, command.parts[spans_idx]);
 
-                        args.push(arg);
-                    };
+                    args.push(arg);
+                };
 
-                    spans_idx += 1;
-                }
+                spans_idx += 1;
             }
         }
     }
@@ -177,7 +212,8 @@ pub fn parse_record_pattern(working_set: &mut StateWorkingSet, span: Span) -> Ma
     if bytes.ends_with(b"}") {
         end -= 1;
     } else {
-        working_set.error(ParseError::Unclosed("}".into(), Span::new(end, end)));
+        let open = ParseError::opener_span(span, 1);
+        working_set.error(ParseError::unclosed("}", open, Span::new(end, end)));
     }
 
     let inner_span = Span::new(start, end);

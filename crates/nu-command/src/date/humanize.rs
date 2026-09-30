@@ -1,13 +1,11 @@
 use crate::date::utils::parse_date_from_string;
 use chrono::{DateTime, FixedOffset, Local};
-use chrono_humanize::HumanTime;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{Category, Example, PipelineData, ShellError, Signature, Span, Type, Value};
-#[derive(Clone)]
-pub struct SubCommand;
+use nu_engine::command_prelude::*;
 
-impl Command for SubCommand {
+#[derive(Clone)]
+pub struct DateHumanize;
+
+impl Command for DateHumanize {
     fn name(&self) -> &str {
         "date humanize"
     }
@@ -17,12 +15,20 @@ impl Command for SubCommand {
             .input_output_types(vec![
                 (Type::Date, Type::String),
                 (Type::String, Type::String),
+                (
+                    Type::List(Box::new(Type::Date)),
+                    Type::List(Box::new(Type::String)),
+                ),
+                (
+                    Type::List(Box::new(Type::String)),
+                    Type::List(Box::new(Type::String)),
+                ),
             ])
             .allow_variants_without_examples(true)
             .category(Category::Date)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Print a 'humanized' format for the date, relative to now."
     }
 
@@ -48,18 +54,30 @@ impl Command for SubCommand {
     ) -> Result<PipelineData, ShellError> {
         let head = call.head;
         // This doesn't match explicit nulls
-        if matches!(input, PipelineData::Empty) {
+        if let PipelineData::Empty = input {
             return Err(ShellError::PipelineEmpty { dst_span: head });
         }
-        input.map(move |value| helper(value, head), engine_state.ctrlc.clone())
+        input.map(move |value| helper(value, head), engine_state.signals())
     }
 
-    fn examples(&self) -> Vec<Example> {
-        vec![Example {
-            description: "Print a 'humanized' format for the date, relative to now.",
-            example: r#""2021-10-22 20:00:12 +01:00" | date humanize"#,
-            result: None,
-        }]
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![
+            Example {
+                description: "Print a 'humanized' format for the date, relative to now.",
+                example: r#""2021-10-22 20:00:12 +01:00" | date humanize"#,
+                result: None,
+            },
+            Example {
+                description: "Humanize a list of datetimes.",
+                example: "[2021-10-22T20:00:12+01:00, 2021-10-23T20:00:00+01:00] | date humanize",
+                result: None,
+            },
+            Example {
+                description: "Humanize a list of date strings.",
+                example: r#"["2021-10-22 20:00:12 +01:00", "2021-10-22 21:00:00 +01:00"] | date humanize"#,
+                result: None,
+            },
+        ]
     }
 }
 
@@ -79,9 +97,11 @@ fn helper(value: Value, head: Span) -> Value {
         }
         Value::Date { val, .. } => Value::string(humanize_date(val), head),
         _ => Value::error(
-            ShellError::DatetimeParseError {
-                msg: value.debug_value(),
-                span: head,
+            ShellError::OnlySupportsThisInputType {
+                exp_input_type: "date, string (that represents datetime), or nothing".into(),
+                wrong_type: value.get_type().to_string(),
+                dst_span: head,
+                src_span: span,
             },
             head,
         ),
@@ -89,7 +109,7 @@ fn helper(value: Value, head: Span) -> Value {
 }
 
 fn humanize_date(dt: DateTime<FixedOffset>) -> String {
-    HumanTime::from(dt).to_string()
+    nu_protocol::human_time_from_now(&dt).to_string()
 }
 
 #[cfg(test)]
@@ -97,9 +117,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(DateHumanize)
     }
 }

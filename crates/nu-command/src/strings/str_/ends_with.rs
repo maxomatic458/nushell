@@ -1,10 +1,6 @@
-use nu_cmd_base::input_handler::{operate, CmdArgument};
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::ast::CellPath;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::Category;
-use nu_protocol::{Example, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value};
+use nu_cmd_base::input_handler::{CmdArgument, operate};
+use nu_engine::command_prelude::*;
+
 use nu_utils::IgnoreCaseExt;
 
 struct Arguments {
@@ -20,9 +16,9 @@ impl CmdArgument for Arguments {
 }
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct StrEndswith;
 
-impl Command for SubCommand {
+impl Command for StrEndswith {
     fn name(&self) -> &str {
         "str ends-with"
     }
@@ -32,8 +28,8 @@ impl Command for SubCommand {
             .input_output_types(vec![
                 (Type::String, Type::Bool),
                 (Type::List(Box::new(Type::String)), Type::List(Box::new(Type::Bool))),
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true)
             .required("string", SyntaxShape::String, "The string to match.")
@@ -42,16 +38,20 @@ impl Command for SubCommand {
                 SyntaxShape::CellPath,
                 "For a data structure input, check strings at the given cell paths, and replace with result.",
             )
-            .switch("ignore-case", "search is case insensitive", Some('i'))
+            .switch("ignore-case", "Search is case insensitive.", Some('i'))
             .category(Category::Strings)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Check if an input ends with a string."
     }
 
     fn search_terms(&self) -> Vec<&str> {
         vec!["suffix", "match", "find", "search"]
+    }
+
+    fn is_const(&self) -> bool {
+        true
     }
 
     fn run(
@@ -68,18 +68,41 @@ impl Command for SubCommand {
             cell_paths,
             case_insensitive: call.has_flag(engine_state, stack, "ignore-case")?,
         };
-        operate(action, args, input, call.head, engine_state.ctrlc.clone())
+        operate(action, args, input, call.head, engine_state.signals())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn run_const(
+        &self,
+        working_set: &StateWorkingSet,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let cell_paths: Vec<CellPath> = call.rest_const(working_set, stack, 1)?;
+        let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
+        let args = Arguments {
+            substring: call.req_const::<String>(working_set, stack, 0)?,
+            cell_paths,
+            case_insensitive: call.has_flag_const(working_set, stack, "ignore-case")?,
+        };
+        operate(
+            action,
+            args,
+            input,
+            call.head,
+            working_set.permanent().signals(),
+        )
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Checks if string ends with '.rb'",
+                description: "Checks if string ends with '.rb'.",
                 example: "'my_library.rb' | str ends-with '.rb'",
                 result: Some(Value::test_bool(true)),
             },
             Example {
-                description: "Checks if strings end with '.txt'",
+                description: "Checks if strings end with '.txt'.",
                 example: "['my_library.rb', 'README.txt'] | str ends-with '.txt'",
                 result: Some(Value::test_list(vec![
                     Value::test_bool(false),
@@ -87,7 +110,7 @@ impl Command for SubCommand {
                 ])),
             },
             Example {
-                description: "Checks if string ends with '.RB', case-insensitive",
+                description: "Checks if string ends with '.RB', case-insensitive.",
                 example: "'my_library.rb' | str ends-with --ignore-case '.RB'",
                 result: Some(Value::test_bool(true)),
             },
@@ -124,9 +147,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StrEndswith)
     }
 }

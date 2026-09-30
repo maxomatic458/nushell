@@ -1,10 +1,7 @@
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, IntoPipelineData, PipelineData, ShellError, Signature, Span, Spanned,
-    SyntaxShape, Type, Value,
-};
+use std::{borrow::Cow, ops::Deref};
+
+use nu_engine::{ClosureEval, command_prelude::*};
+use nu_protocol::{ListStream, ReportMode, ShellWarning, Signals, report_shell_warning};
 
 #[derive(Clone)]
 pub struct Default;
@@ -17,23 +14,27 @@ impl Command for Default {
     fn signature(&self) -> Signature {
         Signature::build("default")
             // TODO: Give more specific type signature?
-            // TODO: Declare usage of cell paths in signature? (It seems to behave as if it uses cell paths)
             .input_output_types(vec![(Type::Any, Type::Any)])
             .required(
                 "default value",
                 SyntaxShape::Any,
                 "The value to use as a default.",
             )
-            .optional(
+            .rest(
                 "column name",
-                SyntaxShape::String,
-                "The name of the column.",
+                SyntaxShape::CellPath,
+                "The name (or cell path) of the column.",
+            )
+            .switch(
+                "empty",
+                "Also replace empty items like \"\", {}, and [].",
+                Some('e'),
             )
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
-        "Sets a default row's column if missing."
+    fn description(&self) -> &str {
+        "Sets a default value if a row's column is missing or null."
     }
 
     fn run(
@@ -43,10 +44,24 @@ impl Command for Default {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        default(engine_state, stack, call, input)
+        let default_value: Value = call.req(engine_state, stack, 0)?;
+        let columns: Vec<CellPath> = call.rest(engine_state, stack, 1)?;
+        let empty = call.has_flag(engine_state, stack, "empty")?;
+
+        let default_value = DefaultValue::new(engine_state, stack, default_value);
+
+        default(
+            engine_state,
+            call,
+            input,
+            default_value,
+            empty,
+            columns,
+            engine_state.signals(),
+        )
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "Give a default 'target' column to all file entries",
@@ -54,14 +69,13 @@ impl Command for Default {
                 result: None,
             },
             Example {
-                description:
-                    "Get the env value of `MY_ENV` with a default value 'abc' if not present",
-                example: "$env | get --ignore-errors MY_ENV | default 'abc'",
-                result: None, // Some(Value::test_string("abc")),
+                description: "Get the env value of `MY_ENV` with a default value 'abc' if not present",
+                example: "$env | get --optional MY_ENV | default 'abc'",
+                result: Some(Value::test_string("abc")),
             },
             Example {
                 description: "Replace the `null` value in a list",
-                example: "[1, 2, null, 4] | default 3",
+                example: "[1, 2, null, 4] | each { default 3 }",
                 result: Some(Value::list(
                     vec![
                         Value::test_int(1),
@@ -72,66 +86,272 @@ impl Command for Default {
                     Span::test_data(),
                 )),
             },
+            Example {
+                description: r#"Replace the missing value in the "a" column of a list"#,
+                example: "[{a:1 b:2} {b:1}] | default 'N/A' a",
+                result: Some(Value::test_list(vec![
+                    Value::test_record(record! {
+                        "a" => Value::test_int(1),
+                        "b" => Value::test_int(2),
+                    }),
+                    Value::test_record(record! {
+                        "a" => Value::test_string("N/A"),
+                        "b" => Value::test_int(1),
+                    }),
+                ])),
+            },
+            Example {
+                description: r#"Replace the empty string in the "a" column of a list"#,
+                example: "[{a:1 b:2} {a:'' b:1}] | default -e 'N/A' a",
+                result: Some(Value::test_list(vec![
+                    Value::test_record(record! {
+                        "a" => Value::test_int(1),
+                        "b" => Value::test_int(2),
+                    }),
+                    Value::test_record(record! {
+                        "a" => Value::test_string("N/A"),
+                        "b" => Value::test_int(1),
+                    }),
+                ])),
+            },
+            Example {
+                description: "Fill a missing nested value using a cell path",
+                example: "{a: {b: 1}} | default 2 a.c",
+                result: Some(Value::test_record(record! {
+                    "a" => Value::test_record(record! {
+                        "b" => Value::test_int(1),
+                        "c" => Value::test_int(2),
+                    }),
+                })),
+            },
+            Example {
+                description: "Generate a default value from a closure",
+                example: "null | default { 1 + 2 }",
+                result: Some(Value::test_int(3)),
+            },
+            Example {
+                description: "Fill missing column values based on other columns",
+                example: "[{a:1 b:2} {b:1}] | upsert a {|rc| default { $rc.b + 1 } }",
+                result: Some(Value::test_list(vec![
+                    Value::test_record(record! {
+                        "a" => Value::test_int(1),
+                        "b" => Value::test_int(2),
+                    }),
+                    Value::test_record(record! {
+                        "a" => Value::test_int(2),
+                        "b" => Value::test_int(1),
+                    }),
+                ])),
+            },
         ]
     }
 }
 
 fn default(
     engine_state: &EngineState,
-    stack: &mut Stack,
     call: &Call,
     input: PipelineData,
+    mut default_value: DefaultValue,
+    default_when_empty: bool,
+    columns: Vec<CellPath>,
+    signals: &Signals,
 ) -> Result<PipelineData, ShellError> {
-    let metadata = input.metadata();
-    let value: Value = call.req(engine_state, stack, 0)?;
-    let column: Option<Spanned<String>> = call.opt(engine_state, stack, 1)?;
-
-    let ctrlc = engine_state.ctrlc.clone();
-
-    if let Some(column) = column {
-        input
-            .map(
-                move |item| {
-                    let span = item.span();
-                    match item {
-                        Value::Record {
-                            val: mut record, ..
-                        } => {
-                            let mut found = false;
-
-                            for (col, val) in record.iter_mut() {
-                                if *col == column.item {
-                                    found = true;
-                                    if matches!(val, Value::Nothing { .. }) {
-                                        *val = value.clone();
-                                    }
-                                }
-                            }
-
-                            if !found {
-                                record.push(column.item.clone(), value.clone());
-                            }
-
-                            Value::record(record, span)
-                        }
-                        _ => item,
-                    }
-                },
-                ctrlc,
-            )
-            .map(|x| x.set_metadata(metadata))
-    } else if input.is_nothing() {
-        Ok(value.into_pipeline_data())
+    let mut input = if !columns.is_empty() {
+        input.into_stream_or_original(engine_state)
     } else {
         input
-            .map(
-                move |item| match item {
-                    Value::Nothing { .. } => value.clone(),
-                    x => x,
-                },
-                ctrlc,
+    };
+
+    let input_span = input.span().unwrap_or(call.head);
+    let metadata = input.take_metadata();
+
+    // If user supplies columns, check if input is a record or list of records
+    // and set the default value for the specified record columns
+    if !columns.is_empty() {
+        if let PipelineData::Value(Value::Record { .. }, _) = input {
+            let record = input.into_value(input_span)?;
+            fill_record(
+                record,
+                &mut default_value,
+                columns.as_slice(),
+                default_when_empty,
             )
-            .map(|x| x.set_metadata(metadata))
+            .map(|x| x.into_pipeline_data_with_metadata(metadata))
+        } else if matches!(
+            input,
+            PipelineData::ListStream(..) | PipelineData::Value(Value::List { .. }, _)
+        ) {
+            // Potential enhancement: add another branch for Value::List,
+            // and collect the iterator into a Result<Value::List, ShellError>
+            // so we can preemptively return an error for collected lists
+            let head = call.head;
+            Ok(input
+                .into_iter()
+                .map(move |item| {
+                    if item.as_record().is_ok() {
+                        fill_record(
+                            item,
+                            &mut default_value,
+                            columns.as_slice(),
+                            default_when_empty,
+                        )
+                        .unwrap_or_else(|err| Value::error(err, head))
+                    } else {
+                        item
+                    }
+                })
+                .into_pipeline_data_with_metadata(head, signals.clone(), metadata))
+        // If columns are given, but input does not use columns, return an error
+        } else {
+            Err(ShellError::PipelineMismatch {
+                exp_input_type: "record, table".to_string(),
+                dst_span: input_span,
+                src_span: input_span,
+            })
+        }
+    // Otherwise, if no column name is given, check if value is null
+    // or an empty string, list, or record when --empty is passed
+    } else if input.is_nothing()
+        || (default_when_empty
+            && matches!(input, PipelineData::Value(ref value, _) if value.is_empty()))
+    {
+        default_value.single_run_pipeline_data()
+    } else if default_when_empty && matches!(input, PipelineData::ListStream(..)) {
+        let PipelineData::ListStream(ls, _) = input else {
+            unreachable!()
+        };
+        let span = ls.span();
+        let mut stream = ls.into_inner().peekable();
+        if stream.peek().is_none() {
+            return default_value.single_run_pipeline_data();
+        }
+
+        // stream's internal state already preserves the original signals config, so if this
+        // Signals::empty list stream gets interrupted it will be caught by the underlying iterator
+        let ls = ListStream::new(stream, span, Signals::empty());
+        Ok(PipelineData::list_stream(ls, metadata))
+    // Otherwise, return the input as is
+    } else {
+        Ok(input.set_metadata(metadata))
+    }
+}
+
+/// A wrapper around the default value to handle closures and caching values
+enum DefaultValue {
+    Uncalculated(Box<Spanned<ClosureEval>>),
+    Calculated(Value),
+}
+
+impl DefaultValue {
+    fn new(engine_state: &EngineState, stack: &Stack, value: Value) -> Self {
+        let span = value.span();
+
+        // FIXME temporary workaround to warn people of breaking change from #15654.
+        // Detects closures passed via `$var` by checking whether the value span's source starts
+        // with `$` (no AST required under IR).
+        let value = match closure_variable_warning(stack, engine_state, value) {
+            Ok(val) => val,
+            Err(default_value) => return default_value,
+        };
+
+        match value {
+            Value::Closure { val, .. } => {
+                let closure_eval = ClosureEval::new(engine_state, stack, *val);
+                DefaultValue::Uncalculated(Box::new(closure_eval.into_spanned(span)))
+            }
+            _ => DefaultValue::Calculated(value),
+        }
+    }
+
+    fn value(&mut self) -> Result<Value, ShellError> {
+        match self {
+            DefaultValue::Uncalculated(closure) => {
+                let value = closure
+                    .item
+                    .run_with_input(PipelineData::empty())?
+                    .into_value(closure.span)?;
+                *self = DefaultValue::Calculated(value.clone());
+                Ok(value)
+            }
+            DefaultValue::Calculated(value) => Ok(value.clone()),
+        }
+    }
+
+    /// Used when we know the value won't need to be cached to allow streaming.
+    fn single_run_pipeline_data(self) -> Result<PipelineData, ShellError> {
+        match self {
+            DefaultValue::Uncalculated(mut closure) => {
+                closure.item.run_with_input(PipelineData::empty())
+            }
+            DefaultValue::Calculated(val) => Ok(val.into_pipeline_data()),
+        }
+    }
+}
+
+/// Given a record, fill missing (or null, or empty with `--empty`) cell paths with a default value.
+///
+/// Each column is a full cell path, so `default 5 a.b` fills the nested field `b` inside `a`
+/// rather than adding a literal `"a.b"` key. Intermediate records are created on demand,
+/// following the same rules as `upsert`.
+fn fill_record(
+    mut record: Value,
+    default_value: &mut DefaultValue,
+    columns: &[CellPath],
+    empty: bool,
+) -> Result<Value, ShellError> {
+    for col in columns {
+        let needs_default = match record.follow_cell_path(&col.members) {
+            Ok(val) => val.is_nothing() || (empty && val.is_empty()),
+            // The path does not exist yet: `upsert` creates it, or reports the real
+            // problem (for example trying to index into a scalar).
+            Err(_) => true,
+        };
+        if needs_default {
+            record.upsert_data_at_cell_path(&col.members, default_value.value()?)?;
+        }
+    }
+    Ok(record)
+}
+
+fn closure_variable_warning(
+    stack: &Stack,
+    engine_state: &EngineState,
+    value: Value,
+) -> Result<Value, DefaultValue> {
+    let span = value.span();
+    // Closures passed as `$var` keep a use-site span whose source starts with `$`.
+    // Closure literals use the block span (starts with `{`).
+    let from_variable = matches!(value, Value::Closure { .. })
+        && engine_state.get_span_contents(span).starts_with(b"$");
+
+    if from_variable {
+        let span_contents = String::from_utf8_lossy(engine_state.get_span_contents(span));
+        let carapace_suggestion = "re-run carapace init with version v1.3.3 or later\nor, change this to `{ $carapace_completer }`";
+        let label = match span_contents {
+            Cow::Borrowed("$carapace_completer") => carapace_suggestion.to_string(),
+            Cow::Owned(s) if s.deref() == "$carapace_completer" => carapace_suggestion.to_string(),
+            _ => format!("change this to {{ {span_contents} }}").to_string(),
+        };
+
+        report_shell_warning(
+            Some(stack),
+            engine_state,
+            &ShellWarning::Deprecated {
+                dep_type: "Behavior".to_string(),
+                label,
+                span,
+                help: Some(
+                    "Since 0.105.0, closure literals passed to default are lazily evaluated, rather than returned as a value.
+In a future release, closures passed by variable will also be lazily evaluated.".to_string(),
+                ),
+                report_mode: ReportMode::FirstUse,
+            },
+        );
+
+        // bypass the normal DefaultValue::new logic
+        Err(DefaultValue::Calculated(value))
+    } else {
+        Ok(value)
     }
 }
 
@@ -140,9 +360,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Default {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Default)
     }
 }

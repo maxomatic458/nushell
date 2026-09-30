@@ -1,10 +1,5 @@
-use nu_cmd_base::input_handler::{operate, CmdArgument};
-use nu_engine::CallExt;
-use nu_protocol::ast::{Call, CellPath};
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value,
-};
+use nu_cmd_base::input_handler::{CmdArgument, operate};
+use nu_engine::command_prelude::*;
 
 struct Arguments {
     pattern: Vec<u8>,
@@ -33,8 +28,8 @@ impl Command for BytesIndexOf {
                 (Type::Binary, Type::Any),
                 // FIXME: this shouldn't be needed, cell paths should work with the two
                 // above
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true)
             .required(
@@ -47,12 +42,12 @@ impl Command for BytesIndexOf {
                 SyntaxShape::CellPath,
                 "For a data structure input, find the indexes at the given cell paths.",
             )
-            .switch("all", "returns all matched index", Some('a'))
-            .switch("end", "search from the end of the binary", Some('e'))
+            .switch("all", "Returns all matched indices.", Some('a'))
+            .switch("end", "Search from the end of the binary.", Some('e'))
             .category(Category::Bytes)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Returns start index of first occurrence of pattern in bytes, or -1 if no match."
     }
 
@@ -67,32 +62,41 @@ impl Command for BytesIndexOf {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let pattern: Vec<u8> = call.req(engine_state, stack, 0)?;
+        let pattern: Spanned<Vec<u8>> = call.req(engine_state, stack, 0)?;
         let cell_paths: Vec<CellPath> = call.rest(engine_state, stack, 1)?;
         let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
+
+        if pattern.item.is_empty() {
+            return Err(ShellError::TypeMismatch {
+                err_message: "the pattern to find cannot be empty".to_string(),
+                span: pattern.span,
+            });
+        }
+
         let arg = Arguments {
-            pattern,
+            pattern: pattern.item,
             end: call.has_flag(engine_state, stack, "end")?,
             all: call.has_flag(engine_state, stack, "all")?,
             cell_paths,
         };
-        operate(index_of, arg, input, call.head, engine_state.ctrlc.clone())
+
+        operate(index_of, arg, input, call.head, engine_state.signals())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Returns index of pattern in bytes",
+                description: "Returns index of pattern in bytes.",
                 example: " 0x[33 44 55 10 01 13 44 55] | bytes index-of 0x[44 55]",
                 result: Some(Value::test_int(1)),
             },
             Example {
-                description: "Returns index of pattern, search from end",
+                description: "Returns index of pattern, search from end.",
                 example: " 0x[33 44 55 10 01 13 44 55] | bytes index-of --end 0x[44 55]",
                 result: Some(Value::test_int(6)),
             },
             Example {
-                description: "Returns all matched index",
+                description: "Returns all matched index.",
                 example: " 0x[33 44 55 10 01 33 44 33 44] | bytes index-of --all 0x[33 44]",
                 result: Some(Value::test_list(vec![
                     Value::test_int(0),
@@ -101,7 +105,7 @@ impl Command for BytesIndexOf {
                 ])),
             },
             Example {
-                description: "Returns all matched index, searching from end",
+                description: "Returns all matched index, searching from end.",
                 example: " 0x[33 44 55 10 01 33 44 33 44] | bytes index-of --all --end 0x[33 44]",
                 result: Some(Value::test_list(vec![
                     Value::test_int(7),
@@ -110,8 +114,8 @@ impl Command for BytesIndexOf {
                 ])),
             },
             Example {
-                description: "Returns index of pattern for specific column",
-                example: r#" [[ColA ColB ColC]; [0x[11 12 13] 0x[14 15 16] 0x[17 18 19]]] | bytes index-of 0x[11] ColA ColC"#,
+                description: "Returns index of pattern for specific column.",
+                example: " [[ColA ColB ColC]; [0x[11 12 13] 0x[14 15 16] 0x[17 18 19]]] | bytes index-of 0x[11] ColA ColC",
                 result: Some(Value::test_list(vec![Value::test_record(record! {
                     "ColA" => Value::test_int(0),
                     "ColB" => Value::binary(vec![0x14, 0x15, 0x16], Span::test_data()),
@@ -208,9 +212,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(BytesIndexOf {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(BytesIndexOf)
     }
 }

@@ -1,11 +1,5 @@
-use nu_engine::column::get_columns;
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, IntoInterruptiblePipelineData, PipelineData, Record, ShellError,
-    Signature, Spanned, SyntaxShape, Type, Value,
-};
+use nu_engine::{column::get_columns, command_prelude::*};
+use nu_protocol::shell_error::generic::GenericError;
 
 #[derive(Clone)]
 pub struct Transpose;
@@ -27,32 +21,32 @@ impl Command for Transpose {
     fn signature(&self) -> Signature {
         Signature::build("transpose")
             .input_output_types(vec![
-                (Type::Table(vec![]), Type::Any),
-                (Type::Record(vec![]), Type::Table(vec![])),
+                (Type::table(), Type::Any),
+                (Type::record(), Type::table()),
             ])
             .switch(
                 "header-row",
-                "treat the first row as column names",
+                "Use the first input column as the table header-row (or keynames when combined with --as-record).",
                 Some('r'),
             )
             .switch(
                 "ignore-titles",
-                "don't transpose the column names into values",
+                "Don't transpose the column names into values.",
                 Some('i'),
             )
             .switch(
                 "as-record",
-                "transfer to record if the result is a table and contains only one row",
+                "Transfer to record if the result is a table and contains only one row.",
                 Some('d'),
             )
             .switch(
                 "keep-last",
-                "on repetition of record fields due to `header-row`, keep the last value obtained",
+                "On repetition of record fields due to `header-row`, keep the last value obtained.",
                 Some('l'),
             )
             .switch(
                 "keep-all",
-                "on repetition of record fields due to `header-row`, keep all the values obtained",
+                "On repetition of record fields due to `header-row`, keep all the values obtained.",
                 Some('a'),
             )
             .allow_variants_without_examples(true)
@@ -64,7 +58,7 @@ impl Command for Transpose {
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Transposes the table contents so rows become columns and columns become rows."
     }
 
@@ -82,10 +76,10 @@ impl Command for Transpose {
         transpose(engine_state, stack, call, input)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Transposes the table contents with default column names",
+                description: "Transposes the table contents with default column names.",
                 example: "[[c1 c2]; [1 2]] | transpose",
                 result: Some(Value::test_list(vec![
                     Value::test_record(record! {
@@ -99,7 +93,7 @@ impl Command for Transpose {
                 ])),
             },
             Example {
-                description: "Transposes the table contents with specified column names",
+                description: "Transposes the table contents with specified column names.",
                 example: "[[c1 c2]; [1 2]] | transpose key val",
                 result: Some(Value::test_list(vec![
                     Value::test_record(record! {
@@ -113,8 +107,7 @@ impl Command for Transpose {
                 ])),
             },
             Example {
-                description:
-                    "Transposes the table without column names and specify a new column name",
+                description: "Transposes the table without column names and specify a new column name.",
                 example: "[[c1 c2]; [1 2]] | transpose --ignore-titles val",
                 result: Some(Value::test_list(vec![
                     Value::test_record(record! {
@@ -126,7 +119,7 @@ impl Command for Transpose {
                 ])),
             },
             Example {
-                description: "Transfer back to record with -d flag",
+                description: "Transfer back to record with -d flag.",
                 example: "{c1: 1, c2: 2} | transpose | transpose --ignore-titles -r -d",
                 result: Some(Value::test_record(record! {
                     "c1" =>  Value::test_int(1),
@@ -141,7 +134,7 @@ pub fn transpose(
     engine_state: &EngineState,
     stack: &mut Stack,
     call: &Call,
-    input: PipelineData,
+    mut input: PipelineData,
 ) -> Result<PipelineData, ShellError> {
     let name = call.head;
     let args = TransposeArgs {
@@ -156,33 +149,50 @@ pub fn transpose(
     if !args.rest.is_empty() && args.header_row {
         return Err(ShellError::IncompatibleParametersSingle {
             msg: "Can not provide header names and use `--header-row`".into(),
-            span: call.get_named_arg("header-row").expect("has flag").span,
+            span: call.get_flag_span(stack, "header-row").expect("has flag"),
         });
     }
     if !args.header_row && args.keep_all {
         return Err(ShellError::IncompatibleParametersSingle {
             msg: "Can only be used with `--header-row`(`-r`)".into(),
-            span: call.get_named_arg("keep-all").expect("has flag").span,
+            span: call.get_flag_span(stack, "keep-all").expect("has flag"),
         });
     }
     if !args.header_row && args.keep_last {
         return Err(ShellError::IncompatibleParametersSingle {
             msg: "Can only be used with `--header-row`(`-r`)".into(),
-            span: call.get_named_arg("keep-last").expect("has flag").span,
+            span: call.get_flag_span(stack, "keep-last").expect("has flag"),
         });
     }
     if args.keep_all && args.keep_last {
         return Err(ShellError::IncompatibleParameters {
             left_message: "can't use `--keep-last` at the same time".into(),
-            left_span: call.get_named_arg("keep-last").expect("has flag").span,
+            left_span: call.get_flag_span(stack, "keep-last").expect("has flag"),
             right_message: "because of `--keep-all`".into(),
-            right_span: call.get_named_arg("keep-all").expect("has flag").span,
+            right_span: call.get_flag_span(stack, "keep-all").expect("has flag"),
         });
     }
 
-    let ctrlc = engine_state.ctrlc.clone();
-    let metadata = input.metadata();
+    let metadata = input.take_metadata();
     let input: Vec<_> = input.into_iter().collect();
+
+    // Ensure error values are propagated and non-record values are rejected
+    for value in input.iter() {
+        match value {
+            Value::Error { .. } => {
+                return Ok(value.clone().into_pipeline_data_with_metadata(metadata));
+            }
+            Value::Record { .. } => {} // go on, this is what we're looking for
+            _ => {
+                return Err(ShellError::OnlySupportsThisInputType {
+                    exp_input_type: "table or record".into(),
+                    wrong_type: "list<any>".into(),
+                    dst_span: call.head,
+                    src_span: value.span(),
+                });
+            }
+        }
+    }
 
     let descs = get_columns(&input);
 
@@ -193,36 +203,30 @@ pub fn transpose(
             if let Some(desc) = descs.first() {
                 match &i.get_data_by_key(desc) {
                     Some(x) => {
-                        if let Ok(s) = x.as_string() {
-                            headers.push(s.to_string());
+                        if let Ok(s) = x.coerce_string() {
+                            headers.push(s);
                         } else {
-                            return Err(ShellError::GenericError {
-                                error: "Header row needs string headers".into(),
-                                msg: "used non-string headers".into(),
-                                span: Some(name),
-                                help: None,
-                                inner: vec![],
-                            });
+                            return Err(ShellError::Generic(GenericError::new(
+                                "Header row needs string headers",
+                                "used non-string headers",
+                                name,
+                            )));
                         }
                     }
                     _ => {
-                        return Err(ShellError::GenericError {
-                            error: "Header row is incomplete and can't be used".into(),
-                            msg: "using incomplete header row".into(),
-                            span: Some(name),
-                            help: None,
-                            inner: vec![],
-                        });
+                        return Err(ShellError::Generic(GenericError::new(
+                            "Header row is incomplete and can't be used",
+                            "using incomplete header row",
+                            name,
+                        )));
                     }
                 }
             } else {
-                return Err(ShellError::GenericError {
-                    error: "Header row is incomplete and can't be used".into(),
-                    msg: "using incomplete header row".into(),
-                    span: Some(name),
-                    help: None,
-                    inner: vec![],
-                });
+                return Err(ShellError::Generic(GenericError::new(
+                    "Header row is incomplete and can't be used",
+                    "using incomplete header row",
+                    name,
+                )));
             }
         }
     } else {
@@ -265,7 +269,7 @@ pub fn transpose(
                             let current_span = val.span();
                             match val {
                                 Value::List { vals, .. } => {
-                                    vals.push(x);
+                                    vals.to_mut().push(x);
                                 }
                                 v => {
                                     *v = Value::list(vec![std::mem::take(v), x], current_span);
@@ -284,14 +288,18 @@ pub fn transpose(
         })
         .collect::<Vec<Value>>();
     if result_data.len() == 1 && args.as_record {
-        Ok(PipelineData::Value(
+        Ok(PipelineData::value(
             result_data
                 .pop()
                 .expect("already check result only contains one item"),
             metadata,
         ))
     } else {
-        Ok(result_data.into_pipeline_data_with_metadata(metadata, ctrlc))
+        Ok(result_data.into_pipeline_data_with_metadata(
+            name,
+            engine_state.signals().clone(),
+            metadata,
+        ))
     }
 }
 
@@ -300,9 +308,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Transpose {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Transpose)
     }
 }

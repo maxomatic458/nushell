@@ -1,27 +1,35 @@
-mod ansi;
 mod clear;
+#[cfg(not(target_arch = "wasm32"))]
+mod clip;
 mod dir_info;
-mod du;
 mod input;
+mod is_redirected;
 mod is_terminal;
 mod kill;
+mod raw_mode;
 mod sleep;
-mod term_size;
+mod term;
 #[cfg(unix)]
 mod ulimit;
+#[cfg(unix)]
+mod umask_;
 mod whoami;
 
-pub use ansi::{Ansi, AnsiLink, AnsiStrip};
 pub use clear::Clear;
-pub use dir_info::{DirBuilder, DirInfo, FileInfo};
-pub use du::Du;
+#[cfg(not(target_arch = "wasm32"))]
+pub use clip::{ClipCommand, ClipCopy, ClipPaste};
+pub use dir_info::{DirBuilder, DirInfo, ExcludeGlob, FileInfo};
 pub use input::Input;
 pub use input::InputList;
 pub use input::InputListen;
+pub use is_redirected::IsRedirected;
 pub use is_terminal::IsTerminal;
 pub use kill::Kill;
+pub use raw_mode::RawModeGuard;
 pub use sleep::Sleep;
-pub use term_size::TermSize;
+pub use term::{Term, TermQuery, TermSize};
 #[cfg(unix)]
 pub use ulimit::ULimit;
+#[cfg(unix)]
+pub use umask_::UMask;
 pub use whoami::Whoami;

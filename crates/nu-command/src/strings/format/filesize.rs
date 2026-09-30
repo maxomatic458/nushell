@@ -1,14 +1,12 @@
-use nu_cmd_base::input_handler::{operate, CmdArgument};
-use nu_engine::CallExt;
-use nu_protocol::ast::{Call, CellPath};
-use nu_protocol::engine::{Command, EngineState, Stack};
+use nu_cmd_base::input_handler::{CmdArgument, operate};
+use nu_engine::command_prelude::*;
 use nu_protocol::{
-    format_filesize, Category, Example, PipelineData, ShellError, Signature, Span, SyntaxShape,
-    Type, Value,
+    FilesizeFormatter, FilesizeUnit, SUPPORTED_FILESIZE_UNITS, engine::StateWorkingSet,
 };
 
 struct Arguments {
-    format_value: String,
+    unit: FilesizeUnit,
+    float_precision: usize,
     cell_paths: Option<Vec<CellPath>>,
 }
 
@@ -30,15 +28,15 @@ impl Command for FormatFilesize {
         Signature::build("format filesize")
             .input_output_types(vec![
                 (Type::Filesize, Type::String),
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true)
-            .required(
-                "format value",
-                SyntaxShape::String,
-                "The format into which convert the file sizes.",
-            )
+            .param(Parameter::Required(
+                PositionalArg::new("format value", SyntaxShape::String)
+                    .desc("The format into which convert the file sizes.")
+                    .completion(Completion::new_list(SUPPORTED_FILESIZE_UNITS.as_slice())),
+            ))
             .rest(
                 "rest",
                 SyntaxShape::CellPath,
@@ -47,12 +45,20 @@ impl Command for FormatFilesize {
             .category(Category::Strings)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Converts a column of filesizes to some specified format."
     }
 
+    fn extra_description(&self) -> &str {
+        "Decimal precision is controlled by `$env.config.float_precision`."
+    }
+
     fn search_terms(&self) -> Vec<&str> {
-        vec!["convert", "display", "pattern", "human readable"]
+        vec!["convert", "display"]
+    }
+
+    fn is_const(&self) -> bool {
+        true
     }
 
     fn run(
@@ -62,14 +68,14 @@ impl Command for FormatFilesize {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let format_value = call
-            .req::<Value>(engine_state, stack, 0)?
-            .as_string()?
-            .to_ascii_lowercase();
+        let unit = parse_filesize_unit(call.req::<Spanned<String>>(engine_state, stack, 0)?)?;
         let cell_paths: Vec<CellPath> = call.rest(engine_state, stack, 1)?;
         let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
+        // Read runtime config so `$env.config.float_precision` changes are honored.
+        let float_precision = stack.get_config(engine_state).float_precision.max(0) as usize;
         let arg = Arguments {
-            format_value,
+            unit,
+            float_precision,
             cell_paths,
         };
         operate(
@@ -77,39 +83,88 @@ impl Command for FormatFilesize {
             arg,
             input,
             call.head,
-            engine_state.ctrlc.clone(),
+            engine_state.signals(),
         )
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn run_const(
+        &self,
+        working_set: &StateWorkingSet,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let unit =
+            parse_filesize_unit(call.req_const::<Spanned<String>>(working_set, stack, 0)?)?;
+        let cell_paths: Vec<CellPath> = call.rest_const(working_set, stack, 1)?;
+        let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
+        let float_precision = working_set.permanent().get_config().float_precision.max(0) as usize;
+        let arg = Arguments {
+            unit,
+            float_precision,
+            cell_paths,
+        };
+        operate(
+            format_value_impl,
+            arg,
+            input,
+            call.head,
+            working_set.permanent().signals(),
+        )
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Convert the size column to KB",
-                example: "ls | format filesize KB size",
+                description: "Convert the size column to KB.",
+                example: "ls | format filesize kB size",
                 result: None,
             },
             Example {
-                description: "Convert the apparent column to B",
+                description: "Convert the apparent column to B.",
                 example: "du | format filesize B apparent",
                 result: None,
             },
             Example {
-                description: "Convert the size data to MB",
-                example: "4Gb | format filesize MB",
-                result: Some(Value::test_string("4000.0 MB")),
+                description: "Convert the size data to MB.",
+                example: "4GB | format filesize MB",
+                result: Some(Value::test_string("4000 MB")),
             },
         ]
     }
 }
 
+fn parse_filesize_unit(format: Spanned<String>) -> Result<FilesizeUnit, ShellError> {
+    format.item.parse().map_err(|_| ShellError::InvalidUnit {
+        supported_units: SUPPORTED_FILESIZE_UNITS.join(", "),
+        span: format.span,
+    })
+}
+
 fn format_value_impl(val: &Value, arg: &Arguments, span: Span) -> Value {
     let value_span = val.span();
     match val {
-        Value::Filesize { val, .. } => Value::string(
-            // don't need to concern about metric, we just format units by what user input.
-            format_filesize(*val, &arg.format_value, None),
-            span,
-        ),
+        Value::Filesize { val, .. } => {
+            // Check if this will produce a fractional result.
+            // If so, apply float_precision; otherwise use None to avoid trailing zeros.
+            let bytes: i64 = (*val).into();
+            let unit_bytes = arg.unit.as_bytes() as i64;
+            let has_remainder =
+                arg.unit != FilesizeUnit::B && unit_bytes > 0 && (bytes % unit_bytes) != 0;
+
+            let precision = if has_remainder {
+                Some(arg.float_precision)
+            } else {
+                None
+            };
+
+            FilesizeFormatter::new()
+                .unit(arg.unit)
+                .precision(precision)
+                .format(*val)
+                .to_string()
+                .into_value(span)
+        }
         Value::Error { .. } => val.clone(),
         _ => Value::error(
             ShellError::OnlySupportsThisInputType {
@@ -128,9 +183,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(FormatFilesize)
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(FormatFilesize)
     }
 }

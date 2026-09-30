@@ -1,14 +1,9 @@
-use nu_cmd_base::input_handler::{operate, CmdArgument};
-use nu_engine::CallExt;
-use nu_protocol::{
-    ast::{Call, CellPath},
-    engine::{Command, EngineState, Stack},
-    levenshtein_distance, record, Category, Example, PipelineData, ShellError, Signature, Span,
-    SyntaxShape, Type, Value,
-};
+use nu_cmd_base::input_handler::{CmdArgument, operate};
+use nu_engine::command_prelude::*;
+use nu_protocol::{engine::StateWorkingSet, levenshtein_distance};
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct StrDistance;
 
 struct Arguments {
     compare_string: String,
@@ -21,7 +16,7 @@ impl CmdArgument for Arguments {
     }
 }
 
-impl Command for SubCommand {
+impl Command for StrDistance {
     fn name(&self) -> &str {
         "str distance"
     }
@@ -30,8 +25,8 @@ impl Command for SubCommand {
         Signature::build("str distance")
             .input_output_types(vec![
                 (Type::String, Type::Int),
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
             ])
             .required(
                 "compare-string",
@@ -46,12 +41,16 @@ impl Command for SubCommand {
             .category(Category::Strings)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Compare two strings and return the edit distance/Levenshtein distance."
     }
 
     fn search_terms(&self) -> Vec<&str> {
         vec!["edit", "levenshtein"]
+    }
+
+    fn is_const(&self) -> bool {
+        true
     }
 
     fn run(
@@ -68,34 +67,56 @@ impl Command for SubCommand {
             compare_string,
             cell_paths,
         };
-        operate(action, args, input, call.head, engine_state.ctrlc.clone())
+        operate(action, args, input, call.head, engine_state.signals())
     }
 
-    fn examples(&self) -> Vec<Example> {
-        vec![Example {
-            description: "get the edit distance between two strings",
-            example: "'nushell' | str distance 'nutshell'",
-            result: Some(Value::test_int(1)),
-        },
-        Example {
-            description: "Compute edit distance between strings in table and another string, using cell paths",
-            example: "[{a: 'nutshell' b: 'numetal'}] | str distance 'nushell' 'a' 'b'",
-            result: Some(Value::test_list (
-                vec![
-                    Value::test_record(record! {
-                        "a" => Value::test_int(1),
-                        "b" => Value::test_int(4),
-                    })])),
-        },
-        Example {
-            description: "Compute edit distance between strings in record and another string, using cell paths",
-            example: "{a: 'nutshell' b: 'numetal'} | str distance 'nushell' a b",
-            result: Some(
-                    Value::test_record(record! {
-                        "a" => Value::test_int(1),
-                        "b" => Value::test_int(4),
-                    })),
-        }]
+    fn run_const(
+        &self,
+        working_set: &StateWorkingSet,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let compare_string: String = call.req_const(working_set, stack, 0)?;
+        let cell_paths: Vec<CellPath> = call.rest_const(working_set, stack, 1)?;
+        let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
+        let args = Arguments {
+            compare_string,
+            cell_paths,
+        };
+        operate(
+            action,
+            args,
+            input,
+            call.head,
+            working_set.permanent().signals(),
+        )
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![
+            Example {
+                description: "Get the edit distance between two strings.",
+                example: "'nushell' | str distance 'nutshell'",
+                result: Some(Value::test_int(1)),
+            },
+            Example {
+                description: "Compute edit distance between strings in table and another string, using cell paths.",
+                example: "[{a: 'nutshell' b: 'numetal'}] | str distance 'nushell' 'a' 'b'",
+                result: Some(Value::test_list(vec![Value::test_record(record! {
+                    "a" => Value::test_int(1),
+                    "b" => Value::test_int(4),
+                })])),
+            },
+            Example {
+                description: "Compute edit distance between strings in record and another string, using cell paths.",
+                example: "{a: 'nutshell' b: 'numetal'} | str distance 'nushell' a b",
+                result: Some(Value::test_record(record! {
+                    "a" => Value::test_int(1),
+                    "b" => Value::test_int(4),
+                })),
+            },
+        ]
     }
 }
 
@@ -124,9 +145,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(StrDistance)
     }
 }

@@ -1,11 +1,13 @@
 [package]
-authors = ["The Nushell Project Developers"]
+authors.workspace = true
 description = "A version incrementer plugin for Nushell"
 repository = "https://github.com/nushell/nushell/tree/main/crates/nu_plugin_example"
-edition = "2021"
-license = "MIT"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 name = "nu_plugin_example"
-version = "0.89.1"
+version.workspace = true
+publish = false
 
 [[bin]]
 name = "nu_plugin_example"
@@ -14,6 +16,13 @@ bench = false
 [lib]
 bench = false
 
+[lints]
+workspace = true
+
 [dependencies]
-nu-plugin = { path = "../nu-plugin", version = "0.89.1" }
-nu-protocol = { path = "../nu-protocol", version = "0.89.1", features = ["plugin"] }
+nu-plugin.workspace = true
+nu-protocol = { workspace = true, features = ["plugin"] }
+
+[dev-dependencies]
+nu-plugin-test-support.workspace = true
+nu-cmd-lang.workspace = true

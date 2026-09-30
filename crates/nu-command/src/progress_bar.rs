@@ -1,13 +1,11 @@
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 // This module includes the progress bar used to show the progress when using the command `save`
 // Eventually it would be nice to find a better place for it.
 
 pub struct NuProgressBar {
     pub pb: ProgressBar,
-    bytes_processed: u64,
-    total_bytes: Option<u64>,
 }
 
 impl NuProgressBar {
@@ -16,7 +14,9 @@ impl NuProgressBar {
         let template = match total_bytes {
             Some(_) => {
                 // We will use a progress bar if we know the total bytes of the stream
-                ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{bar:30.cyan/blue}] [{bytes}/{total_bytes}] {binary_bytes_per_sec} ({eta}) {wide_msg}")
+                ProgressStyle::with_template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:30.cyan/blue}] [{bytes}/{total_bytes}] {binary_bytes_per_sec} ({eta}) {wide_msg}",
+                )
             }
             _ => {
                 // But if we don't know the total then we just show the stats progress
@@ -40,8 +40,6 @@ impl NuProgressBar {
 
         NuProgressBar {
             pb: new_progress_bar,
-            total_bytes: None,
-            bytes_processed: 0,
         }
     }
 
@@ -49,20 +47,7 @@ impl NuProgressBar {
         self.pb.set_position(bytes_processed);
     }
 
-    #[allow(dead_code)]
-    pub fn finished_msg(&self, msg: String) {
-        self.pb.finish_with_message(msg);
-    }
-
-    pub fn abandoned_msg(&self, msg: String) {
+    pub fn abandoned_msg(&self, msg: impl Into<Cow<'static, str>>) {
         self.pb.abandon_with_message(msg);
-    }
-
-    pub fn clone(&self) -> NuProgressBar {
-        NuProgressBar {
-            pb: self.pb.clone(),
-            bytes_processed: self.bytes_processed,
-            total_bytes: self.total_bytes,
-        }
     }
 }

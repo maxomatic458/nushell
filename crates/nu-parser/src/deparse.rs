@@ -1,23 +1,25 @@
+use nu_utils::escape_quote_string;
+
 fn string_should_be_quoted(input: &str) -> bool {
-    input.starts_with('$')
-        || input
-            .chars()
-            .any(|c| c == ' ' || c == '(' || c == '\'' || c == '`' || c == '"' || c == '\\')
-}
-
-pub fn escape_quote_string(input: &str) -> String {
-    let mut output = String::with_capacity(input.len() + 2);
-    output.push('"');
-
-    for c in input.chars() {
-        if c == '"' || c == '\\' {
-            output.push('\\');
-        }
-        output.push(c);
-    }
-
-    output.push('"');
-    output
+    input.is_empty()
+        || input.starts_with('$')
+        || input.chars().any(|c| {
+            c.is_whitespace()
+                || c == '('
+                || c == '['
+                || c == '{'
+                || c == '}'
+                || c == '\''
+                || c == '`'
+                || c == '"'
+                || c == '\\'
+                || c == ';'
+                || c == '|'
+                // `#` starts a comment when it begins a token (or after whitespace).
+                // Without quoting, `nu script.nu #000000` becomes `main #000000` and
+                // the argument is stripped.
+                || c == '#'
+        })
 }
 
 // Escape rules:
@@ -26,7 +28,7 @@ pub fn escape_quote_string(input: &str) -> String {
 // input argument is a flag without =, it's passed as it is (--foo -> --foo)
 // input argument is a flag with =, the first two points apply to the value (--foo=bar -> --foo=bar; --foo=bar' -> --foo="bar'")
 //
-// special characters are white space, (, ', `, ",and \
+// special characters are white space, (, [, {, }, ', `, ", \, ;, |, and #
 pub fn escape_for_script_arg(input: &str) -> String {
     // handle for flag, maybe we need to escape the value.
     if input.starts_with("--") {
@@ -64,14 +66,34 @@ mod test {
 
     #[test]
     fn test_quote_special() {
-        // check for input arg like this:
-        // nu b.nu "two words" $nake "`123"
+        let cases = vec![
+            ("two words", r#""two words""#),
+            ("$nake", r#""$nake""#),
+            ("`123", r#""`123""#),
+            ("this|cat", r#""this|cat""#),
+            ("this;cat", r#""this;cat""#),
+            // `#` would start a comment when re-parsed as `main <arg>`
+            ("#000000", r##""#000000""##),
+            ("#", r##""#""##),
+            ("foo#bar", r##""foo#bar""##),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(escape_for_script_arg(input).as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn test_flag_value_with_hash() {
         assert_eq!(
-            escape_for_script_arg("two words"),
-            r#""two words""#.to_string()
+            escape_for_script_arg("--color=#000000"),
+            r##"--color="#000000""##.to_string()
         );
-        assert_eq!(escape_for_script_arg("$nake"), r#""$nake""#.to_string());
-        assert_eq!(escape_for_script_arg("`123"), r#""`123""#.to_string());
+    }
+
+    #[test]
+    fn test_quote_newline() {
+        assert_eq!(escape_for_script_arg("c\nd"), format!("\"c\nd\""));
     }
 
     #[test]

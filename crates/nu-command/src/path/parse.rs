@@ -1,14 +1,7 @@
-use std::path::Path;
-
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{EngineState, Stack, StateWorkingSet};
-use nu_protocol::{
-    engine::Command, Category, Example, PipelineData, Record, ShellError, Signature, Span, Spanned,
-    SyntaxShape, Type, Value,
-};
-
 use super::PathSubcommandArguments;
+use nu_engine::command_prelude::*;
+use nu_protocol::engine::StateWorkingSet;
+use std::path::Path;
 
 struct Arguments {
     extension: Option<Spanned<String>>,
@@ -17,9 +10,9 @@ struct Arguments {
 impl PathSubcommandArguments for Arguments {}
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct PathParse;
 
-impl Command for SubCommand {
+impl Command for PathParse {
     fn name(&self) -> &str {
         "path parse"
     }
@@ -27,25 +20,25 @@ impl Command for SubCommand {
     fn signature(&self) -> Signature {
         Signature::build("path parse")
             .input_output_types(vec![
-                (Type::String, Type::Record(vec![])),
-                (Type::List(Box::new(Type::String)), Type::Table(vec![])),
+                (Type::String, Type::record()),
+                (Type::List(Box::new(Type::String)), Type::table()),
             ])
             .named(
                 "extension",
                 SyntaxShape::String,
-                "Manually supply the extension (without the dot)",
+                "Manually supply the extension (without the dot).",
                 Some('e'),
             )
             .category(Category::Path)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Convert a path into structured data."
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"Each path is split into a table with 'parent', 'stem' and 'extension' fields.
-On Windows, an extra 'prefix' column is added."#
+    fn extra_description(&self) -> &str {
+        "Each path is split into a table with 'parent', 'stem' and 'extension' fields.
+On Windows, an extra 'prefix' column is added."
     }
 
     fn is_const(&self) -> bool {
@@ -65,43 +58,42 @@ On Windows, an extra 'prefix' column is added."#
         };
 
         // This doesn't match explicit nulls
-        if matches!(input, PipelineData::Empty) {
+        if let PipelineData::Empty = input {
             return Err(ShellError::PipelineEmpty { dst_span: head });
         }
         input.map(
             move |value| super::operate(&parse, &args, value, head),
-            engine_state.ctrlc.clone(),
+            engine_state.signals(),
         )
     }
 
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let head = call.head;
         let args = Arguments {
-            extension: call.get_flag_const(working_set, "extension")?,
+            extension: call.get_flag_const(working_set, stack, "extension")?,
         };
 
         // This doesn't match explicit nulls
-        if matches!(input, PipelineData::Empty) {
+        if let PipelineData::Empty = input {
             return Err(ShellError::PipelineEmpty { dst_span: head });
         }
         input.map(
             move |value| super::operate(&parse, &args, value, head),
-            working_set.permanent().ctrlc.clone(),
+            working_set.permanent().signals(),
         )
     }
 
     #[cfg(windows)]
-    fn examples(&self) -> Vec<Example> {
-        use nu_protocol::record;
-
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Parse a single path",
+                description: "Parse a single path.",
                 example: r"'C:\Users\viking\spam.txt' | path parse",
                 result: Some(Value::test_record(record! {
                         "prefix" =>    Value::test_string("C:"),
@@ -111,12 +103,12 @@ On Windows, an extra 'prefix' column is added."#
                 })),
             },
             Example {
-                description: "Replace a complex extension",
+                description: "Replace a complex extension.",
                 example: r"'C:\Users\viking\spam.tar.gz' | path parse --extension tar.gz | upsert extension { 'txt' }",
                 result: None,
             },
             Example {
-                description: "Ignore the extension",
+                description: "Ignore the extension.",
                 example: r"'C:\Users\viking.d' | path parse --extension ''",
                 result: Some(Value::test_record(record! {
                         "prefix" =>    Value::test_string("C:"),
@@ -126,7 +118,7 @@ On Windows, an extra 'prefix' column is added."#
                 })),
             },
             Example {
-                description: "Parse all paths in a list",
+                description: "Parse all paths in a list.",
                 example: r"[ C:\Users\viking.d C:\Users\spam.txt ] | path parse",
                 result: Some(Value::test_list(vec![
                     Value::test_record(record! {
@@ -147,13 +139,11 @@ On Windows, an extra 'prefix' column is added."#
     }
 
     #[cfg(not(windows))]
-    fn examples(&self) -> Vec<Example> {
-        use nu_protocol::record;
-
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Parse a path",
-                example: r"'/home/viking/spam.txt' | path parse",
+                description: "Parse a path.",
+                example: "'/home/viking/spam.txt' | path parse",
                 result: Some(Value::test_record(record! {
                         "parent" =>    Value::test_string("/home/viking"),
                         "stem" =>      Value::test_string("spam"),
@@ -161,13 +151,13 @@ On Windows, an extra 'prefix' column is added."#
                 })),
             },
             Example {
-                description: "Replace a complex extension",
-                example: r"'/home/viking/spam.tar.gz' | path parse --extension tar.gz | upsert extension { 'txt' }",
+                description: "Replace a complex extension.",
+                example: "'/home/viking/spam.tar.gz' | path parse --extension tar.gz | upsert extension { 'txt' }",
                 result: None,
             },
             Example {
-                description: "Ignore the extension",
-                example: r"'/etc/conf.d' | path parse --extension ''",
+                description: "Ignore the extension.",
+                example: "'/etc/conf.d' | path parse --extension ''",
                 result: Some(Value::test_record(record! {
                         "parent" =>    Value::test_string("/etc"),
                         "stem" =>      Value::test_string("conf.d"),
@@ -175,8 +165,8 @@ On Windows, an extra 'prefix' column is added."#
                 })),
             },
             Example {
-                description: "Parse all paths in a list",
-                example: r"[ /home/viking.d /home/spam.txt ] | path parse",
+                description: "Parse all paths in a list.",
+                example: "[ /home/viking.d /home/spam.txt ] | path parse",
                 result: Some(Value::test_list(vec![
                     Value::test_record(record! {
                         "parent" =>    Value::test_string("/home"),
@@ -260,9 +250,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(PathParse)
     }
 }

@@ -1,12 +1,9 @@
-use nu_engine::CallExt;
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    record, Category, Example, IntoInterruptiblePipelineData, IntoPipelineData, PipelineData,
-    ShellError, Signature, Span, Spanned, SyntaxShape, Type, Value,
-};
-use windows::{core::PCWSTR, Win32::System::Environment::ExpandEnvironmentStringsW};
-use winreg::{enums::*, types::FromRegValue, RegKey};
+use nu_engine::command_prelude::*;
+
+use nu_protocol::shell_error::generic::GenericError;
+use nu_protocol::shell_error::io::IoError;
+use windows::{Win32::System::Environment::ExpandEnvironmentStringsW, core::PCWSTR};
+use winreg::{RegKey, enums::*, types::FromRegValue};
 
 #[derive(Clone)]
 pub struct RegistryQuery;
@@ -19,23 +16,23 @@ impl Command for RegistryQuery {
     fn signature(&self) -> Signature {
         Signature::build("registry query")
             .input_output_types(vec![(Type::Nothing, Type::Any)])
-            .switch("hkcr", "query the hkey_classes_root hive", None)
-            .switch("hkcu", "query the hkey_current_user hive", None)
-            .switch("hklm", "query the hkey_local_machine hive", None)
-            .switch("hku", "query the hkey_users hive", None)
-            .switch("hkpd", "query the hkey_performance_data hive", None)
-            .switch("hkpt", "query the hkey_performance_text hive", None)
-            .switch("hkpnls", "query the hkey_performance_nls_text hive", None)
-            .switch("hkcc", "query the hkey_current_config hive", None)
-            .switch("hkdd", "query the hkey_dyn_data hive", None)
+            .switch("hkcr", "Query the hkey_classes_root hive.", None)
+            .switch("hkcu", "Query the hkey_current_user hive.", None)
+            .switch("hklm", "Query the hkey_local_machine hive.", None)
+            .switch("hku", "Query the hkey_users hive.", None)
+            .switch("hkpd", "Query the hkey_performance_data hive.", None)
+            .switch("hkpt", "Query the hkey_performance_text hive.", None)
+            .switch("hkpnls", "Query the hkey_performance_nls_text hive.", None)
+            .switch("hkcc", "Query the hkey_current_config hive.", None)
+            .switch("hkdd", "Query the hkey_dyn_data hive.", None)
             .switch(
                 "hkculs",
-                "query the hkey_current_user_local_settings hive",
+                "Query the hkey_current_user_local_settings hive.",
                 None,
             )
             .switch(
                 "no-expand",
-                "do not expand %ENV% placeholders in REG_EXPAND_SZ",
+                "Do not expand %ENV% placeholders in REG_EXPAND_SZ.",
                 Some('u'),
             )
             .required("key", SyntaxShape::String, "Registry key to query.")
@@ -47,11 +44,11 @@ impl Command for RegistryQuery {
             .category(Category::System)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Query the Windows registry."
     }
 
-    fn extra_usage(&self) -> &str {
+    fn extra_description(&self) -> &str {
         "Currently supported only on Windows systems."
     }
 
@@ -65,7 +62,7 @@ impl Command for RegistryQuery {
         registry_query(engine_state, stack, call)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "Query the HKEY_CURRENT_USER hive",
@@ -95,7 +92,9 @@ fn registry_query(
     let registry_value: Option<Spanned<String>> = call.opt(engine_state, stack, 1)?;
 
     let reg_hive = get_reg_hive(engine_state, stack, call)?;
-    let reg_key = reg_hive.open_subkey(registry_key.item)?;
+    let reg_key = reg_hive
+        .open_subkey(registry_key.item)
+        .map_err(|err| IoError::new(err, *registry_key_span, None))?;
 
     if registry_value.is_none() {
         let mut reg_values = vec![];
@@ -111,7 +110,7 @@ fn registry_query(
                 *registry_key_span,
             ))
         }
-        Ok(reg_values.into_pipeline_data(engine_state.ctrlc.clone()))
+        Ok(reg_values.into_pipeline_data(call_span, engine_state.signals().clone()))
     } else {
         match registry_value {
             Some(value) => {
@@ -130,13 +129,11 @@ fn registry_query(
                         )
                         .into_pipeline_data())
                     }
-                    Err(_) => Err(ShellError::GenericError {
-                        error: "Unable to find registry key/value".into(),
-                        msg: format!("Registry value: {} was not found", value.item),
-                        span: Some(value.span),
-                        help: None,
-                        inner: vec![],
-                    }),
+                    Err(_) => Err(ShellError::Generic(GenericError::new(
+                        "Unable to find registry key/value",
+                        format!("Registry value: {} was not found", value.item),
+                        value.span,
+                    ))),
                 }
             }
             None => Ok(Value::nothing(call_span).into_pipeline_data()),
@@ -161,13 +158,11 @@ fn get_reg_hive(
     })
     .collect::<Result<Vec<_>, ShellError>>()?;
     if flags.len() > 1 {
-        return Err(ShellError::GenericError {
-            error: "Only one registry key can be specified".into(),
-            msg: "Only one registry key can be specified".into(),
-            span: Some(call.head),
-            help: None,
-            inner: vec![],
-        });
+        return Err(ShellError::Generic(GenericError::new(
+            "Only one registry key can be specified",
+            "Only one registry key can be specified",
+            call.head,
+        )));
     }
     let hive = flags.first().copied().unwrap_or("hkcu");
     let hkey = match hive {
@@ -186,7 +181,7 @@ fn get_reg_hive(
                 msg: "Entered unreachable code".into(),
                 label: "Unknown registry hive".into(),
                 span: call.head,
-            })
+            });
         }
     };
     Ok(RegKey::predef(hkey))
@@ -282,29 +277,6 @@ fn reg_value_to_nu_string(
     }
 }
 
-#[test]
-fn no_expand_does_not_expand() {
-    let unexpanded = "%AppData%";
-    let reg_val = || winreg::RegValue {
-        bytes: unexpanded
-            .encode_utf16()
-            .chain([0])
-            .flat_map(u16::to_ne_bytes)
-            .collect(),
-        vtype: REG_EXPAND_SZ,
-    };
-
-    // normally we do expand
-    let nu_val_expanded = reg_value_to_nu_string(reg_val(), Span::unknown(), false);
-    assert!(nu_val_expanded.as_string().is_ok());
-    assert_ne!(nu_val_expanded.as_string().unwrap(), unexpanded);
-
-    // unless we skip expansion
-    let nu_val_skip_expand = reg_value_to_nu_string(reg_val(), Span::unknown(), true);
-    assert!(nu_val_skip_expand.as_string().is_ok());
-    assert_eq!(nu_val_skip_expand.as_string().unwrap(), unexpanded);
-}
-
 fn reg_value_to_nu_list_string(reg_value: winreg::RegValue, call_span: Span) -> nu_protocol::Value {
     let values = <Vec<String>>::from_reg_value(&reg_value)
         .expect("registry value type should be REG_MULTI_SZ")
@@ -333,4 +305,32 @@ fn reg_value_to_nu_int(reg_value: winreg::RegValue, call_span: Span) -> nu_proto
             ),
         };
     Value::int(value, call_span)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_expand_does_not_expand() {
+        let unexpanded = "%AppData%";
+        let reg_val = || winreg::RegValue {
+            bytes: unexpanded
+                .encode_utf16()
+                .chain([0])
+                .flat_map(u16::to_ne_bytes)
+                .collect(),
+            vtype: REG_EXPAND_SZ,
+        };
+
+        // normally we do expand
+        let nu_val_expanded = reg_value_to_nu_string(reg_val(), Span::unknown(), false);
+        assert!(nu_val_expanded.coerce_string().is_ok());
+        assert_ne!(nu_val_expanded.coerce_string().unwrap(), unexpanded);
+
+        // unless we skip expansion
+        let nu_val_skip_expand = reg_value_to_nu_string(reg_val(), Span::unknown(), true);
+        assert!(nu_val_skip_expand.coerce_string().is_ok());
+        assert_eq!(nu_val_skip_expand.coerce_string().unwrap(), unexpanded);
+    }
 }

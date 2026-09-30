@@ -1,15 +1,11 @@
-use crate::formats::value_to_string;
+use super::utils;
+#[cfg(feature = "sqlite")]
+use crate::database::QueryPlan;
 use itertools::Itertools;
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, IntoPipelineData, PipelineData, PipelineMetadata, ShellError,
-    Signature, Span, Type, Value,
-};
+use nu_engine::command_prelude::*;
+use nu_protocol::PipelineMetadata;
 use nu_utils::IgnoreCaseExt;
-use std::collections::hash_map::IntoIter;
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::IntoIter};
 
 #[derive(Clone)]
 pub struct Uniq;
@@ -27,33 +23,33 @@ impl Command for Uniq {
             )])
             .switch(
                 "count",
-                "Return a table containing the distinct input values together with their counts",
+                "Return a table containing the distinct input values together with their counts.",
                 Some('c'),
             )
             .switch(
                 "repeated",
-                "Return the input values that occur more than once",
+                "Return the input values that occur more than once.",
                 Some('d'),
             )
             .switch(
                 "ignore-case",
-                "Compare input values case-insensitively",
+                "Compare input values case-insensitively.",
                 Some('i'),
             )
             .switch(
                 "unique",
-                "Return the input values that occur once only",
+                "Return the input values that occur once only.",
                 Some('u'),
             )
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Return the distinct values in the input."
     }
 
     fn search_terms(&self) -> Vec<&str> {
-        vec!["distinct", "deduplicate"]
+        vec!["distinct", "deduplicate", "count"]
     }
 
     fn run(
@@ -61,13 +57,32 @@ impl Command for Uniq {
         engine_state: &EngineState,
         stack: &mut Stack,
         call: &Call,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let mapper = Box::new(move |ms: ItemMapperState| -> ValueCounter {
-            item_mapper(ms.item, ms.flag_ignore_case, ms.index)
-        });
+        let head = call.head;
 
-        let metadata = input.metadata();
+        #[cfg(feature = "sqlite")]
+        // Pushdown optimization: bare `uniq` (no flags) via SELECT DISTINCT
+        if !call.has_flag(engine_state, stack, "count")?
+            && !call.has_flag(engine_state, stack, "repeated")?
+            && !call.has_flag(engine_state, stack, "unique")?
+            && !call.has_flag(engine_state, stack, "ignore-case")?
+            && let PipelineData::Value(Value::Custom { val, .. }, metadata) = &input
+            && let Some(plan) = QueryPlan::try_from_any(val.as_any())
+        {
+            let plan = plan.with_distinct();
+            return plan
+                .execute(call.head)
+                .map(|data| data.set_metadata(metadata.clone()));
+        }
+
+        let mapper = Box::new(
+            move |ms: ItemMapperState| -> Result<ValueCounter, ShellError> {
+                Ok(item_mapper(ms.item, ms.flag_ignore_case, ms.index, head))
+            },
+        );
+
+        let metadata = input.take_metadata();
         uniq(
             engine_state,
             stack,
@@ -78,10 +93,10 @@ impl Command for Uniq {
         )
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Return the distinct values of a list/table (remove duplicates so that each value occurs once only)",
+                description: "Return the distinct values of a list/table (remove duplicates so that each value occurs once only).",
                 example: "[2 3 3 4] | uniq",
                 result: Some(Value::list(
                     vec![Value::test_int(2), Value::test_int(3), Value::test_int(4)],
@@ -89,43 +104,36 @@ impl Command for Uniq {
                 )),
             },
             Example {
-                description: "Return the input values that occur more than once",
+                description: "Return the input values that occur more than once.",
                 example: "[1 2 2] | uniq -d",
-                result: Some(Value::list(
-                    vec![Value::test_int(2)],
-                    Span::test_data(),
-                )),
+                result: Some(Value::list(vec![Value::test_int(2)], Span::test_data())),
             },
             Example {
-                description: "Return the input values that occur once only",
+                description: "Return the input values that occur once only.",
                 example: "[1 2 2] | uniq --unique",
-                result: Some(Value::list(
-                    vec![Value::test_int(1)],
-                    Span::test_data(),
-                )),
+                result: Some(Value::list(vec![Value::test_int(1)], Span::test_data())),
             },
             Example {
-                description: "Ignore differences in case when comparing input values",
+                description: "Ignore differences in case when comparing input values.",
                 example: "['hello' 'goodbye' 'Hello'] | uniq --ignore-case",
-                result: Some(Value::test_list(
-                    vec![Value::test_string("hello"), Value::test_string("goodbye")],
-                )),
+                result: Some(Value::test_list(vec![
+                    Value::test_string("hello"),
+                    Value::test_string("goodbye"),
+                ])),
             },
             Example {
-                description: "Return a table containing the distinct input values together with their counts",
+                description: "Return a table containing the distinct input values together with their counts.",
                 example: "[1 2 2] | uniq --count",
-                result: Some(Value::test_list(
-                    vec![
-                        Value::test_record(record! {
-                            "value" => Value::test_int(1),
-                            "count" => Value::test_int(1),
-                        }),
-                        Value::test_record(record! {
-                            "value" => Value::test_int(2),
-                            "count" => Value::test_int(2),
-                        }),
-                    ],
-                )),
+                result: Some(Value::test_list(vec![
+                    Value::test_record(record! {
+                        "value" => Value::test_int(1),
+                        "count" => Value::test_int(1),
+                    }),
+                    Value::test_record(record! {
+                        "value" => Value::test_int(2),
+                        "count" => Value::test_int(2),
+                    }),
+                ])),
             },
         ]
     }
@@ -135,10 +143,11 @@ pub struct ItemMapperState {
     pub item: Value,
     pub flag_ignore_case: bool,
     pub index: usize,
+    pub head: Span,
 }
 
-fn item_mapper(item: Value, flag_ignore_case: bool, index: usize) -> ValueCounter {
-    ValueCounter::new(item, flag_ignore_case, index)
+fn item_mapper(item: Value, flag_ignore_case: bool, index: usize, head: Span) -> ValueCounter {
+    ValueCounter::new(item, flag_ignore_case, index, head)
 }
 
 pub struct ValueCounter {
@@ -155,21 +164,22 @@ impl PartialEq<Self> for ValueCounter {
 }
 
 impl ValueCounter {
-    fn new(val: Value, flag_ignore_case: bool, index: usize) -> Self {
-        Self::new_vals_to_compare(val.clone(), flag_ignore_case, val, index)
+    fn new(val: Value, flag_ignore_case: bool, index: usize, head: Span) -> Self {
+        Self::new_vals_to_compare(val.clone(), flag_ignore_case, val, index, head)
     }
     pub fn new_vals_to_compare(
         val: Value,
         flag_ignore_case: bool,
         vals_to_compare: Value,
         index: usize,
+        head: Span,
     ) -> Self {
         ValueCounter {
             val,
             val_to_compare: if flag_ignore_case {
-                clone_to_folded_case(&vals_to_compare.with_span(Span::unknown()))
+                clone_to_folded_case(&vals_to_compare.with_span(head))
             } else {
-                vals_to_compare.with_span(Span::unknown())
+                vals_to_compare.with_span(head)
             },
             count: 1,
             index,
@@ -195,35 +205,6 @@ fn clone_to_folded_case(value: &Value) -> Value {
     }
 }
 
-fn sort_attributes(val: Value) -> Value {
-    let span = val.span();
-    match val {
-        Value::Record { val, .. } => {
-            // TODO: sort inplace
-            let sorted = val
-                .into_iter()
-                .sorted_by(|a, b| a.0.cmp(&b.0))
-                .collect_vec();
-
-            let record = sorted
-                .into_iter()
-                .map(|(k, v)| (k, sort_attributes(v)))
-                .collect();
-
-            Value::record(record, span)
-        }
-        Value::List { vals, .. } => {
-            Value::list(vals.into_iter().map(sort_attributes).collect_vec(), span)
-        }
-        other => other,
-    }
-}
-
-fn generate_key(item: &ValueCounter) -> Result<String, ShellError> {
-    let value = sort_attributes(item.val_to_compare.clone()); //otherwise, keys could be different for Records
-    value_to_string(&value, Span::unknown(), 0, None)
-}
-
 fn generate_results_with_count(head: Span, uniq_values: Vec<ValueCounter>) -> Vec<Value> {
     uniq_values
         .into_iter()
@@ -244,50 +225,53 @@ pub fn uniq(
     stack: &mut Stack,
     call: &Call,
     input: Vec<Value>,
-    item_mapper: Box<dyn Fn(ItemMapperState) -> ValueCounter>,
+    item_mapper: Box<dyn Fn(ItemMapperState) -> Result<ValueCounter, ShellError>>,
     metadata: Option<PipelineMetadata>,
 ) -> Result<PipelineData, ShellError> {
-    let ctrlc = engine_state.ctrlc.clone();
     let head = call.head;
     let flag_show_count = call.has_flag(engine_state, stack, "count")?;
     let flag_show_repeated = call.has_flag(engine_state, stack, "repeated")?;
     let flag_ignore_case = call.has_flag(engine_state, stack, "ignore-case")?;
     let flag_only_uniques = call.has_flag(engine_state, stack, "unique")?;
 
-    let uniq_values = input
+    // for uniq-by command
+    let flag_keep_last = call.has_flag(engine_state, stack, "keep-last")?;
+
+    let signals = engine_state.signals().clone();
+    let mut uniq_values = input
         .into_iter()
         .enumerate()
         .map_while(|(index, item)| {
-            if nu_utils::ctrl_c::was_pressed(&ctrlc) {
+            if signals.interrupted() {
                 return None;
             }
             Some(item_mapper(ItemMapperState {
                 item,
                 flag_ignore_case,
                 index,
+                head,
             }))
         })
         .try_fold(
             HashMap::<String, ValueCounter>::new(),
-            |mut counter, item| {
-                let key = generate_key(&item);
+            |mut counter, item| -> Result<_, ShellError> {
+                let item = item?;
+                let key = utils::value_to_key(engine_state, &item.val_to_compare, head)?;
 
-                match key {
-                    Ok(key) => {
-                        match counter.get_mut(&key) {
-                            Some(x) => x.count += 1,
-                            None => {
-                                counter.insert(key, item);
-                            }
-                        };
-                        Ok(counter)
+                match counter.get_mut(&key) {
+                    Some(x) => {
+                        if flag_keep_last {
+                            x.val = item.val;
+                        }
+                        x.count += 1;
                     }
-                    Err(err) => Err(err),
-                }
+                    None => {
+                        counter.insert(key, item);
+                    }
+                };
+                Ok(counter)
             },
-        );
-
-    let mut uniq_values: HashMap<String, ValueCounter> = uniq_values?;
+        )?;
 
     if flag_show_repeated {
         uniq_values.retain(|_v, value_count_pair| value_count_pair.count > 1);
@@ -319,9 +303,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Uniq {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Uniq)
     }
 }

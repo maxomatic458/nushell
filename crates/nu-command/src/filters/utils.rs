@@ -1,8 +1,8 @@
-use nu_engine::{eval_block, CallExt};
+use itertools::Itertools;
+use nu_engine::{CallExt, ClosureEval};
 use nu_protocol::{
-    ast::Call,
-    engine::{Closure, EngineState, Stack},
     IntoPipelineData, PipelineData, ShellError, Span, Value,
+    engine::{Call, Closure, EngineState, Stack},
 };
 
 pub fn chain_error_with_input(
@@ -19,6 +19,75 @@ pub fn chain_error_with_input(
     error_source
 }
 
+/// Recursively sort the keys of records in a `Value` tree.
+///
+/// This ensures that two semantically identical values produce the same
+/// serialized representation, even if their record fields appear in different
+/// orders. Lists and nested records are traversed recursively.
+pub fn sort_attributes(val: Value) -> Value {
+    let span = val.span();
+    match val {
+        Value::Record { val, .. } => {
+            let sorted = val
+                .into_owned()
+                .into_iter()
+                .sorted_by(|a, b| a.0.cmp(&b.0))
+                .collect_vec();
+
+            let record = sorted
+                .into_iter()
+                .map(|(k, v)| (k, sort_attributes(v)))
+                .collect();
+
+            Value::record(record, span)
+        }
+        Value::List { vals, .. } => {
+            Value::list(vals.into_iter().map(sort_attributes).collect_vec(), span)
+        }
+        other => other,
+    }
+}
+
+/// Serialize a `Value` to a NUON string for use as a hash-map key.
+///
+/// Record keys are sorted before serialization so that two equivalent records
+/// with different field ordering produce the same key. This is used by the set
+/// operation commands (`union`, `intersect`, `difference`) and by `uniq` for
+/// deduplication across all `Value` types.
+pub fn value_to_key(
+    engine_state: &EngineState,
+    value: &Value,
+    head: Span,
+) -> Result<String, ShellError> {
+    let value = sort_attributes(value.clone());
+    nuon::to_nuon(
+        engine_state,
+        &value,
+        nuon::ToNuonConfig::default().span(Some(head)),
+    )
+}
+
+/// Extract and validate the `other` list argument for set operations.
+///
+/// Used by `union`, `intersect`, and `difference` to parse their required
+/// list argument with a consistent error message.
+pub fn extract_other_list(
+    engine_state: &EngineState,
+    stack: &mut Stack,
+    call: &Call,
+    head: Span,
+) -> Result<Vec<Value>, ShellError> {
+    let other: Value = call.req(engine_state, stack, 0)?;
+    let other_type = other.get_type();
+    let other_span = other.span();
+    other.into_list().map_err(|_| ShellError::UnsupportedInput {
+        msg: "Expected a list from `other` argument".into(),
+        input: format!("{}", other_type),
+        msg_span: head,
+        input_span: other_span,
+    })
+}
+
 pub fn boolean_fold(
     engine_state: &EngineState,
     stack: &mut Stack,
@@ -26,50 +95,19 @@ pub fn boolean_fold(
     input: PipelineData,
     accumulator: bool,
 ) -> Result<PipelineData, ShellError> {
-    let span = call.head;
+    let head = call.head;
+    let closure: Closure = call.req(engine_state, stack, 0)?;
 
-    let capture_block: Closure = call.req(engine_state, stack, 0)?;
-    let block_id = capture_block.block_id;
+    let mut closure = ClosureEval::new(engine_state, stack, closure);
 
-    let block = engine_state.get_block(block_id);
-    let var_id = block.signature.get_positional(0).and_then(|arg| arg.var_id);
-    let mut stack = stack.captures_to_stack(capture_block.captures);
+    for value in input {
+        engine_state.signals().check(&head)?;
+        let pred = closure.run_with_value(value)?.into_value(head)?.is_true();
 
-    let orig_env_vars = stack.env_vars.clone();
-    let orig_env_hidden = stack.env_hidden.clone();
-
-    let ctrlc = engine_state.ctrlc.clone();
-    let engine_state = engine_state.clone();
-
-    for value in input.into_interruptible_iter(ctrlc) {
-        // with_env() is used here to ensure that each iteration uses
-        // a different set of environment variables.
-        // Hence, a 'cd' in the first loop won't affect the next loop.
-        stack.with_env(&orig_env_vars, &orig_env_hidden);
-
-        if let Some(var_id) = var_id {
-            stack.add_var(var_id, value.clone());
-        }
-
-        let eval = eval_block(
-            &engine_state,
-            &mut stack,
-            block,
-            value.into_pipeline_data(),
-            call.redirect_stdout,
-            call.redirect_stderr,
-        );
-        match eval {
-            Err(e) => {
-                return Err(e);
-            }
-            Ok(pipeline_data) => {
-                if pipeline_data.into_value(span).is_true() == accumulator {
-                    return Ok(Value::bool(accumulator, span).into_pipeline_data());
-                }
-            }
+        if pred == accumulator {
+            return Ok(Value::bool(accumulator, head).into_pipeline_data());
         }
     }
 
-    Ok(Value::bool(!accumulator, span).into_pipeline_data())
+    Ok(Value::bool(!accumulator, head).into_pipeline_data())
 }

@@ -1,15 +1,10 @@
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, PipelineData, ShellError, Signature, Spanned, SyntaxShape, Type, Value,
-};
-use rand::prelude::{thread_rng, Rng};
+use nu_engine::command_prelude::*;
+use rand::random_bool;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct RandomBool;
 
-impl Command for SubCommand {
+impl Command for RandomBool {
     fn name(&self) -> &str {
         "random bool"
     }
@@ -21,13 +16,13 @@ impl Command for SubCommand {
             .named(
                 "bias",
                 SyntaxShape::Number,
-                "Adjusts the probability of a \"true\" outcome",
+                "Adjusts the probability of a \"true\" outcome.",
                 Some('b'),
             )
             .category(Category::Random)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Generate a random boolean value."
     }
 
@@ -45,15 +40,15 @@ impl Command for SubCommand {
         bool(engine_state, stack, call)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Generate a random boolean value",
+                description: "Generate a random boolean value.",
                 example: "random bool",
                 result: None,
             },
             Example {
-                description: "Generate a random boolean value with a 75% chance of \"true\"",
+                description: "Generate a random boolean value with a 75% chance of \"true\".",
                 example: "random bool --bias 0.75",
                 result: None,
             },
@@ -81,10 +76,9 @@ fn bool(
         }
     }
 
-    let mut rng = thread_rng();
-    let bool_result: bool = rng.gen_bool(probability);
+    let bool_result: bool = random_bool(probability);
 
-    Ok(PipelineData::Value(Value::bool(bool_result, span), None))
+    Ok(PipelineData::value(Value::bool(bool_result, span), None))
 }
 
 #[cfg(test)]
@@ -92,9 +86,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(RandomBool)
     }
 }

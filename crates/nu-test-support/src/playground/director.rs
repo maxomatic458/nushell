@@ -1,5 +1,5 @@
-use super::nu_process::*;
 use super::EnvironmentVariable;
+use super::nu_process::*;
 use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Write;
@@ -14,21 +14,6 @@ pub struct Director {
 }
 
 impl Director {
-    pub fn cococo(&self, arg: &str) -> Self {
-        let mut process = NuProcess {
-            environment_vars: self.environment_vars.clone(),
-            ..Default::default()
-        };
-
-        process.args(&["--testbin", "cococo", arg]);
-        Director {
-            config: self.config.clone(),
-            executable: Some(process),
-            environment_vars: self.environment_vars.clone(),
-            ..Default::default()
-        }
-    }
-
     pub fn and_then(&mut self, commands: &str) -> &mut Self {
         let commands = commands.to_string();
 
@@ -60,15 +45,14 @@ impl Director {
             process.cwd(working_directory);
         }
 
-        process.arg("--skip-plugins");
         process.arg("--no-history");
         if let Some(config_file) = self.config.as_ref() {
             process.args(&[
-                "--config-file",
+                "--config",
                 config_file.to_str().expect("failed to convert."),
             ]);
         }
-        process.arg("--perf");
+        process.args(&["--log-level", "info"]);
 
         director.executable = Some(process);
         director
@@ -84,7 +68,7 @@ impl Director {
 }
 
 impl Executable for Director {
-    fn execute(&mut self) -> NuResult {
+    fn execute(&mut self) -> Result<Outcome, NuError> {
         use std::process::Stdio;
 
         match self.executable() {
@@ -104,7 +88,8 @@ impl Executable for Director {
                     .stdout(Stdio::piped())
                     // .stdin(Stdio::piped())
                     .stderr(Stdio::piped())
-                    .arg(format!("-c '{commands}'"))
+                    .arg("-c")
+                    .arg(commands)
                     .spawn()
                     .expect("It should be possible to run tests");
 

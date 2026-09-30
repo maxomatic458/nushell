@@ -1,10 +1,12 @@
+use crate::*;
 use nu_protocol::engine::{EngineState, StateWorkingSet};
 
-use crate::*;
-
 pub fn create_default_context() -> EngineState {
-    let mut engine_state = EngineState::new();
+    let engine_state = EngineState::new();
+    add_default_context(engine_state)
+}
 
+pub fn add_default_context(mut engine_state: EngineState) -> EngineState {
     let delta = {
         let mut working_set = StateWorkingSet::new(&engine_state);
 
@@ -17,6 +19,14 @@ pub fn create_default_context() -> EngineState {
         // Core
         bind_command! {
             Alias,
+            Attr,
+            AttrCategory,
+            AttrComplete,
+            AttrCompleteExternal,
+            AttrDeprecated,
+            AttrExample,
+            AttrInteractive,
+            AttrSearchTerms,
             Break,
             Collect,
             Const,
@@ -25,6 +35,7 @@ pub fn create_default_context() -> EngineState {
             Describe,
             Do,
             Echo,
+            Error,
             ErrorMake,
             ExportAlias,
             ExportCommand,
@@ -44,7 +55,6 @@ pub fn create_default_context() -> EngineState {
             OverlayList,
             OverlayNew,
             OverlayHide,
-            LazyMake,
             Let,
             Loop,
             Match,
@@ -63,9 +73,6 @@ pub fn create_default_context() -> EngineState {
             Version,
             While,
         };
-
-        //#[cfg(feature = "plugin")]
-        bind_command!(Register);
 
         working_set.render()
     };

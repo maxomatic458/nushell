@@ -1,13 +1,9 @@
 #![cfg(test)]
 
-//use nu_parser::ParseError;
 use nu_parser::*;
 use nu_protocol::{
-    //ast::{Expr, Expression, PipelineElement},
-    ast::{Expr, PipelineElement},
-    //engine::{Command, EngineState, Stack, StateWorkingSet},
+    ast::Expr,
     engine::{EngineState, StateWorkingSet},
-    //Signature, SyntaxShape,
 };
 
 pub fn do_test(test: &[u8], expected: &str, error_contains: Option<&str>) {
@@ -19,13 +15,11 @@ pub fn do_test(test: &[u8], expected: &str, error_contains: Option<&str>) {
     match working_set.parse_errors.first() {
         None => {
             assert_eq!(block.len(), 1);
-            let expressions = &block[0];
-            assert_eq!(expressions.len(), 1);
-            if let PipelineElement::Expression(_, expr) = &expressions[0] {
-                assert_eq!(expr.expr, Expr::String(expected.to_string()))
-            } else {
-                panic!("Not an expression")
-            }
+            let pipeline = &block.pipelines[0];
+            assert_eq!(pipeline.len(), 1);
+            let element = &pipeline.elements[0];
+            assert!(element.redirection.is_none());
+            assert_eq!(element.expr.expr, Expr::String(expected.to_string()));
         }
         Some(pev) => match error_contains {
             None => {
@@ -74,16 +68,23 @@ pub fn unicode_escapes_in_strings_expected_failures() {
         // template: Tc(br#""<string literal without #'s>"", "<pattern in expected error>")
         //deprecated Tc(br#""\u06e""#, "any shape"), // 4digit too short, next char is EOF
         //deprecatedTc(br#""\u06ex""#, "any shape"), // 4digit too short, next char is non-hex-digit
-        Tc(br#""hello \u{6e""#, "missing '}'"), // extended, missing close delim
+        Tc(br#""hello \u{6e""#, "missing closing '}'"), // extended, missing close delim
         Tc(
             br#""\u{39}8\u{000000000000000000000000000000000000000000000037}""#,
             "must be 1-6 hex digits",
         ), // hex too long, but small value
-        Tc(br#""\u{110000}""#, "max value 10FFF"), // max unicode <= 0x10ffff
+        Tc(br#""\u{110000}""#, "max codepoint 0x10FFFF"), // max unicode <= 0x10ffff
     ];
 
     for tci in test_vec {
         println!("Expecting failure containing: {}", tci.1);
         do_test(tci.0, "--success not expected--", Some(tci.1));
     }
+}
+
+#[test]
+pub fn trailing_backslash_escape_does_not_panic() {
+    // Incomplete quoted string (trailing escape) must not panic. Reported as
+    // Unclosed `"` (multi-span delimiter diagnostic), not a crash.
+    do_test(b"\"say \\", "--success not expected--", Some("Unclosed"));
 }

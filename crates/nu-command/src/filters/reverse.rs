@@ -1,9 +1,4 @@
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, IntoInterruptiblePipelineData, PipelineData, ShellError, Signature,
-    Type, Value,
-};
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
 pub struct Reverse;
@@ -22,7 +17,7 @@ impl Command for Reverse {
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Reverses the input list or table."
     }
 
@@ -30,11 +25,11 @@ impl Command for Reverse {
         vec!["convert, inverse, flip"]
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 example: "[0,1,2,3] | reverse",
-                description: "Reverse a list",
+                description: "Reverse a list.",
                 result: Some(Value::test_list(vec![
                     Value::test_int(3),
                     Value::test_int(2),
@@ -44,7 +39,7 @@ impl Command for Reverse {
             },
             Example {
                 example: "[{a: 1} {a: 2}] | reverse",
-                description: "Reverse a table",
+                description: "Reverse a table.",
                 result: Some(Value::test_list(vec![
                     Value::test_record(record! {
                         "a" => Value::test_int(2),
@@ -62,14 +57,13 @@ impl Command for Reverse {
         engine_state: &EngineState,
         _stack: &mut Stack,
         call: &Call,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let metadata = input.metadata();
-
-        #[allow(clippy::needless_collect)]
-        let v: Vec<_> = input.into_iter_strict(call.head)?.collect();
-        let iter = v.into_iter().rev();
-        Ok(iter.into_pipeline_data_with_metadata(metadata, engine_state.ctrlc.clone()))
+        let head = call.head;
+        let metadata = input.take_metadata();
+        let values = input.into_iter_strict(head)?.collect::<Vec<_>>();
+        let iter = values.into_iter().rev();
+        Ok(iter.into_pipeline_data_with_metadata(head, engine_state.signals().clone(), metadata))
     }
 }
 
@@ -78,9 +72,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Reverse {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Reverse)
     }
 }

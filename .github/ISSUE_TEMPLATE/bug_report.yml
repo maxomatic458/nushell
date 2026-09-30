@@ -1,19 +1,26 @@
 name: Bug Report
-description: Create a report to help us improve
-labels: ["needs-triage"]
+description: "Create a report of behavior that doesn't seem to be intended and help us improve"
+labels: ["status:needs-triage"]
 body: 
+  - type: checkboxes
+    attributes:
+      label: Bug report form
+      description: Thank you for your bug report.
+      options:
+        - label: I have done a basic search of the issue tracker to find any existing issues that are similar.
+        - label: I have checked that my version is at least the latest stable release available via my installation method.
   - type: textarea
     id: description
     attributes:
       label: Describe the bug
-      description: Thank you for your bug report.
+      description: Try to make it easy for us to understand what problem you are encountering.
     validations:
       required: true
   - type: textarea
     id: repro
     attributes:
       label: How to reproduce
-      description: Steps to reproduce the behavior
+      description: Steps to reproduce the behavior (including succinct code examples or screenshots of the observed behavior).
       placeholder: |
         1.
         2.
@@ -28,13 +35,6 @@ body:
       placeholder: I expected nu to...
     validations:
       required: true
-  - type: textarea
-    id: screenshots
-    attributes:
-      label: Screenshots
-      description: Please add any relevant screenshots here, if any
-    validations:
-      required: false
   - type: textarea
     id: config
     attributes:
@@ -55,10 +55,3 @@ body:
         | installed_plugins  | binaryview, chart bar, chart line, fetch, from bson, from sqlite, inc, match, post, ps, query json, s3, selector, start, sys, textview, to bson, to sqlite, tree, xpath |
     validations:
       required: true
-  - type: textarea
-    id: context
-    attributes:
-      label: Additional context
-      description: Add any other context about the problem here.
-    validations:
-      required: false

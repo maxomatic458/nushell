@@ -1,10 +1,35 @@
-use std::path::Path;
-
-use crate::{ast::Call, Alias, BlockId, Example, PipelineData, ShellError, Signature};
+use serde::{Deserialize, Serialize};
 
 use super::{EngineState, Stack, StateWorkingSet};
+use crate::{
+    Alias, BlockId, DeprecationEntry, DynamicCompletionCallRef, DynamicSuggestion, Example,
+    OutDest, PipelineData, ShellError, Signature, Span, Value, engine::Call,
+};
+use std::{
+    any::Any,
+    borrow::Cow,
+    fmt::{Debug, Display},
+};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArgType<'a> {
+    Flag(Cow<'a, str>),
+    Positional(usize),
+}
+
+impl<'a> Display for ArgType<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArgType::Flag(flag_name) => match flag_name {
+                Cow::Borrowed(v) => write!(f, "{v}"),
+                Cow::Owned(v) => write!(f, "{v}"),
+            },
+            ArgType::Positional(idx) => write!(f, "{idx}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandType {
     Builtin,
     Custom,
@@ -12,17 +37,36 @@ pub enum CommandType {
     External,
     Alias,
     Plugin,
-    Other,
 }
 
-pub trait Command: Send + Sync + CommandClone {
+impl Display for CommandType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let str = match self {
+            CommandType::Builtin => "built-in",
+            CommandType::Custom => "custom",
+            CommandType::Keyword => "keyword",
+            CommandType::External => "external",
+            CommandType::Alias => "alias",
+            CommandType::Plugin => "plugin",
+        };
+        write!(f, "{str}")
+    }
+}
+
+pub trait Command: Send + Sync + CommandClone + Any {
     fn name(&self) -> &str;
 
     fn signature(&self) -> Signature;
 
-    fn usage(&self) -> &str;
+    /// Short preferably single sentence description for the command.
+    ///
+    /// Will be shown with the completions etc.
+    fn description(&self) -> &str;
 
-    fn extra_usage(&self) -> &str {
+    /// Longer documentation description, if necessary.
+    ///
+    /// Will be shown below `description`
+    fn extra_description(&self) -> &str {
         ""
     }
 
@@ -41,69 +85,15 @@ pub trait Command: Send + Sync + CommandClone {
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         Err(ShellError::MissingConstEvalImpl { span: call.head })
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         Vec::new()
-    }
-
-    // This is a built-in command
-    fn is_builtin(&self) -> bool {
-        true
-    }
-
-    // This is a signature for a known external command
-    fn is_known_external(&self) -> bool {
-        false
-    }
-
-    // This is an alias of another command
-    fn is_alias(&self) -> bool {
-        false
-    }
-
-    // Return reference to the command as Alias
-    fn as_alias(&self) -> Option<&Alias> {
-        None
-    }
-
-    // This is an enhanced method to determine if a command is custom command or not
-    // since extern "foo" [] and def "foo" [] behaves differently
-    fn is_custom_command(&self) -> bool {
-        if self.get_block_id().is_some() {
-            true
-        } else {
-            self.is_known_external()
-        }
-    }
-
-    // Is a sub command
-    fn is_sub(&self) -> bool {
-        self.name().contains(' ')
-    }
-
-    // Is a parser keyword (source, def, etc.)
-    fn is_parser_keyword(&self) -> bool {
-        false
-    }
-
-    // Is a plugin command (returns plugin's path, type of shell if the declaration is a plugin)
-    fn is_plugin(&self) -> Option<(&Path, Option<&Path>)> {
-        None
-    }
-
-    // Whether can run in const evaluation in the parser
-    fn is_const(&self) -> bool {
-        false
-    }
-
-    // If command is a block i.e. def blah [] { }, get the block id
-    fn get_block_id(&self) -> Option<BlockId> {
-        None
     }
 
     // Related terms to help with command search
@@ -111,23 +101,106 @@ pub trait Command: Send + Sync + CommandClone {
         vec![]
     }
 
+    fn attributes(&self) -> Vec<(String, Value)> {
+        vec![]
+    }
+
+    // Whether can run in const evaluation in the parser
+    fn is_const(&self) -> bool {
+        false
+    }
+
+    // Is a sub command
+    fn is_sub(&self) -> bool {
+        self.name().contains(' ')
+    }
+
+    // If command is a block i.e. def blah [] { }, get the block id
+    fn block_id(&self) -> Option<BlockId> {
+        None
+    }
+
+    // Return reference to the command as Alias
+    fn as_alias(&self) -> Option<&Alias> {
+        None
+    }
+
+    /// The identity of the plugin, if this is a plugin command
+    #[cfg(feature = "plugin")]
+    fn plugin_identity(&self) -> Option<&crate::PluginIdentity> {
+        None
+    }
+
     fn command_type(&self) -> CommandType {
-        match (
-            self.is_builtin(),
-            self.is_custom_command(),
-            self.is_parser_keyword(),
-            self.is_known_external(),
-            self.is_alias(),
-            self.is_plugin().is_some(),
-        ) {
-            (true, false, false, false, false, false) => CommandType::Builtin,
-            (true, true, false, false, false, false) => CommandType::Custom,
-            (true, false, true, false, false, false) => CommandType::Keyword,
-            (false, true, false, true, false, false) => CommandType::External,
-            (_, _, _, _, true, _) => CommandType::Alias,
-            (true, false, false, false, false, true) => CommandType::Plugin,
-            _ => CommandType::Other,
-        }
+        CommandType::Builtin
+    }
+
+    fn is_builtin(&self) -> bool {
+        self.command_type() == CommandType::Builtin
+    }
+
+    fn is_custom(&self) -> bool {
+        self.command_type() == CommandType::Custom
+    }
+
+    fn is_keyword(&self) -> bool {
+        self.command_type() == CommandType::Keyword
+    }
+
+    fn is_known_external(&self) -> bool {
+        self.command_type() == CommandType::External
+    }
+
+    /// The span of this command's declaration, if available.
+    /// Used to look up the source file where the command was declared.
+    /// Applicable to any command type that knows its declaration site.
+    fn decl_span(&self) -> Option<Span> {
+        None
+    }
+
+    fn is_alias(&self) -> bool {
+        self.command_type() == CommandType::Alias
+    }
+
+    fn is_plugin(&self) -> bool {
+        self.command_type() == CommandType::Plugin
+    }
+
+    fn deprecation_info(&self) -> Vec<DeprecationEntry> {
+        vec![]
+    }
+
+    fn pipe_redirection(&self) -> (Option<OutDest>, Option<OutDest>) {
+        (None, None)
+    }
+
+    // engine_state and stack are required to get completion from plugin.
+    /// Get completion items for `arg_type`.
+    ///
+    /// It's useful when you want to get auto completion items of a flag or positional argument
+    /// dynamically.
+    ///
+    /// The implementation can returns 3 types of return values:
+    /// - None: I couldn't find any suggestions, please fall back to default completions
+    /// - Some(vec![]): there are no suggestions
+    /// - Some(vec![item1, item2]): item1 and item2 are available
+    #[allow(unused_variables)]
+    #[expect(deprecated)]
+    fn get_dynamic_completion(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        call: DynamicCompletionCallRef,
+        arg_type: &ArgType,
+        _experimental: ExperimentalMarker,
+    ) -> Result<Option<Vec<DynamicSuggestion>>, ShellError> {
+        Ok(None)
+    }
+
+    /// Return true if the AST nodes for the arguments are required for IR evaluation. This is
+    /// currently inefficient so is not generally done.
+    fn requires_ast_for_arguments(&self) -> bool {
+        false
     }
 }
 
@@ -149,3 +222,11 @@ impl Clone for Box<dyn Command> {
         self.clone_box()
     }
 }
+
+/// Marker type for tagging [`Command`] methods as experimental.
+///
+/// Add this marker as a parameter to a method to make implementors see a deprecation warning when
+/// they implement it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[deprecated(note = "this method is very experimental, likely to change")]
+pub struct ExperimentalMarker;

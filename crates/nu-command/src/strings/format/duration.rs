@@ -1,13 +1,12 @@
-use nu_cmd_base::input_handler::{operate, CmdArgument};
-use nu_engine::CallExt;
-use nu_protocol::ast::{Call, CellPath};
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value,
-};
+use nu_cmd_base::input_handler::{CmdArgument, operate};
+use nu_engine::command_prelude::*;
+
+pub const SUPPORTED_UNITS: &[&str] = &[
+    "ns", "us", "µs", "ms", "sec", "min", "hr", "day", "wk", "month", "yr", "dec",
+];
 
 struct Arguments {
-    format_value: String,
+    format_value: Spanned<String>,
     float_precision: usize,
     cell_paths: Option<Vec<CellPath>>,
 }
@@ -34,14 +33,14 @@ impl Command for FormatDuration {
                     Type::List(Box::new(Type::Duration)),
                     Type::List(Box::new(Type::String)),
                 ),
-                (Type::Table(vec![]), Type::Table(vec![])),
+                (Type::table(), Type::table()),
             ])
             .allow_variants_without_examples(true)
-            .required(
-                "format value",
-                SyntaxShape::String,
-                "The unit in which to display the duration.",
-            )
+            .param(Parameter::Required(
+                PositionalArg::new("format value", SyntaxShape::String)
+                    .desc("The unit in which to display the duration.")
+                    .completion(Completion::new_list(SUPPORTED_UNITS)),
+            ))
             .rest(
                 "rest",
                 SyntaxShape::CellPath,
@@ -50,12 +49,16 @@ impl Command for FormatDuration {
             .category(Category::Strings)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Outputs duration with a specified unit of time."
     }
 
     fn search_terms(&self) -> Vec<&str> {
         vec!["convert", "display", "pattern", "human readable"]
+    }
+
+    fn is_const(&self) -> bool {
+        true
     }
 
     fn run(
@@ -65,10 +68,12 @@ impl Command for FormatDuration {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let format_value = call
-            .req::<Value>(engine_state, stack, 0)?
-            .as_string()?
-            .to_ascii_lowercase();
+        let format_value = call.req::<Value>(engine_state, stack, 0)?;
+        let format_value_span = format_value.span();
+        let format_value = Spanned {
+            item: format_value.coerce_into_string()?.to_ascii_lowercase(),
+            span: format_value_span,
+        };
         let cell_paths: Vec<CellPath> = call.rest(engine_state, stack, 1)?;
         let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
         let float_precision = engine_state.config.float_precision as usize;
@@ -82,19 +87,49 @@ impl Command for FormatDuration {
             arg,
             input,
             call.head,
-            engine_state.ctrlc.clone(),
+            engine_state.signals(),
         )
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn run_const(
+        &self,
+        working_set: &StateWorkingSet,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let format_value = call.req_const::<Value>(working_set, stack, 0)?;
+        let format_value_span = format_value.span();
+        let format_value = Spanned {
+            item: format_value.coerce_into_string()?.to_ascii_lowercase(),
+            span: format_value_span,
+        };
+        let cell_paths: Vec<CellPath> = call.rest_const(working_set, stack, 1)?;
+        let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
+        let float_precision = working_set.permanent().config.float_precision as usize;
+        let arg = Arguments {
+            format_value,
+            float_precision,
+            cell_paths,
+        };
+        operate(
+            format_value_impl,
+            arg,
+            input,
+            call.head,
+            working_set.permanent().signals(),
+        )
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Convert µs duration to the requested second duration as a string",
+                description: "Convert µs duration to the requested second duration as a string.",
                 example: "1000000µs | format duration sec",
                 result: Some(Value::test_string("1 sec")),
             },
             Example {
-                description: "Convert durations to µs duration as strings",
+                description: "Convert durations to µs duration as strings.",
                 example: "[1sec 2sec] | format duration µs",
                 result: Some(Value::test_list(vec![
                     Value::test_string("1000000 µs"),
@@ -102,7 +137,7 @@ impl Command for FormatDuration {
                 ])),
             },
             Example {
-                description: "Convert duration to µs as a string if unit asked for was us",
+                description: "Convert duration to µs as a string if unit asked for was us.",
                 example: "1sec | format duration us",
                 result: Some(Value::test_string("1000000 µs")),
             },
@@ -116,17 +151,17 @@ fn format_value_impl(val: &Value, arg: &Arguments, span: Span) -> Value {
         Value::Duration { val: inner, .. } => {
             let duration = *inner;
             let float_precision = arg.float_precision;
-            match convert_inner_to_unit(duration, &arg.format_value, span, inner_span) {
+            match convert_inner_to_unit(duration, &arg.format_value.item, arg.format_value.span) {
                 Ok(d) => {
-                    let unit = if &arg.format_value == "us" {
+                    let unit = if &arg.format_value.item == "us" {
                         "µs"
                     } else {
-                        &arg.format_value
+                        &arg.format_value.item
                     };
                     if d.fract() == 0.0 {
-                        Value::string(format!("{} {}", d, unit), inner_span)
+                        Value::string(format!("{d} {unit}"), inner_span)
                     } else {
-                        Value::string(format!("{:.float_precision$} {}", d, unit), inner_span)
+                        Value::string(format!("{d:.float_precision$} {unit}"), inner_span)
                     }
                 }
                 Err(e) => Value::error(e, inner_span),
@@ -145,12 +180,7 @@ fn format_value_impl(val: &Value, arg: &Arguments, span: Span) -> Value {
     }
 }
 
-fn convert_inner_to_unit(
-    val: i64,
-    to_unit: &str,
-    span: Span,
-    value_span: Span,
-) -> Result<f64, ShellError> {
+fn convert_inner_to_unit(val: i64, to_unit: &str, span: Span) -> Result<f64, ShellError> {
     match to_unit {
         "ns" => Ok(val as f64),
         "us" => Ok(val as f64 / 1000.0),
@@ -166,25 +196,19 @@ fn convert_inner_to_unit(
         "yr" => Ok(val as f64 / 1000.0 / 1000.0 / 1000.0 / 60.0 / 60.0 / 24.0 / 365.0),
         "dec" => Ok(val as f64 / 10.0 / 1000.0 / 1000.0 / 1000.0 / 60.0 / 60.0 / 24.0 / 365.0),
 
-        _ => Err(ShellError::CantConvertToDuration {
-            details: to_unit.to_string(),
-            dst_span: span,
-            src_span: value_span,
-            help: Some(
-                "supported units are ns, us/µs, ms, sec, min, hr, day, wk, month, yr, and dec"
-                    .to_string(),
-            ),
+        _ => Err(ShellError::InvalidUnit {
+            span,
+            supported_units: SUPPORTED_UNITS.join(", "),
         }),
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(FormatDuration)
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(FormatDuration)
     }
 }

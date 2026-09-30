@@ -1,10 +1,5 @@
-use nu_cmd_base::input_handler::{operate, CellPathOnlyArgs};
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::ast::CellPath;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::Category;
-use nu_protocol::{Example, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value};
+use nu_cmd_base::input_handler::{CellPathOnlyArgs, operate};
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
 pub struct BytesLen;
@@ -22,8 +17,8 @@ impl Command for BytesLen {
                     Type::List(Box::new(Type::Binary)),
                     Type::List(Box::new(Type::Int)),
                 ),
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true)
             .rest(
@@ -34,7 +29,7 @@ impl Command for BytesLen {
             .category(Category::Bytes)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Output the length of any bytes in the pipeline."
     }
 
@@ -49,20 +44,20 @@ impl Command for BytesLen {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let cell_paths: Vec<CellPath> = call.rest(engine_state, stack, 1)?;
+        let cell_paths: Vec<CellPath> = call.rest(engine_state, stack, 0)?;
         let arg = CellPathOnlyArgs::from(cell_paths);
-        operate(length, arg, input, call.head, engine_state.ctrlc.clone())
+        operate(length, arg, input, call.head, engine_state.signals())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Return the length of a binary",
+                description: "Return the length of a binary.",
                 example: "0x[1F FF AA AB] | bytes length",
                 result: Some(Value::test_int(4)),
             },
             Example {
-                description: "Return the lengths of multiple binaries",
+                description: "Return the lengths of multiple binaries.",
                 example: "[0x[1F FF AA AB] 0x[1F]] | bytes length",
                 result: Some(Value::list(
                     vec![Value::test_int(4), Value::test_int(1)],
@@ -70,6 +65,28 @@ impl Command for BytesLen {
                 )),
             },
         ]
+    }
+
+    fn is_const(&self) -> bool {
+        true
+    }
+
+    fn run_const(
+        &self,
+        working_set: &StateWorkingSet,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let cell_paths: Vec<CellPath> = call.rest_const(working_set, stack, 0)?;
+        let arg = CellPathOnlyArgs::from(cell_paths);
+        operate(
+            length,
+            arg,
+            input,
+            call.head,
+            working_set.permanent().signals(),
+        )
     }
 }
 
@@ -96,9 +113,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(BytesLen {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(BytesLen)
     }
 }

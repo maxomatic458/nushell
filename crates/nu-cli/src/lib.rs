@@ -1,30 +1,35 @@
+#![doc = include_str!("../README.md")]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 mod commands;
 mod completions;
 mod config_files;
 mod eval_cmds;
 mod eval_file;
+mod hints;
 mod menus;
-mod nu_highlight;
-mod print;
 mod prompt;
 mod prompt_update;
 mod reedline_config;
 mod repl;
+mod startup_context;
 mod syntax_highlight;
 mod util;
 mod validation;
 
 pub use commands::add_cli_context;
-pub use completions::{FileCompletion, NuCompleter};
-pub use config_files::eval_config_contents;
-pub use eval_cmds::evaluate_commands;
+pub use completions::{
+    CompletionEngine, FileCompletion, NuCompleter, SemanticSuggestion, SuggestionKind,
+    completion_source_is_active,
+};
+pub use config_files::{eval_config_contents, eval_config_contents_with_kind};
+pub use eval_cmds::{EvaluateCommandsOpts, evaluate_commands};
 pub use eval_file::evaluate_file;
 pub use menus::NuHelpCompleter;
-pub use nu_cmd_base::util::get_init_cwd;
-pub use nu_highlight::NuHighlight;
-pub use print::Print;
 pub use prompt::NushellPrompt;
+pub use prompt_update::update_prompt;
 pub use repl::evaluate_repl;
+pub use startup_context::{StartupFileKind, StartupLoadContext, report_startup_file_not_found};
 pub use syntax_highlight::NuHighlighter;
 pub use util::{eval_source, gather_parent_env_vars};
 pub use validation::NuValidator;
@@ -32,4 +37,13 @@ pub use validation::NuValidator;
 #[cfg(feature = "plugin")]
 pub use config_files::add_plugin_file;
 #[cfg(feature = "plugin")]
+pub use config_files::migrate_old_plugin_file;
+#[cfg(feature = "plugin")]
 pub use config_files::read_plugin_file;
+
+#[cfg(test)]
+#[macro_use]
+extern crate nu_test_support;
+
+#[cfg(test)]
+use nu_test_support::harness::main;

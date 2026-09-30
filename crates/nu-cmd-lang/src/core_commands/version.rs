@@ -1,11 +1,66 @@
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack, StateWorkingSet};
-use nu_protocol::{
-    Category, Example, IntoPipelineData, PipelineData, Record, ShellError, Signature, Type, Value,
-};
+use std::{borrow::Cow, sync::OnceLock};
+
+use itertools::Itertools;
+use nu_engine::command_prelude::*;
+use nu_protocol::engine::StateWorkingSet;
 use shadow_rs::shadow;
 
 shadow!(build);
+
+/// Static container for the version shown by the `version` command.
+///
+/// By default, this falls back to `nu_cmd_lang`'s own crate version
+/// (`env!("CARGO_PKG_VERSION")`).
+///
+/// If you're embedding Nushell (or wiring `nu_cmd_lang` into another binary),
+/// set this static before calling `version` so it reports your host binary's version.
+///
+/// ```no_run
+/// let version = env!("CARGO_PKG_VERSION")
+///     .parse()
+///     .expect("cargo sets valid version");
+///
+/// nu_cmd_lang::VERSION
+///     .set(version)
+///     .expect("VERSION is unset");
+/// ```
+pub static VERSION: OnceLock<semver::Version> = OnceLock::new();
+
+/// Static container for the cargo features used by the `version` command.
+///
+/// This `OnceLock` holds the features from `nu`.
+/// When you build `nu_cmd_lang`, Cargo doesn't pass along the same features that `nu` itself uses.
+/// By setting this static before calling `version`, you make it show `nu`'s features instead
+/// of `nu_cmd_lang`'s.
+///
+/// Embedders can set this to any feature list they need, but in most cases you'll probably want to
+/// pass the cargo features of your host binary.
+///
+/// # How to get cargo features in your build script
+///
+/// In your binary's build script:
+/// ```no_run
+/// // Re-export CARGO_CFG_FEATURE to the main binary.
+/// // It holds all the features that cargo sets for your binary as a comma-separated list.
+/// println!(
+///     "cargo:rustc-env=NU_FEATURES={}",
+///     std::env::var("CARGO_CFG_FEATURE").expect("set by cargo")
+/// );
+/// ```
+///
+/// Then, before you call `version`:
+/// ```ignore
+/// // This uses static strings, but since we're using `Cow`, you can also pass owned strings.
+/// let features = env!("NU_FEATURES")
+///     .split(',')
+///     .map(Cow::Borrowed)
+///     .collect();
+///
+/// nu_cmd_lang::VERSION_NU_FEATURES
+///     .set(features)
+///     .expect("couldn't set VERSION_NU_FEATURES");
+/// ```
+pub static VERSION_NU_FEATURES: OnceLock<Vec<Cow<'static, str>>> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct Version;
@@ -17,12 +72,12 @@ impl Command for Version {
 
     fn signature(&self) -> Signature {
         Signature::build("version")
-            .input_output_types(vec![(Type::Nothing, Type::Record(vec![]))])
+            .input_output_types(vec![(Type::Nothing, Type::record())])
             .allow_variants_without_examples(true)
             .category(Category::Core)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Display Nu version, and its build configuration."
     }
 
@@ -37,176 +92,161 @@ impl Command for Version {
         call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        version(engine_state, call)
+        version(engine_state, call.head)
     }
 
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        _stack: &mut Stack,
         call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        version(working_set.permanent(), call)
+        version(working_set.permanent(), call.head)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
-            description: "Display Nu version",
+            description: "Display Nu version.",
             example: "version",
             result: None,
         }]
     }
 }
 
-pub fn version(engine_state: &EngineState, call: &Call) -> Result<PipelineData, ShellError> {
-    // Pre-allocate the arrays in the worst case (12 items):
-    // - version
-    // - branch
-    // - commit_hash
-    // - build_os
-    // - build_target
-    // - rust_version
-    // - cargo_version
-    // - build_time
-    // - build_rust_channel
-    // - features
-    // - installed_plugins
-    let mut record = Record::with_capacity(12);
+fn push_non_empty(record: &mut Record, name: &str, value: &str, span: Span) {
+    if !value.is_empty() {
+        record.push(name, Value::string(value, span))
+    }
+}
 
-    record.push(
+fn load_version() -> Cow<'static, semver::Version> {
+    match VERSION.get() {
+        Some(version) => Cow::Borrowed(version),
+        None => Cow::Owned(
+            semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("cargo sets valid version"),
+        ),
+    }
+}
+
+pub fn version(engine_state: &EngineState, span: Span) -> Result<PipelineData, ShellError> {
+    // Pre-allocate the arrays in the worst case:
+    const VERSION_MAX_ROWS: usize = [
         "version",
-        Value::string(env!("CARGO_PKG_VERSION"), call.head),
+        "major",
+        "minor",
+        "patch",
+        "pre",
+        "build",
+        "branch",
+        "commit_hash",
+        "build_os",
+        "build_target",
+        "rust_version",
+        "rust_channel",
+        "cargo_version",
+        "build_time",
+        "build_rust_channel",
+        "allocator",
+        "features",
+        "installed_plugins",
+    ]
+    .len();
+
+    let mut record = Record::with_capacity(VERSION_MAX_ROWS);
+
+    let version = load_version();
+    record.push("version", Value::string(version.to_string(), span));
+    record.push("major", Value::int(version.major as i64, span));
+    record.push("minor", Value::int(version.minor as i64, span));
+    record.push("patch", Value::int(version.patch as i64, span));
+    push_non_empty(&mut record, "pre", version.pre.as_str(), span);
+    push_non_empty(&mut record, "build", version.build.as_str(), span);
+
+    record.push("branch", Value::string(build::BRANCH, span));
+
+    if let Some(commit_hash) = option_env!("NU_COMMIT_HASH") {
+        record.push("commit_hash", Value::string(commit_hash, span));
+    }
+
+    push_non_empty(&mut record, "build_os", build::BUILD_OS, span);
+    push_non_empty(&mut record, "build_target", build::BUILD_TARGET, span);
+    push_non_empty(&mut record, "rust_version", build::RUST_VERSION, span);
+    push_non_empty(&mut record, "rust_channel", build::RUST_CHANNEL, span);
+    push_non_empty(&mut record, "cargo_version", build::CARGO_VERSION, span);
+    push_non_empty(&mut record, "build_time", build::BUILD_TIME, span);
+    push_non_empty(
+        &mut record,
+        "build_rust_channel",
+        build::BUILD_RUST_CHANNEL,
+        span,
     );
 
-    record.push("branch", Value::string(build::BRANCH, call.head));
-
-    let commit_hash = option_env!("NU_COMMIT_HASH");
-    if let Some(commit_hash) = commit_hash {
-        record.push("commit_hash", Value::string(commit_hash, call.head));
-    }
-
-    let build_os = Some(build::BUILD_OS).filter(|x| !x.is_empty());
-    if let Some(build_os) = build_os {
-        record.push("build_os", Value::string(build_os, call.head));
-    }
-
-    let build_target = Some(build::BUILD_TARGET).filter(|x| !x.is_empty());
-    if let Some(build_target) = build_target {
-        record.push("build_target", Value::string(build_target, call.head));
-    }
-
-    let rust_version = Some(build::RUST_VERSION).filter(|x| !x.is_empty());
-    if let Some(rust_version) = rust_version {
-        record.push("rust_version", Value::string(rust_version, call.head));
-    }
-
-    let rust_channel = Some(build::RUST_CHANNEL).filter(|x| !x.is_empty());
-    if let Some(rust_channel) = rust_channel {
-        record.push("rust_channel", Value::string(rust_channel, call.head));
-    }
-
-    let cargo_version = Some(build::CARGO_VERSION).filter(|x| !x.is_empty());
-    if let Some(cargo_version) = cargo_version {
-        record.push("cargo_version", Value::string(cargo_version, call.head));
-    }
-
-    let build_time = Some(build::BUILD_TIME).filter(|x| !x.is_empty());
-    if let Some(build_time) = build_time {
-        record.push("build_time", Value::string(build_time, call.head));
-    }
-
-    let build_rust_channel = Some(build::BUILD_RUST_CHANNEL).filter(|x| !x.is_empty());
-    if let Some(build_rust_channel) = build_rust_channel {
-        record.push(
-            "build_rust_channel",
-            Value::string(build_rust_channel, call.head),
-        );
-    }
-
-    record.push("allocator", Value::string(global_allocator(), call.head));
+    record.push("allocator", Value::string(global_allocator(), span));
 
     record.push(
         "features",
-        Value::string(features_enabled().join(", "), call.head),
+        Value::string(
+            VERSION_NU_FEATURES
+                .get()
+                .as_ref()
+                .map(|v| v.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .filter(|f| !f.starts_with("dep:"))
+                .join(", "),
+            span,
+        ),
     );
 
-    // Get a list of command names and check for plugins
-    let installed_plugins = engine_state
-        .plugin_decls()
-        .filter(|x| x.is_plugin().is_some())
-        .map(|x| x.name())
-        .collect::<Vec<_>>();
+    #[cfg(not(feature = "plugin"))]
+    let _ = engine_state;
+
+    #[cfg(feature = "plugin")]
+    {
+        // Get a list of plugin names and versions if present
+        let installed_plugins = engine_state
+            .plugins()
+            .iter()
+            .map(|x| {
+                let name = x.identity().name();
+                if let Some(version) = x.metadata().and_then(|m| m.version) {
+                    format!("{name} {version}")
+                } else {
+                    name.into()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        record.push(
+            "installed_plugins",
+            Value::string(installed_plugins.join(", "), span),
+        );
+    }
 
     record.push(
-        "installed_plugins",
-        Value::string(installed_plugins.join(", "), call.head),
+        "experimental_options",
+        Value::string(
+            nu_experimental::ALL
+                .iter()
+                .map(|option| format!("{}={}", option.identifier(), option.get()))
+                .join(", "),
+            span,
+        ),
     );
 
-    Ok(Value::record(record, call.head).into_pipeline_data())
+    Ok(Value::record(record, span).into_pipeline_data())
 }
 
 fn global_allocator() -> &'static str {
-    if cfg!(feature = "mimalloc") {
-        "mimalloc"
-    } else {
-        "standard"
-    }
-}
-
-fn features_enabled() -> Vec<String> {
-    let mut names = vec!["default".to_string()];
-
-    // NOTE: There should be another way to know features on.
-
-    #[cfg(feature = "which-support")]
-    {
-        names.push("which".to_string());
-    }
-
-    // always include it?
-    names.push("zip".to_string());
-
-    #[cfg(feature = "trash-support")]
-    {
-        names.push("trash".to_string());
-    }
-
-    #[cfg(feature = "sqlite")]
-    {
-        names.push("sqlite".to_string());
-    }
-
-    #[cfg(feature = "dataframe")]
-    {
-        names.push("dataframe".to_string());
-    }
-
-    #[cfg(feature = "static-link-openssl")]
-    {
-        names.push("static-link-openssl".to_string());
-    }
-
-    #[cfg(feature = "extra")]
-    {
-        names.push("extra".to_string());
-    }
-
-    #[cfg(feature = "wasi")]
-    {
-        names.push("wasi".to_string());
-    }
-
-    names.sort();
-
-    names
+    "standard"
 }
 
 #[cfg(test)]
 mod test {
     #[test]
-    fn test_examples() {
+    fn test_examples() -> nu_test_support::Result {
         use super::Version;
-        use crate::test_examples;
-        test_examples(Version {})
+        nu_test_support::test().examples(Version)
     }
 }

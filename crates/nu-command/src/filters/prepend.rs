@@ -1,10 +1,4 @@
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, IntoInterruptiblePipelineData, IntoPipelineData, PipelineData, ShellError,
-    Signature, SyntaxShape, Type, Value,
-};
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
 pub struct Prepend;
@@ -25,26 +19,26 @@ impl Command for Prepend {
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Prepend any number of rows to a table."
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"Be aware that this command 'unwraps' lists passed to it. So, if you pass a variable to it,
+    fn extra_description(&self) -> &str {
+        "Be aware that this command 'unwraps' lists passed to it. So, if you pass a variable to it,
 and you want the variable's contents to be prepended without being unwrapped, it's wise to
 pre-emptively wrap the variable in a list, like so: `prepend [$val]`. This way, `prepend` will
-only unwrap the outer list, and leave the variable's contents untouched."#
+only unwrap the outer list, and leave the variable's contents untouched."
     }
 
     fn search_terms(&self) -> Vec<&str> {
         vec!["add", "concatenate"]
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 example: "0 | prepend [1 2 3]",
-                description: "prepend a list to an item",
+                description: "Prepend a list to an item.",
                 result: Some(Value::test_list(vec![
                     Value::test_int(1),
                     Value::test_int(2),
@@ -54,7 +48,7 @@ only unwrap the outer list, and leave the variable's contents untouched."#
             },
             Example {
                 example: r#""a" | prepend ["b"] "#,
-                description: "Prepend a list of strings to a string",
+                description: "Prepend a list of strings to a string.",
                 result: Some(Value::test_list(vec![
                     Value::test_string("b"),
                     Value::test_string("a"),
@@ -62,7 +56,7 @@ only unwrap the outer list, and leave the variable's contents untouched."#
             },
             Example {
                 example: "[1 2 3 4] | prepend 0",
-                description: "Prepend one int item",
+                description: "Prepend one int item.",
                 result: Some(Value::test_list(vec![
                     Value::test_int(0),
                     Value::test_int(1),
@@ -73,7 +67,7 @@ only unwrap the outer list, and leave the variable's contents untouched."#
             },
             Example {
                 example: "[2 3 4] | prepend [0 1]",
-                description: "Prepend two int items",
+                description: "Prepend two int items.",
                 result: Some(Value::test_list(vec![
                     Value::test_int(0),
                     Value::test_int(1),
@@ -84,7 +78,7 @@ only unwrap the outer list, and leave the variable's contents untouched."#
             },
             Example {
                 example: "[2 nu 4 shell] | prepend [0 1 rocks]",
-                description: "Prepend ints and strings",
+                description: "Prepend ints and strings.",
                 result: Some(Value::test_list(vec![
                     Value::test_int(0),
                     Value::test_int(1),
@@ -97,7 +91,7 @@ only unwrap the outer list, and leave the variable's contents untouched."#
             },
             Example {
                 example: "[3 4] | prepend 0..2",
-                description: "Prepend a range",
+                description: "Prepend a range.",
                 result: Some(Value::test_list(vec![
                     Value::test_int(0),
                     Value::test_int(1),
@@ -114,16 +108,16 @@ only unwrap the outer list, and leave the variable's contents untouched."#
         engine_state: &EngineState,
         stack: &mut Stack,
         call: &Call,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let other: Value = call.req(engine_state, stack, 0)?;
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
 
         Ok(other
             .into_pipeline_data()
             .into_iter()
             .chain(input)
-            .into_pipeline_data_with_metadata(metadata, engine_state.ctrlc.clone()))
+            .into_pipeline_data_with_metadata(call.head, engine_state.signals().clone(), metadata))
     }
 }
 
@@ -132,9 +126,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Prepend {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Prepend)
     }
 }

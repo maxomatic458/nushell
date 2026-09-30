@@ -1,95 +1,78 @@
-use crate::util::eval_source;
-use log::info;
-use log::trace;
-use miette::{IntoDiagnostic, Result};
+use crate::util::{eval_parsed_block_source, eval_source, print_pipeline};
+use log::{info, trace};
 use nu_engine::eval_block;
-use nu_engine::{convert_env_values, current_dir};
 use nu_parser::parse;
-use nu_path::canonicalize_with;
-use nu_protocol::report_error;
+use nu_path::absolute_with;
 use nu_protocol::{
-    ast::Call,
+    PipelineData, ShellError, Span, Value,
+    debugger::WithoutDebug,
     engine::{EngineState, Stack, StateWorkingSet},
-    Config, PipelineData, ShellError, Span, Value,
+    report_error::report_compile_error,
+    report_parse_error, report_parse_warning,
+    shell_error::io::*,
 };
-use nu_utils::stdout_write_all_and_flush;
+use std::{path::PathBuf, sync::Arc};
 
-/// Main function used when a file path is found as argument for nu
+/// Entry point for evaluating a file.
+///
+/// If the file contains a main command, it is invoked with `args` and the pipeline data from `input`;
+/// otherwise, the pipeline data is forwarded to the first command in the file, and `args` are ignored.
 pub fn evaluate_file(
     path: String,
     args: &[String],
     engine_state: &mut EngineState,
     stack: &mut Stack,
     input: PipelineData,
-) -> Result<()> {
-    // Translate environment variables from Strings to Values
-    if let Some(e) = convert_env_values(engine_state, stack) {
-        let working_set = StateWorkingSet::new(engine_state);
-        report_error(&working_set, &e);
-        std::process::exit(1);
-    }
+) -> Result<(), ShellError> {
+    let cwd = engine_state.cwd_as_string(Some(stack))?;
 
-    let cwd = current_dir(engine_state, stack)?;
+    let file_path = {
+        match absolute_with(&path, cwd) {
+            Ok(t) => Ok(t),
+            Err(err) => Err(IoError::new_internal_with_path(
+                err,
+                "Invalid path",
+                PathBuf::from(&path),
+            )),
+        }
+    }?;
 
-    let file_path = canonicalize_with(&path, cwd).unwrap_or_else(|e| {
-        let working_set = StateWorkingSet::new(engine_state);
-        report_error(
-            &working_set,
-            &ShellError::FileNotFoundCustom {
-                msg: format!("Could not access file '{}': {:?}", path, e.to_string()),
-                span: Span::unknown(),
-            },
-        );
-        std::process::exit(1);
-    });
+    let file_path_str = file_path
+        .to_str()
+        .ok_or_else(|| ShellError::NonUtf8Custom {
+            msg: format!(
+                "Input file name '{}' is not valid UTF8",
+                file_path.to_string_lossy()
+            ),
+            // No call span available during file evaluation startup
+            span: Span::unknown(),
+        })?;
 
-    let file_path_str = file_path.to_str().unwrap_or_else(|| {
-        let working_set = StateWorkingSet::new(engine_state);
-        report_error(
-            &working_set,
-            &ShellError::NonUtf8Custom {
-                msg: format!(
-                    "Input file name '{}' is not valid UTF8",
-                    file_path.to_string_lossy()
-                ),
-                span: Span::unknown(),
-            },
-        );
-        std::process::exit(1);
-    });
+    let file = std::fs::read(&file_path).map_err(|err| {
+        let cmdline = format!("nu {path} {}", args.join(" "));
+        let mut working_set = StateWorkingSet::new(engine_state);
+        let file_id = working_set.add_file("<commandline>", cmdline.as_bytes());
+        let span = working_set
+            .get_span_for_file(file_id)
+            .subspan(3, path.len() + 3)
+            .expect("<commandline> to contain script path");
+        if let Err(err) = engine_state.merge_delta(working_set.render()) {
+            err
+        } else {
+            IoError::new(err.not_found_as(NotFound::File), span, PathBuf::from(&path)).into()
+        }
+    })?;
+    engine_state.file = Some(file_path.clone());
 
-    let file = std::fs::read(&file_path)
-        .into_diagnostic()
-        .unwrap_or_else(|e| {
-            let working_set = StateWorkingSet::new(engine_state);
-            report_error(
-                &working_set,
-                &ShellError::FileNotFoundCustom {
-                    msg: format!(
-                        "Could not read file '{}': {:?}",
-                        file_path_str,
-                        e.to_string()
-                    ),
-                    span: Span::unknown(),
-                },
-            );
-            std::process::exit(1);
-        });
+    let parent = file_path.parent().ok_or_else(|| {
+        IoError::new_internal_with_path(
+            ErrorKind::DirectoryNotFound,
+            "The file path does not have a parent",
+            file_path.clone(),
+        )
+    })?;
 
-    engine_state.start_in_file(Some(file_path_str));
-
-    let parent = file_path.parent().unwrap_or_else(|| {
-        let working_set = StateWorkingSet::new(engine_state);
-        report_error(
-            &working_set,
-            &ShellError::FileNotFoundCustom {
-                msg: format!("The file path '{file_path_str}' does not have a parent"),
-                span: Span::unknown(),
-            },
-        );
-        std::process::exit(1);
-    });
-
+    // These env vars are set before parsing, so no source span is available
     stack.add_env_var(
         "FILE_PWD".to_string(),
         Value::string(parent.to_string_lossy(), Span::unknown()),
@@ -105,81 +88,127 @@ pub fn evaluate_file(
 
     let source_filename = file_path
         .file_name()
-        .expect("internal error: script missing filename");
+        .expect("internal error: missing filename");
+
+    // we'll need the script name repeatedly; keep both String and bytes
+    let script_name = source_filename.to_string_lossy().to_string();
+    let script_name_bytes = script_name.as_bytes().to_vec();
 
     let mut working_set = StateWorkingSet::new(engine_state);
-    trace!("parsing file: {}", file_path_str);
+    trace!("parsing file: {file_path_str}");
     let block = parse(&mut working_set, Some(file_path_str), &file, false);
 
+    if let Some(warning) = working_set.parse_warnings.first() {
+        report_parse_warning(None, &working_set, warning);
+    }
+
+    // If any parse errors were found, report the first error and exit.
     if let Some(err) = working_set.parse_errors.first() {
-        report_error(&working_set, err);
+        report_parse_error(None, &working_set, err);
         std::process::exit(1);
     }
 
-    for block in &mut working_set.delta.blocks {
+    if let Some(err) = working_set.compile_errors.first() {
+        report_compile_error(None, &working_set, err);
+        std::process::exit(1);
+    }
+
+    // Look for blocks whose name is `main` or begins with `main `; if any are
+    // found we:
+    // 1. rewrite the signature to use the script's filename,
+    // 2. remember that the file contained a `main` command, and
+    // 3. later add an alias in the overlay so users can still call `main`.
+    let mut file_has_main = false;
+    for block in working_set.delta.blocks.iter_mut().map(Arc::make_mut) {
         if block.signature.name == "main" {
-            block.signature.name = source_filename.to_string_lossy().to_string();
+            file_has_main = true;
+            block.signature.name = script_name.clone();
         } else if block.signature.name.starts_with("main ") {
-            block.signature.name =
-                source_filename.to_string_lossy().to_string() + " " + &block.signature.name[5..];
+            file_has_main = true;
+            block.signature.name = script_name.clone() + " " + &block.signature.name[5..];
         }
     }
 
-    let _ = engine_state.merge_delta(working_set.delta);
-
-    if engine_state.find_decl(b"main", &[]).is_some() {
-        let args = format!("main {}", args.join(" "));
-
-        let pipeline_data = eval_block(
-            engine_state,
-            stack,
-            &block,
-            PipelineData::empty(),
-            false,
-            false,
-        );
-        let pipeline_data = match pipeline_data {
-            Err(ShellError::Return { .. }) => {
-                // allows early exists before `main` is run.
-                return Ok(());
-            }
-
-            x => x,
-        }
-        .unwrap_or_else(|e| {
-            let working_set = StateWorkingSet::new(engine_state);
-            report_error(&working_set, &e);
-            std::process::exit(1);
-        });
-
-        let result = pipeline_data.print(engine_state, stack, true, false);
-
-        match result {
-            Err(err) => {
-                let working_set = StateWorkingSet::new(engine_state);
-
-                report_error(&working_set, &err);
-                std::process::exit(1);
-            }
-            Ok(exit_code) => {
-                if exit_code != 0 {
-                    std::process::exit(exit_code as i32);
+    // If we found a main declaration, alias the overlay entries so that
+    // `script.nu` (and `script.nu foo`) resolve just like `main`.
+    if file_has_main && let Some(overlay) = working_set.delta.last_overlay_mut() {
+        // Collect new entries to avoid mutating while iterating.
+        // For "main" → new_name is just the script filename.
+        // For "main foo" → name[4..] is " foo" (space included), giving "script.nu foo".
+        let mut new_decls = Vec::new();
+        for (name, &decl_id) in &overlay.decls {
+            if name == b"main" || name.starts_with(b"main ") {
+                let mut new_name = script_name_bytes.clone();
+                if name.len() > 4 {
+                    new_name.extend_from_slice(&name[4..]);
                 }
+                new_decls.push((new_name, decl_id));
             }
         }
+        for (n, id) in new_decls {
+            overlay.decls.insert(n, id);
+        }
 
-        if !eval_source(
+        let mut new_predecls = Vec::new();
+        for (name, &decl_id) in &overlay.predecls {
+            if name == b"main" || name.starts_with(b"main ") {
+                let mut new_name = script_name_bytes.clone();
+                if name.len() > 4 {
+                    new_name.extend_from_slice(&name[4..]);
+                }
+                new_predecls.push((new_name, decl_id));
+            }
+        }
+        for (n, id) in new_predecls {
+            overlay.predecls.insert(n, id);
+        }
+    }
+
+    // Merge the changes into the engine state.
+    engine_state.merge_delta(working_set.delta)?;
+
+    // Check if the file contains a main command.  We use the script name instead
+    // of the literal `main` because the delta (above) may have rewritten the
+    // declaration and added an alias.
+    let exit_code = if file_has_main && engine_state.find_decl(&script_name_bytes, &[]).is_some() {
+        // Evaluate the file, but don't run main yet.
+        let pipeline =
+            match eval_block::<WithoutDebug>(engine_state, stack, &block, PipelineData::empty()) {
+                Ok(data) if data.early_return => {
+                    // Allow early return before main is run.
+                    return Ok(());
+                }
+                Ok(data) => data.body,
+                Err(err) => return Err(err),
+            };
+
+        // Print the pipeline output of the last command of the file.
+        print_pipeline(engine_state, stack, pipeline, true)?;
+
+        // Invoke the main command with arguments. Keep using `main` as the internal command name
+        // so the parser reliably resolves it; the block's signature was already rewritten to the
+        // script filename above, so help messages will show the correct `script.nu`-qualified name.
+        // The CLI parser has already escaped script arguments via `args_to_script`, so we must not
+        // escape them again here or we would double-quote values like `"arg 2"`.
+        let command_line = format!("main {}", args.join(" "));
+        eval_source(
             engine_state,
             stack,
-            args.as_bytes(),
+            command_line.as_bytes(),
             "<commandline>",
             input,
             true,
-        ) {
-            std::process::exit(1);
-        }
-    } else if !eval_source(engine_state, stack, &file, file_path_str, input, true) {
-        std::process::exit(1);
+        )
+    } else {
+        // Evaluate the already-parsed block instead of re-parsing through
+        // eval_source. Re-parsing can return stale `source` blocks whose
+        // VarIds no longer match re-declared `let`/`mut` variables.
+        // See https://github.com/nushell/nushell/issues/18515
+        eval_parsed_block_source(engine_state, stack, &block, file_path_str, input, true)
+    };
+
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
 
     info!("evaluate {}:{}:{}", file!(), line!(), column!());
@@ -187,76 +216,28 @@ pub fn evaluate_file(
     Ok(())
 }
 
-pub(crate) fn print_table_or_error(
-    engine_state: &mut EngineState,
-    stack: &mut Stack,
-    mut pipeline_data: PipelineData,
-    config: &mut Config,
-) -> Option<i64> {
-    let exit_code = match &mut pipeline_data {
-        PipelineData::ExternalStream { exit_code, .. } => exit_code.take(),
-        _ => None,
-    };
+#[cfg(test)]
+mod tests {
+    use nu_test_support::fs::Stub::FileWithContent;
+    use nu_test_support::playground::Playground;
+    use nu_test_support::prelude::*;
 
-    // Change the engine_state config to use the passed in configuration
-    engine_state.set_config(config.clone());
+    #[test]
+    #[deps(NU)]
+    fn evaluate_file_arg_with_various_characters_escape_properly() -> Result {
+        Playground::setup("evaluate_file_various_characters", |dirs, sandbox| {
+            sandbox.with_files(&[FileWithContent(
+                "test.nu",
+                "def main [...args: string] { $args | to json }",
+            )]);
 
-    if let PipelineData::Value(Value::Error { error, .. }, ..) = &pipeline_data {
-        let working_set = StateWorkingSet::new(engine_state);
-        report_error(&working_set, &**error);
-        std::process::exit(1);
-    }
+            let args = r#"a "" b "c\nd" "e f" ] "[" "}" "{" "\"" '"'"#;
+            let expected = ["a", "", "b", "c\nd", "e f", "]", "[", "}", "{", "\"", "\""];
 
-    if let Some(decl_id) = engine_state.find_decl("table".as_bytes(), &[]) {
-        let command = engine_state.get_decl(decl_id);
-        if command.get_block_id().is_some() {
-            print_or_exit(pipeline_data, engine_state, config);
-        } else {
-            // The final call on table command, it's ok to set redirect_output to false.
-            let mut call = Call::new(Span::new(0, 0));
-            call.redirect_stdout = false;
-            let table = command.run(engine_state, stack, &call, pipeline_data);
-
-            match table {
-                Ok(table) => {
-                    print_or_exit(table, engine_state, config);
-                }
-                Err(error) => {
-                    let working_set = StateWorkingSet::new(engine_state);
-                    report_error(&working_set, &error);
-                    std::process::exit(1);
-                }
-            }
-        }
-    } else {
-        print_or_exit(pipeline_data, engine_state, config);
-    }
-
-    // Make sure everything has finished
-    if let Some(exit_code) = exit_code {
-        let mut exit_code: Vec<_> = exit_code.into_iter().collect();
-        exit_code
-            .pop()
-            .and_then(|last_exit_code| match last_exit_code {
-                Value::Int { val: code, .. } => Some(code),
-                _ => None,
-            })
-    } else {
-        None
-    }
-}
-
-fn print_or_exit(pipeline_data: PipelineData, engine_state: &mut EngineState, config: &Config) {
-    for item in pipeline_data {
-        if let Value::Error { error, .. } = item {
-            let working_set = StateWorkingSet::new(engine_state);
-
-            report_error(&working_set, &*error);
-
-            std::process::exit(1);
-        }
-
-        let out = item.into_string("\n", config) + "\n";
-        let _ = stdout_write_all_and_flush(out).map_err(|err| eprintln!("{err}"));
+            test()
+                .cwd(dirs.test())
+                .run(format!("nu test.nu {args} | from json"))
+                .expect_value_eq(expected)
+        })
     }
 }

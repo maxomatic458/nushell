@@ -1,11 +1,7 @@
-use nu_engine::CallExt;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{ast::Call, span};
-use nu_protocol::{
-    Category, Example, IntoInterruptiblePipelineData, IntoPipelineData, PipelineData, ShellError,
-    Signature, Spanned, SyntaxShape, Type, Value,
-};
-use std::process::{Command as CommandSys, Stdio};
+use nu_engine::command_prelude::*;
+use nu_protocol::shell_error::generic::GenericError;
+use nu_system::build_kill_command;
+use std::process::Stdio;
 
 #[derive(Clone)]
 pub struct Kill;
@@ -15,22 +11,21 @@ impl Command for Kill {
         "kill"
     }
 
-    fn usage(&self) -> &str {
-        "Kill a process using the process id."
+    fn description(&self) -> &str {
+        "Kill a process using its process ID."
     }
 
     fn signature(&self) -> Signature {
         let signature = Signature::build("kill")
             .input_output_types(vec![(Type::Nothing, Type::Any)])
             .allow_variants_without_examples(true)
-            .required(
+            .rest(
                 "pid",
                 SyntaxShape::Int,
-                "Process id of process that is to be killed.",
+                "Process ids of processes that are to be killed.",
             )
-            .rest("rest", SyntaxShape::Int, "Rest of processes to kill.")
-            .switch("force", "forcefully kill the process", Some('f'))
-            .switch("quiet", "won't print anything to the console", Some('q'))
+            .switch("force", "Forcefully kill the process.", Some('f'))
+            .switch("quiet", "Won't print anything to the console.", Some('q'))
             .category(Category::Platform);
 
         if cfg!(windows) {
@@ -40,13 +35,13 @@ impl Command for Kill {
         signature.named(
             "signal",
             SyntaxShape::Int,
-            "signal decimal number to be sent instead of the default 15 (unsupported on Windows)",
+            "Signal decimal number to be sent instead of the default 15 (unsupported on Windows).",
             Some('s'),
         )
     }
 
     fn search_terms(&self) -> Vec<&str> {
-        vec!["stop", "end", "close"]
+        vec!["stop", "end", "close", "taskkill"]
     }
 
     fn run(
@@ -56,76 +51,62 @@ impl Command for Kill {
         call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let pid: i64 = call.req(engine_state, stack, 0)?;
-        let rest: Vec<i64> = call.rest(engine_state, stack, 1)?;
+        let pids: Vec<Spanned<i64>> = call.rest(engine_state, stack, 0)?;
         let force: bool = call.has_flag(engine_state, stack, "force")?;
         let signal: Option<Spanned<i64>> = call.get_flag(engine_state, stack, "signal")?;
         let quiet: bool = call.has_flag(engine_state, stack, "quiet")?;
 
-        let mut cmd = if cfg!(windows) {
-            let mut cmd = CommandSys::new("taskkill");
+        if cfg!(unix)
+            && signal.is_none()
+            && let Some((span, signal_number)) = pids.iter().find_map(|pid| {
+                inferred_signal_number(engine_state.get_span_contents(pid.span), pid.item)
+                    .map(|signal_number| (pid.span, signal_number))
+            })
+        {
+            return Err(ShellError::IncorrectValue {
+                msg: format!(
+                    "negative pid shorthand is not supported; use `kill -s {signal_number} <pid>`"
+                ),
+                val_span: span,
+                call_span: call.head,
+            });
+        }
 
-            if force {
-                cmd.arg("/F");
-            }
+        if pids.is_empty() {
+            return Err(ShellError::MissingParameter {
+                param_name: "pid".to_string(),
+                span: call.arguments_span(),
+            });
+        }
 
-            cmd.arg("/PID");
-            cmd.arg(pid.to_string());
-
-            // each pid must written as `/PID 0` otherwise
-            // taskkill will act as `killall` unix command
-            for id in &rest {
-                cmd.arg("/PID");
-                cmd.arg(id.to_string());
-            }
-
-            cmd
-        } else {
-            let mut cmd = CommandSys::new("kill");
-            if force {
-                if let Some(Spanned {
+        if cfg!(unix)
+            && let (
+                true,
+                Some(Spanned {
                     item: _,
                     span: signal_span,
-                }) = signal
-                {
-                    return Err(ShellError::IncompatibleParameters {
-                        left_message: "force".to_string(),
-                        left_span: call
-                            .get_named_arg("force")
-                            .ok_or_else(|| ShellError::GenericError {
-                                error: "Flag error".into(),
-                                msg: "flag force not found".into(),
-                                span: Some(call.head),
-                                help: None,
-                                inner: vec![],
-                            })?
-                            .span,
-                        right_message: "signal".to_string(),
-                        right_span: span(&[
-                            call.get_named_arg("signal")
-                                .ok_or_else(|| ShellError::GenericError {
-                                    error: "Flag error".into(),
-                                    msg: "flag signal not found".into(),
-                                    span: Some(call.head),
-                                    help: None,
-                                    inner: vec![],
-                                })?
-                                .span,
-                            signal_span,
-                        ]),
-                    });
-                }
-                cmd.arg("-9");
-            } else if let Some(signal_value) = signal {
-                cmd.arg(format!("-{}", signal_value.item));
-            }
-
-            cmd.arg(pid.to_string());
-
-            cmd.args(rest.iter().map(move |id| id.to_string()));
-
-            cmd
+                }),
+            ) = (force, signal)
+        {
+            return Err(ShellError::IncompatibleParameters {
+                left_message: "force".to_string(),
+                left_span: call
+                    .get_flag_span(stack, "force")
+                    .expect("Had flag force, but didn't have span for flag"),
+                right_message: "signal".to_string(),
+                right_span: Span::merge(
+                    call.get_flag_span(stack, "signal")
+                        .expect("Had flag signal, but didn't have span for flag"),
+                    signal_span,
+                ),
+            });
         };
+
+        let mut cmd = build_kill_command(
+            force,
+            pids.iter().copied().map(|spanned| spanned.item),
+            signal.map(|spanned| spanned.item as u32),
+        );
 
         // pipe everything to null
         if quiet {
@@ -134,59 +115,54 @@ impl Command for Kill {
                 .stderr(Stdio::null());
         }
 
-        let output = cmd.output().map_err(|e| ShellError::GenericError {
-            error: "failed to execute shell command".into(),
-            msg: e.to_string(),
-            span: Some(call.head),
-            help: None,
-            inner: vec![],
+        let output = cmd.output().map_err(|e| {
+            ShellError::Generic(GenericError::new(
+                "failed to execute shell command",
+                e.to_string(),
+                call.head,
+            ))
         })?;
 
         if !quiet && !output.status.success() {
-            return Err(ShellError::GenericError {
-                error: "process didn't terminate successfully".into(),
-                msg: String::from_utf8(output.stderr).unwrap_or_default(),
-                span: Some(call.head),
-                help: None,
-                inner: vec![],
-            });
+            return Err(ShellError::Generic(GenericError::new(
+                "process didn't terminate successfully",
+                String::from_utf8(output.stderr).unwrap_or_default(),
+                call.head,
+            )));
         }
 
-        let val = String::from(
-            String::from_utf8(output.stdout)
-                .map_err(|e| ShellError::GenericError {
-                    error: "failed to convert output to string".into(),
-                    msg: e.to_string(),
-                    span: Some(call.head),
-                    help: None,
-                    inner: vec![],
-                })?
-                .trim_end(),
-        );
-        if val.is_empty() {
+        let mut output = String::from_utf8(output.stdout).map_err(|e| {
+            ShellError::Generic(GenericError::new(
+                "failed to convert output to string",
+                e.to_string(),
+                call.head,
+            ))
+        })?;
+
+        output.truncate(output.trim_end().len());
+
+        if output.is_empty() {
             Ok(Value::nothing(call.head).into_pipeline_data())
         } else {
-            Ok(vec![Value::string(val, call.head)]
-                .into_iter()
-                .into_pipeline_data(engine_state.ctrlc.clone()))
+            Ok(Value::string(output, call.head).into_pipeline_data())
         }
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Kill the pid using the most memory",
+                description: "Kill the pid using the most memory.",
                 example: "ps | sort-by mem | last | kill $in.pid",
                 result: None,
             },
             Example {
-                description: "Force kill a given pid",
+                description: "Force kill a given pid.",
                 example: "kill --force 12345",
                 result: None,
             },
             #[cfg(not(target_os = "windows"))]
             Example {
-                description: "Send INT signal",
+                description: "Send INT signal.",
                 example: "kill -s 2 12345",
                 result: None,
             },
@@ -194,13 +170,35 @@ impl Command for Kill {
     }
 }
 
+fn inferred_signal_number(raw: &[u8], pid: i64) -> Option<u64> {
+    if pid < 0 {
+        return Some(pid.unsigned_abs());
+    }
+
+    let stripped = std::str::from_utf8(raw).ok()?.strip_prefix('-')?;
+
+    if stripped.is_empty() || !stripped.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    stripped.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Kill;
+    use super::*;
 
     #[test]
-    fn examples_work_as_expected() {
-        use crate::test_examples;
-        test_examples(Kill {})
+    fn examples_work_as_expected() -> nu_test_support::Result {
+        nu_test_support::test().examples(Kill)
+    }
+
+    #[test]
+    fn inferred_signal_number_detects_negative_pid_shorthand() {
+        assert_eq!(inferred_signal_number(b"-0", 0), Some(0));
+        assert_eq!(inferred_signal_number(b"-00", 0), Some(0));
+        assert_eq!(inferred_signal_number(b"-9", -9), Some(9));
+        assert_eq!(inferred_signal_number(b"0", 0), None);
+        assert_eq!(inferred_signal_number(b"9", 9), None);
     }
 }

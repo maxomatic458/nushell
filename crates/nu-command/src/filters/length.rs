@@ -1,8 +1,7 @@
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, IntoPipelineData, PipelineData, ShellError, Signature, Type, Value,
-};
+#[cfg(feature = "sqlite")]
+use crate::database::QueryPlan;
+use nu_engine::command_prelude::*;
+use std::io::Read;
 
 #[derive(Clone)]
 pub struct Length;
@@ -12,13 +11,20 @@ impl Command for Length {
         "length"
     }
 
-    fn usage(&self) -> &str {
-        "Count the number of items in an input list or rows in a table."
+    fn description(&self) -> &str {
+        "Count the number of items in an input list, rows in a table, or bytes in binary data."
     }
 
     fn signature(&self) -> nu_protocol::Signature {
         Signature::build("length")
-            .input_output_types(vec![(Type::List(Box::new(Type::Any)), Type::Int)])
+            .input_output_types(vec![
+                (Type::List(Box::new(Type::Any)), Type::Int),
+                (Type::Binary, Type::Int),
+                (Type::Nothing, Type::Int),
+                #[cfg(feature = "sqlite")]
+                (Type::Custom("SQLiteQueryBuilder".into()), Type::Int),
+            ])
+            .allow_variants_without_examples(true)
             .category(Category::Filters)
     }
 
@@ -36,7 +42,7 @@ impl Command for Length {
         length_row(call, input)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "Count the number of items in a list",
@@ -48,37 +54,79 @@ impl Command for Length {
                 example: "[{a:1 b:2}, {a:2 b:3}] | length",
                 result: Some(Value::test_int(2)),
             },
+            Example {
+                description: "Count the number of bytes in binary data",
+                example: "0x[01 02] | length",
+                result: Some(Value::test_int(2)),
+            },
+            Example {
+                description: "Count the length a null value",
+                example: "null | length",
+                result: Some(Value::test_int(0)),
+            },
         ]
     }
 }
 
 fn length_row(call: &Call, input: PipelineData) -> Result<PipelineData, ShellError> {
     let span = input.span().unwrap_or(call.head);
+
+    #[cfg(feature = "sqlite")]
+    // Pushdown optimization: handle 'length' via QueryPlan using COUNT(*)
+    if let PipelineData::Value(Value::Custom { val, .. }, ..) = &input
+        && let Some(plan) = QueryPlan::try_from_any(val.as_any())
+    {
+        let count = plan.count(call.head)?;
+        return Ok(Value::int(count, call.head).into_pipeline_data());
+    }
+
     match input {
-        PipelineData::Value(Value::Nothing { .. }, ..) => {
+        PipelineData::Empty | PipelineData::Value(Value::Nothing { .. }, ..) => {
             Ok(Value::int(0, call.head).into_pipeline_data())
         }
-        // I added this here because input_output_type() wasn't catching a record
-        // being sent in as input from echo. e.g. "echo {a:1 b:2} | length"
-        PipelineData::Value(Value::Record { .. }, ..) => {
-            Err(ShellError::OnlySupportsThisInputType {
-                exp_input_type: "list, and table".into(),
-                wrong_type: "record".into(),
-                dst_span: call.head,
-                src_span: span,
-            })
+        PipelineData::Value(Value::Binary { val, .. }, ..) => {
+            Ok(Value::int(val.len() as i64, call.head).into_pipeline_data())
         }
-        _ => {
-            let mut count: i64 = 0;
-            // Check for and propagate errors
-            for value in input.into_iter() {
-                if let Value::Error { error, .. } = value {
-                    return Err(*error);
-                }
-                count += 1
+        #[cfg(feature = "sqlite")]
+        PipelineData::Value(
+            Value::Custom {
+                val, internal_span, ..
+            },
+            ..,
+        ) => Err(ShellError::OnlySupportsThisInputType {
+            exp_input_type: "list, table, binary, and nothing".into(),
+            wrong_type: val.type_name(),
+            dst_span: call.head,
+            src_span: internal_span,
+        }),
+        PipelineData::Value(Value::List { vals, .. }, ..) => {
+            Ok(Value::int(vals.len() as i64, call.head).into_pipeline_data())
+        }
+        PipelineData::ListStream(stream, ..) => {
+            let mut count = 0;
+            for value in stream {
+                // Propagate error values instead of silently counting them (see #18928).
+                value.unwrap_error()?;
+                count += 1;
             }
             Ok(Value::int(count, call.head).into_pipeline_data())
         }
+        PipelineData::ByteStream(stream, ..) if stream.type_().is_binary_coercible() => {
+            Ok(Value::int(
+                match stream.reader() {
+                    Some(r) => r.bytes().count() as i64,
+                    None => 0,
+                },
+                call.head,
+            )
+            .into_pipeline_data())
+        }
+        _ => Err(ShellError::OnlySupportsThisInputType {
+            exp_input_type: "list, table, binary, and nothing".into(),
+            wrong_type: input.get_type().to_string(),
+            dst_span: call.head,
+            src_span: span,
+        }),
     }
 }
 
@@ -87,9 +135,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Length {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Length)
     }
 }

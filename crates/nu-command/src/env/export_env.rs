@@ -1,9 +1,5 @@
-use nu_engine::{eval_block, redirect_env, CallExt};
-use nu_protocol::{
-    ast::Call,
-    engine::{Closure, Command, EngineState, Stack},
-    Category, Example, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value,
-};
+use nu_engine::{command_prelude::*, get_eval_block, redirect_env};
+use nu_protocol::engine::{Closure, CommandType};
 
 #[derive(Clone)]
 pub struct ExportEnv;
@@ -24,8 +20,17 @@ impl Command for ExportEnv {
             .category(Category::Env)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Run a block and preserve its environment in a current scope."
+    }
+
+    fn extra_description(&self) -> &str {
+        "This command is a parser keyword. For details, check:
+  https://www.nushell.sh/book/thinking_in_nu.html"
+    }
+
+    fn command_type(&self) -> CommandType {
+        CommandType::Keyword
     }
 
     fn run(
@@ -35,34 +40,34 @@ impl Command for ExportEnv {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let capture_block: Closure = call.req(engine_state, caller_stack, 0)?;
-        let block = engine_state.get_block(capture_block.block_id);
-        let mut callee_stack = caller_stack.captures_to_stack(capture_block.captures);
+        // Blocks compile to closure values under IR; use the block id from the evaluated arg.
+        let closure: Closure = call.req(engine_state, caller_stack, 0)?;
+        let block = engine_state.get_block(closure.block_id);
+        let mut callee_stack = caller_stack
+            .gather_captures(engine_state, &block.captures)
+            .reset_pipes();
 
-        let _ = eval_block(
-            engine_state,
-            &mut callee_stack,
-            block,
-            input,
-            call.redirect_stdout,
-            call.redirect_stderr,
-        );
+        let eval_block = get_eval_block(engine_state);
 
+        // Run the block (discard the result)
+        let _ = eval_block(engine_state, &mut callee_stack, block, input)?;
+
+        // Merge the block's environment to the current stack
         redirect_env(engine_state, caller_stack, &callee_stack);
 
         Ok(PipelineData::empty())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Set an environment variable",
-                example: r#"export-env { $env.SPAM = 'eggs' }"#,
+                description: "Set an environment variable.",
+                example: "export-env { $env.SPAM = 'eggs' }",
                 result: Some(Value::nothing(Span::test_data())),
             },
             Example {
-                description: "Set an environment variable and examine its value",
-                example: r#"export-env { $env.SPAM = 'eggs' }; $env.SPAM"#,
+                description: "Set an environment variable and examine its value.",
+                example: "export-env { $env.SPAM = 'eggs' }; $env.SPAM",
                 result: Some(Value::test_string("eggs")),
             },
         ]
@@ -74,9 +79,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(ExportEnv {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(ExportEnv)
     }
 }

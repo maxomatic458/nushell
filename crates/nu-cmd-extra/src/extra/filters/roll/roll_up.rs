@@ -1,12 +1,5 @@
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, IntoPipelineData, PipelineData, ShellError, Signature, SyntaxShape,
-    Type, Value,
-};
-
-use super::{vertical_rotate_value, VerticalDirection};
+use super::{VerticalDirection, vertical_rotate_value};
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
 pub struct RollUp;
@@ -23,16 +16,16 @@ impl Command for RollUp {
     fn signature(&self) -> Signature {
         Signature::build(self.name())
             // TODO: It also operates on List
-            .input_output_types(vec![(Type::Table(vec![]), Type::Table(vec![]))])
-            .named("by", SyntaxShape::Int, "Number of rows to roll", Some('b'))
+            .input_output_types(vec![(Type::table(), Type::table())])
+            .named("by", SyntaxShape::Int, "Number of rows to roll.", Some('b'))
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Roll table rows up."
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
             description: "Rolls rows up",
             example: "[[a b]; [1 2] [3 4] [5 6]] | roll up",
@@ -60,13 +53,14 @@ impl Command for RollUp {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
+        let mut input = input.into_stream_or_original(engine_state);
         let by: Option<usize> = call.get_flag(engine_state, stack, "by")?;
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
 
-        let value = input.into_value(call.head);
+        let value = input.into_value(call.head)?;
         let rotated_value = vertical_rotate_value(value, by, VerticalDirection::Up)?;
 
-        Ok(rotated_value.into_pipeline_data().set_metadata(metadata))
+        Ok(rotated_value.into_pipeline_data_with_metadata(metadata))
     }
 }
 
@@ -75,9 +69,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(RollUp {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(RollUp)
     }
 }

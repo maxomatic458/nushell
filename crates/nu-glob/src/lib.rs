@@ -27,9 +27,9 @@
 //! To print all jpg files in `/media/` and all of its subdirectories.
 //!
 //! ```rust,no_run
-//! use nu_glob::glob;
+//! use nu_glob::{glob, Uninterruptible};
 //!
-//! for entry in glob("/media/**/*.jpg").expect("Failed to read glob pattern") {
+//! for entry in glob("/media/**/*.jpg", Uninterruptible).expect("Failed to read glob pattern") {
 //!     match entry {
 //!         Ok(path) => println!("{:?}", path.display()),
 //!         Err(e) => println!("{:?}", e),
@@ -42,8 +42,7 @@
 //! instead of printing them.
 //!
 //! ```rust,no_run
-//! use nu_glob::glob_with;
-//! use nu_glob::MatchOptions;
+//! use nu_glob::{glob_with, MatchOptions, Uninterruptible};
 //!
 //! let options = MatchOptions {
 //!     case_sensitive: false,
@@ -51,7 +50,7 @@
 //!     require_literal_leading_dot: false,
 //!     recursive_match_hidden_dir: true,
 //! };
-//! for entry in glob_with("local/*a*", options).unwrap() {
+//! for entry in glob_with("local/*a*", options, Uninterruptible).unwrap() {
 //!     if let Ok(path) = entry {
 //!         println!("{:?}", path.display())
 //!     }
@@ -65,6 +64,8 @@
 )]
 #![deny(missing_docs)]
 
+pub mod dc_glob;
+
 #[cfg(test)]
 #[macro_use]
 extern crate doc_comment;
@@ -73,6 +74,7 @@ extern crate doc_comment;
 doctest!("../README.md");
 
 use std::cmp;
+use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -85,6 +87,29 @@ use MatchResult::{EntirePatternDoesntMatch, Match, SubPatternDoesntMatch};
 use PatternToken::AnyExcept;
 use PatternToken::{AnyChar, AnyRecursiveSequence, AnySequence, AnyWithin, Char};
 
+/// A trait for types that can be periodically polled to check whether to cancel an operation.
+pub trait Interruptible {
+    /// Returns whether the current operation should be cancelled.
+    fn interrupted(&self) -> bool;
+}
+
+impl<I: Interruptible> Interruptible for &I {
+    #[inline]
+    fn interrupted(&self) -> bool {
+        (*self).interrupted()
+    }
+}
+
+/// A no-op implementor of [`Interruptible`] that always returns `false` for [`interrupted`](Interruptible::interrupted).
+pub struct Uninterruptible;
+
+impl Interruptible for Uninterruptible {
+    #[inline]
+    fn interrupted(&self) -> bool {
+        false
+    }
+}
+
 /// An iterator that yields `Path`s from the filesystem that match a particular
 /// pattern.
 ///
@@ -95,15 +120,16 @@ use PatternToken::{AnyChar, AnyRecursiveSequence, AnySequence, AnyWithin, Char};
 ///
 /// See the `glob` function for more details.
 #[derive(Debug)]
-pub struct Paths {
+pub struct Paths<I = Uninterruptible> {
     dir_patterns: Vec<Pattern>,
     require_dir: bool,
     options: MatchOptions,
     todo: Vec<Result<(PathBuf, usize), GlobError>>,
     scope: Option<PathBuf>,
+    interrupt: I,
 }
 
-impl Paths {
+impl Paths<Uninterruptible> {
     /// An iterator representing a single path.
     pub fn single(path: &Path, relative_to: &Path) -> Self {
         Paths {
@@ -112,6 +138,7 @@ impl Paths {
             options: MatchOptions::default(),
             todo: vec![Ok((path.to_path_buf(), 0))],
             scope: Some(relative_to.into()),
+            interrupt: Uninterruptible,
         }
     }
 }
@@ -128,7 +155,7 @@ impl Paths {
 ///
 /// When iterating, each result is a `GlobResult` which expresses the
 /// possibility that there was an `IoError` when attempting to read the contents
-/// of the matched path.  In other words, each item returned by the iterator
+/// of the matched path. In other words, each item returned by the iterator
 /// will either be an `Ok(Path)` if the path matched, or an `Err(GlobError)` if
 /// the path (partially) matched _but_ its contents could not be read in order
 /// to determine if its contents matched.
@@ -141,9 +168,9 @@ impl Paths {
 /// `kittens.jpg`, `puppies.jpg` and `hamsters.gif`:
 ///
 /// ```rust,no_run
-/// use nu_glob::glob;
+/// use nu_glob::{glob, Uninterruptible};
 ///
-/// for entry in glob("/media/pictures/*.jpg").unwrap() {
+/// for entry in glob("/media/pictures/*.jpg", Uninterruptible).unwrap() {
 ///     match entry {
 ///         Ok(path) => println!("{:?}", path.display()),
 ///
@@ -165,16 +192,16 @@ impl Paths {
 /// `filter_map`:
 ///
 /// ```rust
-/// use nu_glob::glob;
+/// use nu_glob::{glob, Uninterruptible};
 /// use std::result::Result;
 ///
-/// for path in glob("/media/pictures/*.jpg").unwrap().filter_map(Result::ok) {
+/// for path in glob("/media/pictures/*.jpg", Uninterruptible).unwrap().filter_map(Result::ok) {
 ///     println!("{}", path.display());
 /// }
 /// ```
 /// Paths are yielded in alphabetical order.
-pub fn glob(pattern: &str) -> Result<Paths, PatternError> {
-    glob_with(pattern, MatchOptions::default())
+pub fn glob<I: Interruptible>(pattern: &str, interrupt: I) -> Result<Paths<I>, PatternError> {
+    glob_with(pattern, MatchOptions::default(), interrupt)
 }
 
 /// Return an iterator that produces all the `Path`s that match the given
@@ -190,7 +217,11 @@ pub fn glob(pattern: &str) -> Result<Paths, PatternError> {
 /// passed to this function.
 ///
 /// Paths are yielded in alphabetical order.
-pub fn glob_with(pattern: &str, options: MatchOptions) -> Result<Paths, PatternError> {
+pub fn glob_with<I: Interruptible>(
+    pattern: &str,
+    options: MatchOptions,
+    interrupt: I,
+) -> Result<Paths<I>, PatternError> {
     #[cfg(windows)]
     fn check_windows_verbatim(p: &Path) -> bool {
         match p.components().next() {
@@ -252,6 +283,7 @@ pub fn glob_with(pattern: &str, options: MatchOptions) -> Result<Paths, PatternE
             options,
             todo: Vec::new(),
             scope: None,
+            interrupt,
         });
     }
 
@@ -283,6 +315,7 @@ pub fn glob_with(pattern: &str, options: MatchOptions) -> Result<Paths, PatternE
         options,
         todo,
         scope: Some(scope),
+        interrupt,
     })
 }
 
@@ -293,13 +326,13 @@ pub fn glob_with(pattern: &str, options: MatchOptions) -> Result<Paths, PatternE
 /// This is provided primarily for testability, so multithreaded test runners can
 /// test pattern matches in different test directories at the same time without
 /// having to append the parent to the pattern under test.
-
-pub fn glob_with_parent(
+pub fn glob_with_parent<I: Interruptible>(
     pattern: &str,
     options: MatchOptions,
     parent: &Path,
-) -> Result<Paths, PatternError> {
-    match glob_with(pattern, options) {
+    interrupt: I,
+) -> Result<Paths<I>, PatternError> {
+    match glob_with(pattern, options, interrupt) {
         Ok(mut p) => {
             p.scope = match p.scope {
                 None => Some(parent.to_path_buf()),
@@ -309,6 +342,47 @@ pub fn glob_with_parent(
             Ok(p)
         }
         Err(e) => Err(e),
+    }
+}
+
+const GLOB_CHARS: &[char] = &['*', '?', '['];
+
+/// Returns true if the given pattern is a glob, false if it's merely text to be
+/// matched exactly.
+///
+/// ```rust
+/// assert!(nu_glob::is_glob("foo/*"));
+/// assert!(nu_glob::is_glob("foo/**/bar"));
+/// assert!(nu_glob::is_glob("foo?"));
+/// assert!(nu_glob::is_glob("foo[A]"));
+///
+/// assert!(!nu_glob::is_glob("foo"));
+/// // nu_glob will ignore an unmatched ']'
+/// assert!(!nu_glob::is_glob("foo]"));
+/// // nu_glob doesn't expand {}
+/// assert!(!nu_glob::is_glob("foo.{txt,png}"));
+/// ```
+pub fn is_glob(pattern: &str) -> bool {
+    pattern.contains(GLOB_CHARS)
+}
+
+/// Returns true if the given pattern contains glob metacharacters, selecting
+/// the active backend via the `dc-glob` experimental option.
+pub fn is_glob_with_backend(pattern: &str) -> bool {
+    if nu_experimental::DC_GLOB.get() {
+        dc_glob::is_glob(pattern)
+    } else {
+        is_glob(pattern)
+    }
+}
+
+/// Escapes glob metacharacters for literal path matching, selecting the active
+/// backend via the `dc-glob` experimental option.
+pub fn escape_with_backend(pattern: &str) -> String {
+    if nu_experimental::DC_GLOB.get() {
+        dc_glob::escape(pattern)
+    } else {
+        Pattern::escape(pattern)
     }
 }
 
@@ -346,7 +420,6 @@ impl Error for GlobError {
         self.error.description()
     }
 
-    #[allow(unknown_lints, bare_trait_objects)]
     fn cause(&self) -> Option<&dyn Error> {
         Some(&self.error)
     }
@@ -373,7 +446,7 @@ fn is_dir(p: &Path) -> bool {
 /// such as failing to read a particular directory's contents.
 pub type GlobResult = Result<PathBuf, GlobError>;
 
-impl Iterator for Paths {
+impl<I: Interruptible> Iterator for Paths<I> {
     type Item = GlobResult;
 
     fn next(&mut self) -> Option<GlobResult> {
@@ -381,15 +454,22 @@ impl Iterator for Paths {
         // point rather than in glob() so that the errors are unified that is,
         // failing to fill the buffer is an iteration error construction of the
         // iterator (i.e. glob()) only fails if it fails to compile the Pattern
-        if let Some(scope) = self.scope.take() {
-            if !self.dir_patterns.is_empty() {
-                // Shouldn't happen, but we're using -1 as a special index.
-                assert!(self.dir_patterns.len() < !0);
+        if let Some(scope) = self.scope.take()
+            && !self.dir_patterns.is_empty()
+        {
+            // Shouldn't happen, but we're using -1 as a special index.
+            assert!(self.dir_patterns.len() < !0);
 
-                // if there's one prefilled result, take it, otherwise fill the todo buffer
-                if self.todo.len() != 1 {
-                    fill_todo(&mut self.todo, &self.dir_patterns, 0, &scope, self.options);
-                }
+            // if there's one prefilled result, take it, otherwise fill the todo buffer
+            if self.todo.len() != 1 {
+                fill_todo(
+                    &mut self.todo,
+                    &self.dir_patterns,
+                    0,
+                    &scope,
+                    self.options,
+                    &self.interrupt,
+                );
             }
         }
 
@@ -445,6 +525,7 @@ impl Iterator for Paths {
                         next,
                         &path,
                         self.options,
+                        &self.interrupt,
                     );
 
                     if next == self.dir_patterns.len() - 1 {
@@ -496,6 +577,7 @@ impl Iterator for Paths {
                         idx + 1,
                         &path,
                         self.options,
+                        &self.interrupt,
                     );
                 }
             }
@@ -505,7 +587,6 @@ impl Iterator for Paths {
 
 /// A pattern parsing error.
 #[derive(Debug)]
-#[allow(missing_copy_implementations)]
 pub struct PatternError {
     /// The approximate character index of where the error occurred.
     pub pos: usize,
@@ -630,53 +711,58 @@ impl Pattern {
 
                     let count = i - old;
 
-                    #[allow(clippy::comparison_chain)]
-                    if count > 2 {
-                        return Err(PatternError {
-                            pos: old + 2,
-                            msg: ERROR_WILDCARDS,
-                        });
-                    } else if count == 2 {
-                        // ** can only be an entire path component
-                        // i.e. a/**/b is valid, but a**/b or a/**b is not
-                        // invalid matches are treated literally
-                        let is_valid = if i == 2 || path::is_separator(chars[i - count - 1]) {
-                            // it ends in a '/'
-                            if i < chars.len() && path::is_separator(chars[i]) {
-                                i += 1;
-                                true
-                            // or the pattern ends here
-                            // this enables the existing globbing mechanism
-                            } else if i == chars.len() {
-                                true
-                            // `**` ends in non-separator
+                    match count.cmp(&2) {
+                        Ordering::Greater => {
+                            return Err(PatternError {
+                                pos: old + 2,
+                                msg: ERROR_WILDCARDS,
+                            });
+                        }
+                        Ordering::Equal => {
+                            // ** can only be an entire path component
+                            // i.e. a/**/b is valid, but a**/b or a/**b is not
+                            // invalid matches are treated literally
+                            let is_valid = if i == 2 || path::is_separator(chars[i - count - 1]) {
+                                // it ends in a '/'
+                                if i < chars.len() && path::is_separator(chars[i]) {
+                                    i += 1;
+                                    true
+                                // or the pattern ends here
+                                // this enables the existing globbing mechanism
+                                } else if i == chars.len() {
+                                    true
+                                // `**` ends in non-separator
+                                } else {
+                                    return Err(PatternError {
+                                        pos: i,
+                                        msg: ERROR_RECURSIVE_WILDCARDS,
+                                    });
+                                }
+                            // `**` begins with non-separator
                             } else {
                                 return Err(PatternError {
-                                    pos: i,
+                                    pos: old - 1,
                                     msg: ERROR_RECURSIVE_WILDCARDS,
                                 });
-                            }
-                        // `**` begins with non-separator
-                        } else {
-                            return Err(PatternError {
-                                pos: old - 1,
-                                msg: ERROR_RECURSIVE_WILDCARDS,
-                            });
-                        };
+                            };
 
-                        if is_valid {
-                            // collapse consecutive AnyRecursiveSequence to a
-                            // single one
+                            if is_valid {
+                                // collapse consecutive AnyRecursiveSequence to a
+                                // single one
 
-                            let tokens_len = tokens.len();
+                                let tokens_len = tokens.len();
 
-                            if !(tokens_len > 1 && tokens[tokens_len - 1] == AnyRecursiveSequence) {
-                                is_recursive = true;
-                                tokens.push(AnyRecursiveSequence);
+                                if !(tokens_len > 1
+                                    && tokens[tokens_len - 1] == AnyRecursiveSequence)
+                                {
+                                    is_recursive = true;
+                                    tokens.push(AnyRecursiveSequence);
+                                }
                             }
                         }
-                    } else {
-                        tokens.push(AnySequence);
+                        Ordering::Less => {
+                            tokens.push(AnySequence);
+                        }
                     }
                 }
                 '[' => {
@@ -765,7 +851,7 @@ impl Pattern {
     /// `Pattern` using the default match options (i.e. `MatchOptions::default()`).
     pub fn matches_path(&self, path: &Path) -> bool {
         // FIXME (#9639): This needs to handle non-utf8 paths
-        path.to_str().map_or(false, |s| self.matches(s))
+        path.to_str().is_some_and(|s| self.matches(s))
     }
 
     /// Return if the given `str` matches this `Pattern` using the specified
@@ -778,8 +864,7 @@ impl Pattern {
     /// `Pattern` using the specified match options.
     pub fn matches_path_with(&self, path: &Path, options: MatchOptions) -> bool {
         // FIXME (#9639): This needs to handle non-utf8 paths
-        path.to_str()
-            .map_or(false, |s| self.matches_with(s, options))
+        path.to_str().is_some_and(|s| self.matches_with(s, options))
     }
 
     /// Access the original glob pattern.
@@ -819,7 +904,7 @@ impl Pattern {
                             AnySequence
                                 if options.require_literal_separator && follows_separator =>
                             {
-                                return SubPatternDoesntMatch
+                                return SubPatternDoesntMatch;
                             }
                             _ => (),
                         }
@@ -882,6 +967,7 @@ fn fill_todo(
     idx: usize,
     path: &Path,
     options: MatchOptions,
+    interrupt: &impl Interruptible,
 ) {
     // convert a pattern that's just many Char(_) to a string
     fn pattern_as_str(pattern: &Pattern) -> Option<String> {
@@ -903,7 +989,7 @@ fn fill_todo(
             // . or .. globs since these never show up as path components.
             todo.push(Ok((next_path, !0)));
         } else {
-            fill_todo(todo, patterns, idx + 1, &next_path, options);
+            fill_todo(todo, patterns, idx + 1, &next_path, options, interrupt);
         }
     };
 
@@ -934,6 +1020,9 @@ fn fill_todo(
         None if is_dir => {
             let dirs = fs::read_dir(path).and_then(|d| {
                 d.map(|e| {
+                    if interrupt.interrupted() {
+                        return Err(io::Error::from(io::ErrorKind::Interrupted));
+                    }
                     e.map(|e| {
                         if curdir {
                             PathBuf::from(
@@ -1044,14 +1133,13 @@ fn chars_eq(a: char, b: char, case_sensitive: bool) -> bool {
         true
     } else if !case_sensitive && a.is_ascii() && b.is_ascii() {
         // FIXME: work with non-ascii chars properly (issue #9084)
-        a.to_ascii_lowercase() == b.to_ascii_lowercase()
+        a.eq_ignore_ascii_case(&b)
     } else {
         a == b
     }
 }
 
 /// Configuration options to modify the behaviour of `Pattern::matches_with(..)`.
-#[allow(missing_copy_implementations)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MatchOptions {
     /// Whether or not patterns should be matched in a case-sensitive manner.
@@ -1091,8 +1179,14 @@ impl Default for MatchOptions {
 
 #[cfg(test)]
 mod test {
-    use super::{glob, MatchOptions, Pattern};
+    use crate::{Paths, PatternError, Uninterruptible};
+
+    use super::{MatchOptions, Pattern, glob as glob_with_signals};
     use std::path::Path;
+
+    fn glob(pattern: &str) -> Result<Paths, PatternError> {
+        glob_with_signals(pattern, Uninterruptible)
+    }
 
     #[test]
     fn test_pattern_from_str() {
@@ -1141,18 +1235,28 @@ mod test {
         use std::io;
         let mut iter = glob("/root/*").unwrap();
 
-        // Skip test if running with permissions to read /root
-        if std::fs::read_dir("/root/").is_err() {
-            // GlobErrors shouldn't halt iteration
-            let next = iter.next();
-            assert!(next.is_some());
+        match std::fs::read_dir("/root/") {
+            // skip if running with permissions to read /root
+            Ok(_) => {}
 
-            let err = next.unwrap();
-            assert!(err.is_err());
+            // skip if /root doesn't exist
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                assert!(iter.count() == 0);
+            }
 
-            let err = err.err().unwrap();
-            assert!(err.path() == Path::new("/root"));
-            assert!(err.error().kind() == io::ErrorKind::PermissionDenied);
+            // should otherwise return a single match with permission error
+            Err(_) => {
+                // GlobErrors shouldn't halt iteration
+                let next = iter.next();
+                assert!(next.is_some());
+
+                let err = next.unwrap();
+                assert!(err.is_err());
+
+                let err = err.err().unwrap();
+                assert!(err.path() == Path::new("/root"));
+                assert!(err.error().kind() == io::ErrorKind::PermissionDenied);
+            }
         }
     }
 
@@ -1177,17 +1281,18 @@ mod test {
                 .ok()
                 .map(|p| match p.components().next().unwrap() {
                     Component::Prefix(prefix_component) => {
-                        let path = Path::new(prefix_component.as_os_str()).join("*");
-                        path
+                        Path::new(prefix_component.as_os_str()).join("*")
                     }
                     _ => panic!("no prefix in this path"),
                 })
                 .unwrap();
             // FIXME (#9639): This needs to handle non-utf8 paths
-            assert!(glob(root_with_device.as_os_str().to_str().unwrap())
-                .unwrap()
-                .next()
-                .is_some());
+            assert!(
+                glob(root_with_device.as_os_str().to_str().unwrap())
+                    .unwrap()
+                    .next()
+                    .is_some()
+            );
         }
         win()
     }
@@ -1199,15 +1304,21 @@ mod test {
         assert!(!Pattern::new("a*b*c").unwrap().matches("abcd"));
         assert!(Pattern::new("a*b*c").unwrap().matches("a_b_c"));
         assert!(Pattern::new("a*b*c").unwrap().matches("a___b___c"));
-        assert!(Pattern::new("abc*abc*abc")
-            .unwrap()
-            .matches("abcabcabcabcabcabcabc"));
-        assert!(!Pattern::new("abc*abc*abc")
-            .unwrap()
-            .matches("abcabcabcabcabcabcabca"));
-        assert!(Pattern::new("a*a*a*a*a*a*a*a*a")
-            .unwrap()
-            .matches("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(
+            Pattern::new("abc*abc*abc")
+                .unwrap()
+                .matches("abcabcabcabcabcabcabc")
+        );
+        assert!(
+            !Pattern::new("abc*abc*abc")
+                .unwrap()
+                .matches("abcabcabcabcabcabcabca")
+        );
+        assert!(
+            Pattern::new("a*a*a*a*a*a*a*a*a")
+                .unwrap()
+                .matches("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
         assert!(Pattern::new("a*b[xyz]c*d").unwrap().matches("abxcdbxcddd"));
     }
 
@@ -1269,13 +1380,13 @@ mod test {
     fn test_range_pattern() {
         let pat = Pattern::new("a[0-9]b").unwrap();
         for i in 0..10 {
-            assert!(pat.matches(&format!("a{}b", i)), "a{i}b =~ a[0-9]b");
+            assert!(pat.matches(&format!("a{i}b")), "a{i}b =~ a[0-9]b");
         }
         assert!(!pat.matches("a_b"));
 
         let pat = Pattern::new("a[!0-9]b").unwrap();
         for i in 0..10 {
-            assert!(!pat.matches(&format!("a{}b", i)));
+            assert!(!pat.matches(&format!("a{i}b")));
         }
         assert!(pat.matches("a_b"));
 
@@ -1398,31 +1509,47 @@ mod test {
             recursive_match_hidden_dir: true,
         };
 
-        assert!(Pattern::new("abc/def")
-            .unwrap()
-            .matches_with("abc/def", options_require_literal));
-        assert!(!Pattern::new("abc?def")
-            .unwrap()
-            .matches_with("abc/def", options_require_literal));
-        assert!(!Pattern::new("abc*def")
-            .unwrap()
-            .matches_with("abc/def", options_require_literal));
-        assert!(!Pattern::new("abc[/]def")
-            .unwrap()
-            .matches_with("abc/def", options_require_literal));
+        assert!(
+            Pattern::new("abc/def")
+                .unwrap()
+                .matches_with("abc/def", options_require_literal)
+        );
+        assert!(
+            !Pattern::new("abc?def")
+                .unwrap()
+                .matches_with("abc/def", options_require_literal)
+        );
+        assert!(
+            !Pattern::new("abc*def")
+                .unwrap()
+                .matches_with("abc/def", options_require_literal)
+        );
+        assert!(
+            !Pattern::new("abc[/]def")
+                .unwrap()
+                .matches_with("abc/def", options_require_literal)
+        );
 
-        assert!(Pattern::new("abc/def")
-            .unwrap()
-            .matches_with("abc/def", options_not_require_literal));
-        assert!(Pattern::new("abc?def")
-            .unwrap()
-            .matches_with("abc/def", options_not_require_literal));
-        assert!(Pattern::new("abc*def")
-            .unwrap()
-            .matches_with("abc/def", options_not_require_literal));
-        assert!(Pattern::new("abc[/]def")
-            .unwrap()
-            .matches_with("abc/def", options_not_require_literal));
+        assert!(
+            Pattern::new("abc/def")
+                .unwrap()
+                .matches_with("abc/def", options_not_require_literal)
+        );
+        assert!(
+            Pattern::new("abc?def")
+                .unwrap()
+                .matches_with("abc/def", options_not_require_literal)
+        );
+        assert!(
+            Pattern::new("abc*def")
+                .unwrap()
+                .matches_with("abc/def", options_not_require_literal)
+        );
+        assert!(
+            Pattern::new("abc[/]def")
+                .unwrap()
+                .matches_with("abc/def", options_not_require_literal)
+        );
     }
 
     #[test]

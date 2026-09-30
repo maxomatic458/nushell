@@ -1,40 +1,75 @@
 <!--
-if this PR closes one or more issues, you can automatically link the PR with
-them by using one of the [*linking keywords*](https://docs.github.com/en/issues/tracking-your-work-with-issues/linking-a-pull-request-to-an-issue#linking-a-pull-request-to-an-issue-using-a-keyword), e.g.
-- this PR should close #xxxx
-- fixes #xxxx
+Thanks for contributing to Nushell!
 
-you can also mention related issues, PRs or discussions!
+Before submitting, please read the contributing guide:
+https://github.com/nushell/nushell/blob/main/CONTRIBUTING.md
+
+This template helps reviewers understand your changes and allows us to generate high-quality release notes.
 -->
 
-# Description
+## Description
 <!--
-Thank you for improving Nushell. Please, check our [contributing guide](../CONTRIBUTING.md) and talk to the core team before making major changes.
+Explain what this PR does and why.
 
-Description of your pull request goes here. **Provide examples and/or screenshots** if your changes affect the user experience.
+This section is intentionally flexible:
+- Describe the problem
+- Explain your approach
+- Include technical details if relevant
+
+Good examples:
+- "In this PR, I fixed..."
+- "In this PR, I added support for..."
+- "This change improves X by..."
+
+Write as much or as little as needed for reviewers to understand your changes.
 -->
 
-# User-Facing Changes
-<!-- List of all changes that impact the user experience here. This helps us keep track of breaking changes. -->
-
-# Tests + Formatting
+## User-facing changes (Release notes)
 <!--
-Don't forget to add tests that cover your changes.
+This section is used (mostly as-is) for https://www.nushell.sh/blog/
 
-Make sure you've run and fixed any issues with these commands:
+Describe how Nushell behavior changes from a user's perspective.
+Do NOT describe internal Rust changes here.
 
-- `cargo fmt --all -- --check` to check standard code formatting (`cargo fmt --all` applies these changes)
-- `cargo clippy --workspace -- -D warnings -D clippy::unwrap_used` to check that you're using the standard code style
-- `cargo test --workspace` to check that all tests pass (on Windows make sure to [enable developer mode](https://learn.microsoft.com/en-us/windows/apps/get-started/developer-mode-features-and-debugging))
-- `cargo run -- -c "use std testing; testing run-tests --path crates/nu-std"` to run the tests for the standard library
+Write in a release note style, for example:
+- "Added support for..."
+- "Fixed an issue where..."
+- "Nushell now supports..."
+- "Improved performance of..."
 
-> **Note**
-> from `nushell` you can also use the `toolkit` as follows
-> ```bash
-> use toolkit.nu  # or use an `env_change` hook to activate it automatically
-> toolkit check pr
-> ```
+If your changes do NOT affect users (internal refactors, cleanup, etc.),
+just write:
+- "n/a"
+- "nan"
+- or similar
+
+This tells us the change should not appear in the changelog.
+
+Tips:
+- Focus on observable behavior
+- Include examples if helpful
+- Keep it concise
+
+You can:
+- Write a short paragraph (will appear as a bullet point), OR
+- Use headings (###) if your change needs more structure
+
+Avoid writing things like:
+- "In this PR, I refactored..."
+- "This updates internal code..."
+
+You may leave this blank until the PR is ready.
 -->
 
-# After Submitting
-<!-- If your PR had any user-facing changes, update [the documentation](https://github.com/nushell/nushell.github.io) after the PR is merged, if necessary. This will help us keep the docs up to date. -->
+## Additional notes
+<!--
+Optional.
+
+Examples:
+- fixes #123
+- closes #456
+- related #789
+
+Anything else reviewers should know.
+Remove this section if not needed.
+-->

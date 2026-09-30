@@ -1,10 +1,6 @@
-use nu_engine::CallExt;
-use nu_protocol::ast::{Call, Expr, Expression};
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, DataSource, Example, IntoPipelineData, PipelineData, PipelineMetadata,
-    Record, ShellError, Signature, Span, SyntaxShape, Type, Value,
-};
+use super::util::{build_metadata_record, extend_record_with_metadata};
+use nu_engine::command_prelude::*;
+use nu_protocol::PipelineMetadata;
 
 #[derive(Clone)]
 pub struct Metadata;
@@ -14,13 +10,13 @@ impl Command for Metadata {
         "metadata"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Get the metadata for items in the stream."
     }
 
     fn signature(&self) -> nu_protocol::Signature {
         Signature::build("metadata")
-            .input_output_types(vec![(Type::Any, Type::Record(vec![]))])
+            .input_output_types(vec![(Type::Any, Type::record())])
             .allow_variants_without_examples(true)
             .optional(
                 "expression",
@@ -37,78 +33,47 @@ impl Command for Metadata {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let arg = call.positional_nth(0);
         let head = call.head;
+        // Do not use `call.opt`: it filters out `Value::Nothing`, so `metadata $null` (and
+        // optional/rest bindings that are nothing) would be treated as "no positional" and
+        // return pipeline metadata without a `span` field. Callers like `assert equal $x null`
+        // always evaluate `(metadata $right).span` when building error labels.
+        let arg = if call.has_positional_args(stack, 0) {
+            Some(call.req::<Value>(engine_state, stack, 0)?)
+        } else {
+            None
+        };
+
+        if !matches!(input, PipelineData::Empty)
+            && let Some(ref arg_val) = arg
+        {
+            return Err(ShellError::IncompatibleParameters {
+                left_message: "pipeline input was provided".into(),
+                left_span: head,
+                right_message: "but a positional metadata expression was also given".into(),
+                right_span: arg_val.span(),
+            });
+        }
 
         match arg {
-            Some(Expression {
-                expr: Expr::FullCellPath(full_cell_path),
-                span,
-                ..
-            }) => {
-                if full_cell_path.tail.is_empty() {
-                    match &full_cell_path.head {
-                        Expression {
-                            expr: Expr::Var(var_id),
-                            ..
-                        } => {
-                            let origin = stack.get_var_with_origin(*var_id, *span)?;
-
-                            Ok(
-                                build_metadata_record(&origin, input.metadata().as_ref(), head)
-                                    .into_pipeline_data(),
-                            )
-                        }
-                        _ => {
-                            let val: Value = call.req(engine_state, stack, 0)?;
-                            Ok(build_metadata_record(&val, input.metadata().as_ref(), head)
-                                .into_pipeline_data())
-                        }
-                    }
-                } else {
-                    let val: Value = call.req(engine_state, stack, 0)?;
-                    Ok(build_metadata_record(&val, input.metadata().as_ref(), head)
-                        .into_pipeline_data())
-                }
-            }
-            Some(_) => {
-                let val: Value = call.req(engine_state, stack, 0)?;
-                Ok(build_metadata_record(&val, input.metadata().as_ref(), head)
-                    .into_pipeline_data())
-            }
+            Some(val) => Ok(
+                build_metadata_record_value(&val, input.metadata_ref(), head).into_pipeline_data(),
+            ),
             None => {
-                let mut record = Record::new();
-                if let Some(x) = input.metadata().as_ref() {
-                    match x {
-                        PipelineMetadata {
-                            data_source: DataSource::Ls,
-                        } => record.push("source", Value::string("ls", head)),
-                        PipelineMetadata {
-                            data_source: DataSource::HtmlThemes,
-                        } => record.push("source", Value::string("into html --list", head)),
-                        PipelineMetadata {
-                            data_source: DataSource::FilePath(path),
-                        } => record.push(
-                            "source",
-                            Value::string(path.to_string_lossy().to_string(), head),
-                        ),
-                    }
-                }
-
-                Ok(Value::record(record, head).into_pipeline_data())
+                Ok(Value::record(build_metadata_record(&input, head), head).into_pipeline_data())
             }
         }
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Get the metadata of a variable",
+                description: "Get the metadata of a variable.",
                 example: "let a = 42; metadata $a",
                 result: None,
             },
             Example {
-                description: "Get the metadata of the input",
+                description: "Get the metadata of the input.",
                 example: "ls | metadata",
                 result: None,
             },
@@ -116,39 +81,14 @@ impl Command for Metadata {
     }
 }
 
-fn build_metadata_record(arg: &Value, metadata: Option<&PipelineMetadata>, head: Span) -> Value {
+fn build_metadata_record_value(
+    arg: &Value,
+    metadata: Option<&PipelineMetadata>,
+    head: Span,
+) -> Value {
     let mut record = Record::new();
-
-    let span = arg.span();
-    record.push(
-        "span",
-        Value::record(
-            record! {
-                "start" => Value::int(span.start as i64,span),
-                "end" => Value::int(span.end as i64, span),
-            },
-            head,
-        ),
-    );
-
-    if let Some(x) = metadata {
-        match x {
-            PipelineMetadata {
-                data_source: DataSource::Ls,
-            } => record.push("source", Value::string("ls", head)),
-            PipelineMetadata {
-                data_source: DataSource::HtmlThemes,
-            } => record.push("source", Value::string("into html --list", head)),
-            PipelineMetadata {
-                data_source: DataSource::FilePath(path),
-            } => record.push(
-                "source",
-                Value::string(path.to_string_lossy().to_string(), head),
-            ),
-        }
-    }
-
-    Value::record(record, head)
+    record.push("span", arg.span().into_value(head));
+    Value::record(extend_record_with_metadata(record, metadata, head), head)
 }
 
 #[cfg(test)]
@@ -156,9 +96,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Metadata {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Metadata)
     }
 }

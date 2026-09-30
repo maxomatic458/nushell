@@ -1,10 +1,7 @@
-use nu_cmd_base::input_handler::{operate, CmdArgument};
-use nu_engine::CallExt;
-use nu_protocol::{
-    ast::{Call, CellPath},
-    engine::{Command, EngineState, Stack},
-    Category, Example, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value,
-};
+use nu_cmd_base::input_handler::{CmdArgument, operate};
+use nu_engine::command_prelude::*;
+
+use nu_protocol::FromValue;
 use print_positions::print_positions;
 
 #[derive(Clone)]
@@ -23,12 +20,26 @@ impl CmdArgument for Arguments {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 enum FillAlignment {
+    #[default]
     Left,
     Right,
     Middle,
     MiddleRight,
+}
+
+impl FromValue for FillAlignment {
+    fn from_value(v: Value) -> Result<Self, ShellError> {
+        Ok(match String::from_value(v)?.to_ascii_lowercase().as_str() {
+            "l" | "left" => Self::Left,
+            "r" | "right" => Self::Right,
+            "c" | "center" | "m" | "middle" => Self::Middle,
+            "cr" | "centerright" | "mr" | "middleright" => Self::MiddleRight,
+            // TODO: This should probably be an error
+            _ => Self::Left,
+        })
+    }
 }
 
 impl Command for Fill {
@@ -36,8 +47,8 @@ impl Command for Fill {
         "fill"
     }
 
-    fn usage(&self) -> &str {
-        "Fill and Align."
+    fn description(&self) -> &str {
+        "Fill and align text in columns."
     }
 
     fn signature(&self) -> nu_protocol::Signature {
@@ -47,72 +58,91 @@ impl Command for Fill {
                 (Type::Float, Type::String),
                 (Type::String, Type::String),
                 (Type::Filesize, Type::String),
-                (Type::List(Box::new(Type::Int)), Type::List(Box::new(Type::String))),
-                (Type::List(Box::new(Type::Float)), Type::List(Box::new(Type::String))),
-                (Type::List(Box::new(Type::String)), Type::List(Box::new(Type::String))),
-                (Type::List(Box::new(Type::Filesize)), Type::List(Box::new(Type::String))),
+                (
+                    Type::List(Box::new(Type::Int)),
+                    Type::List(Box::new(Type::String)),
+                ),
+                (
+                    Type::List(Box::new(Type::Float)),
+                    Type::List(Box::new(Type::String)),
+                ),
+                (
+                    Type::List(Box::new(Type::String)),
+                    Type::List(Box::new(Type::String)),
+                ),
+                (
+                    Type::List(Box::new(Type::Filesize)),
+                    Type::List(Box::new(Type::String)),
+                ),
                 // General case for heterogeneous lists
-                (Type::List(Box::new(Type::Any)), Type::List(Box::new(Type::String))),
-                ])
+                (
+                    Type::List(Box::new(Type::Any)),
+                    Type::List(Box::new(Type::String)),
+                ),
+            ])
             .allow_variants_without_examples(true)
             .named(
                 "width",
                 SyntaxShape::Int,
-                "The width of the output. Defaults to 1",
+                "The width of the output. Defaults to 1.",
                 Some('w'),
             )
-            .named(
-                "alignment",
-                SyntaxShape::String,
-                "The alignment of the output. Defaults to Left (Left(l), Right(r), Center(c/m), MiddleRight(cr/mr))",
-                Some('a'),
+            .param(
+                Flag::new("alignment")
+                    .short('a')
+                    .arg(SyntaxShape::String)
+                    .desc(
+                        "The alignment of the output. Defaults to Left (Left(l), Right(r), Center(c/m), MiddleRight(cr/mr)).",
+                    )
+                    .completion(Completion::new_list(&[
+                        "left",
+                        "right",
+                        "middle",
+                        "middleright",
+                    ])),
             )
             .named(
                 "character",
                 SyntaxShape::String,
-                "The character to fill with. Defaults to ' ' (space)",
+                "The character to fill with. Defaults to ' ' (space).",
                 Some('c'),
             )
             .category(Category::Conversions)
     }
 
     fn search_terms(&self) -> Vec<&str> {
-        vec!["display", "render", "format", "pad", "align"]
+        vec!["display", "render", "format", "pad", "align", "repeat"]
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description:
-                    "Fill a string on the left side to a width of 15 with the character '─'",
+                description: "Fill a string on the left side to a width of 15 with the character '─'.",
                 example: "'nushell' | fill --alignment l --character '─' --width 15",
                 result: Some(Value::string("nushell────────", Span::test_data())),
             },
             Example {
-                description:
-                    "Fill a string on the right side to a width of 15 with the character '─'",
+                description: "Fill a string on the right side to a width of 15 with the character '─'.",
                 example: "'nushell' | fill --alignment r --character '─' --width 15",
                 result: Some(Value::string("────────nushell", Span::test_data())),
             },
             Example {
-                description: "Fill a string on both sides to a width of 15 with the character '─'",
-                example: "'nushell' | fill --alignment m --character '─' --width 15",
-                result: Some(Value::string("────nushell────", Span::test_data())),
+                description: "Fill an empty string with 10 '─' characters.",
+                example: "'' | fill --character '─' --width 10",
+                result: Some(Value::string("──────────", Span::test_data())),
             },
             Example {
-                description:
-                    "Fill a number on the left side to a width of 5 with the character '0'",
+                description: "Fill a number on the left side to a width of 5 with the character '0'.",
                 example: "1 | fill --alignment right --character '0' --width 5",
                 result: Some(Value::string("00001", Span::test_data())),
             },
             Example {
-                description: "Fill a number on both sides to a width of 5 with the character '0'",
+                description: "Fill a number on both sides to a width of 5 with the character '0'.",
                 example: "1.1 | fill --alignment center --character '0' --width 5",
                 result: Some(Value::string("01.10", Span::test_data())),
             },
             Example {
-                description:
-                    "Fill a filesize on the left side to a width of 5 with the character '0'",
+                description: "Fill a filesize on both sides to a width of 10 with the character '0'.",
                 example: "1kib | fill --alignment middle --character '0' --width 10",
                 result: Some(Value::string("0001024000", Span::test_data())),
             },
@@ -137,30 +167,16 @@ fn fill(
     input: PipelineData,
 ) -> Result<nu_protocol::PipelineData, nu_protocol::ShellError> {
     let width_arg: Option<usize> = call.get_flag(engine_state, stack, "width")?;
-    let alignment_arg: Option<String> = call.get_flag(engine_state, stack, "alignment")?;
+    let alignment = call
+        .get_flag::<FillAlignment>(engine_state, stack, "alignment")?
+        .unwrap_or_default();
     let character_arg: Option<String> = call.get_flag(engine_state, stack, "character")?;
     let cell_paths: Vec<CellPath> = call.rest(engine_state, stack, 0)?;
     let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
 
-    let alignment = if let Some(arg) = alignment_arg {
-        match arg.to_ascii_lowercase().as_str() {
-            "l" | "left" => FillAlignment::Left,
-            "r" | "right" => FillAlignment::Right,
-            "c" | "center" | "m" | "middle" => FillAlignment::Middle,
-            "cr" | "centerright" | "mr" | "middleright" => FillAlignment::MiddleRight,
-            _ => FillAlignment::Left,
-        }
-    } else {
-        FillAlignment::Left
-    };
+    let width = width_arg.unwrap_or(1);
 
-    let width = if let Some(arg) = width_arg { arg } else { 1 };
-
-    let character = if let Some(arg) = character_arg {
-        arg
-    } else {
-        " ".to_string()
-    };
+    let character = character_arg.unwrap_or_else(|| " ".to_string());
 
     let arg = Arguments {
         width,
@@ -169,13 +185,13 @@ fn fill(
         cell_paths,
     };
 
-    operate(action, arg, input, call.head, engine_state.ctrlc.clone())
+    operate(action, arg, input, call.head, engine_state.signals())
 }
 
 fn action(input: &Value, args: &Arguments, span: Span) -> Value {
     match input {
         Value::Int { val, .. } => fill_int(*val, args, span),
-        Value::Filesize { val, .. } => fill_int(*val, args, span),
+        Value::Filesize { val, .. } => fill_int(val.get(), args, span),
         Value::Float { val, .. } => fill_float(*val, args, span),
         Value::String { val, .. } => fill_string(val, args, span),
         // Propagate errors by explicitly matching them before the final case.
@@ -249,9 +265,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Fill {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Fill)
     }
 }

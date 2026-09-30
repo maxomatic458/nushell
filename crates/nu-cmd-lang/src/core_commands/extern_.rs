@@ -1,6 +1,5 @@
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{Category, Example, PipelineData, ShellError, Signature, SyntaxShape, Type};
+use nu_engine::command_prelude::*;
+use nu_protocol::engine::CommandType;
 
 #[derive(Clone)]
 pub struct Extern;
@@ -10,25 +9,33 @@ impl Command for Extern {
         "extern"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Define a signature for an external command."
     }
 
     fn signature(&self) -> nu_protocol::Signature {
         Signature::build("extern")
             .input_output_types(vec![(Type::Nothing, Type::Nothing)])
-            .required("def_name", SyntaxShape::String, "Definition name.")
-            .required("params", SyntaxShape::Signature, "Parameters.")
+            .required(
+                "def_name",
+                SyntaxShape::String,
+                "The name of the external command signature to define.",
+            )
+            .required(
+                "params",
+                SyntaxShape::ExternalSignature,
+                "The parameters for the external command signature.",
+            )
             .category(Category::Core)
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"This command is a parser keyword. For details, check:
-  https://www.nushell.sh/book/thinking_in_nu.html"#
+    fn extra_description(&self) -> &str {
+        "This command is a parser keyword. For details, check:
+  https://www.nushell.sh/book/thinking_in_nu.html"
     }
 
-    fn is_parser_keyword(&self) -> bool {
-        true
+    fn command_type(&self) -> CommandType {
+        CommandType::Keyword
     }
 
     fn run(
@@ -41,10 +48,10 @@ impl Command for Extern {
         Ok(PipelineData::empty())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
-            description: "Write a signature for an external command",
-            example: r#"extern echo [text: string]"#,
+            description: "Write a signature for an external command.",
+            example: "extern echo [text: string]",
             result: None,
         }]
     }

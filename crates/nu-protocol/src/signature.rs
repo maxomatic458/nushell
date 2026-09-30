@@ -1,19 +1,33 @@
-use serde::Deserialize;
-use serde::Serialize;
-
-use crate::ast::Call;
-use crate::engine::Command;
-use crate::engine::EngineState;
-use crate::engine::Stack;
-use crate::BlockId;
-use crate::PipelineData;
-use crate::ShellError;
-use crate::SyntaxShape;
-use crate::Type;
-use crate::Value;
-use crate::VarId;
+use crate::{
+    BlockId, CompareTypes, DeclId, DeprecationEntry, Example, FromValue, IntoValue, PipelineData,
+    ShellError, Span, SyntaxShape, Type, TypeSet, Value, VarId,
+    engine::{Call, Command, CommandType, EngineState, Stack},
+    shell_error::generic::GenericError,
+};
+use nu_derive_value::FromValue as DeriveFromValue;
+use nu_utils::NuCow;
+use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 
+// Make nu_protocol available in this namespace, consumers of this crate will
+// have this without such an export.
+// The `FromValue` derive macro fully qualifies paths to "nu_protocol".
+use crate as nu_protocol;
+
+pub enum Parameter {
+    Required(PositionalArg),
+    Optional(PositionalArg),
+    Rest(PositionalArg),
+    Flag(Flag),
+}
+
+impl From<Flag> for Parameter {
+    fn from(value: Flag) -> Self {
+        Self::Flag(value)
+    }
+}
+
+/// The signature definition of a named flag that either accepts a value or acts as a toggle flag
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Flag {
     pub long: String,
@@ -21,23 +35,214 @@ pub struct Flag {
     pub arg: Option<SyntaxShape>,
     pub required: bool,
     pub desc: String,
+    pub completion: Option<Completion>,
 
     // For custom commands
     pub var_id: Option<VarId>,
     pub default_value: Option<Value>,
 }
 
+impl Flag {
+    /// The flag's long name, or `None` for a short-only flag (whose `long` is empty).
+    #[inline]
+    pub fn long_name(&self) -> Option<&str> {
+        (!self.long.is_empty()).then_some(self.long.as_str())
+    }
+
+    /// Whether this flag's value type accepts `nothing`/`null`.
+    ///
+    /// Used so `--flag=$null` can either pass `null` through (when the type allows it) or omit
+    /// the flag (when it does not). Switches (`arg: None`) never accept nothing — null means omit.
+    #[inline]
+    pub fn type_accepts_nothing(&self) -> bool {
+        match &self.arg {
+            Some(shape) => Type::Nothing.is_assignable_to(&shape.to_type()),
+            None => false,
+        }
+    }
+
+    #[inline]
+    pub fn new(long: impl Into<String>) -> Self {
+        Flag {
+            long: long.into(),
+            short: None,
+            arg: None,
+            required: false,
+            desc: String::new(),
+            completion: None,
+            var_id: None,
+            default_value: None,
+        }
+    }
+
+    #[inline]
+    pub fn short(self, short: char) -> Self {
+        Self {
+            short: Some(short),
+            ..self
+        }
+    }
+
+    #[inline]
+    pub fn arg(self, arg: SyntaxShape) -> Self {
+        Self {
+            arg: Some(arg),
+            ..self
+        }
+    }
+
+    #[inline]
+    pub fn required(self) -> Self {
+        Self {
+            required: true,
+            ..self
+        }
+    }
+
+    #[inline]
+    pub fn desc(self, desc: impl Into<String>) -> Self {
+        Self {
+            desc: desc.into(),
+            ..self
+        }
+    }
+
+    #[inline]
+    pub fn completion(self, completion: Completion) -> Self {
+        Self {
+            completion: Some(completion),
+            ..self
+        }
+    }
+}
+
+/// The signature definition for a positional argument
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PositionalArg {
     pub name: String,
     pub desc: String,
     pub shape: SyntaxShape,
+    pub completion: Option<Completion>,
 
     // For custom commands
     pub var_id: Option<VarId>,
     pub default_value: Option<Value>,
 }
 
+impl PositionalArg {
+    #[inline]
+    pub fn new(name: impl Into<String>, shape: SyntaxShape) -> Self {
+        Self {
+            name: name.into(),
+            desc: String::new(),
+            shape,
+            completion: None,
+            var_id: None,
+            default_value: None,
+        }
+    }
+
+    #[inline]
+    pub fn desc(self, desc: impl Into<String>) -> Self {
+        Self {
+            desc: desc.into(),
+            ..self
+        }
+    }
+
+    #[inline]
+    pub fn completion(self, completion: Completion) -> Self {
+        Self {
+            completion: Some(completion),
+            ..self
+        }
+    }
+
+    #[inline]
+    pub fn required(self) -> Parameter {
+        Parameter::Required(self)
+    }
+
+    #[inline]
+    pub fn optional(self) -> Parameter {
+        Parameter::Optional(self)
+    }
+
+    #[inline]
+    pub fn rest(self) -> Parameter {
+        Parameter::Rest(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum CommandWideCompleter {
+    External,
+    Command(DeclId),
+}
+
+/// A built-in completion a command declares for one of its arguments, dispatched on by the
+/// completer so renaming the command can't silently disable its argument completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BuiltinCompletion {
+    /// A `.nu` file or directory (`use`, `overlay use`, `source-env`); `std_virtual_path`
+    /// also offers the virtual `std/` modules (disabled for `source-env`).
+    NuFile { std_virtual_path: bool },
+    /// The exported members of an already-named module (`use spam <tab>`).
+    ModuleExports,
+    /// An environment variable name (`hide-env`).
+    EnvVar,
+    /// A command name; `internal_only` restricts to internal commands (`attr complete`).
+    Command { internal_only: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Completion {
+    Command(DeclId),
+    List(NuCow<&'static [&'static str], Vec<String>>),
+    /// A completion the engine provides for the argument (module/env/command names, …).
+    Builtin(BuiltinCompletion),
+}
+
+impl Completion {
+    pub const fn new_list(list: &'static [&'static str]) -> Self {
+        Self::List(NuCow::Borrowed(list))
+    }
+
+    pub fn to_value(&self, engine_state: &EngineState, span: Span) -> Value {
+        match self {
+            Completion::Command(id) => engine_state
+                .get_decl(*id)
+                .name()
+                .to_owned()
+                .into_value(span),
+            // No list to surface; name it so `scope commands` stays honest.
+            Completion::Builtin(kind) => Value::string(
+                match kind {
+                    BuiltinCompletion::NuFile { .. } => "<nu-file>",
+                    BuiltinCompletion::ModuleExports => "<module-exports>",
+                    BuiltinCompletion::EnvVar => "<env-var>",
+                    BuiltinCompletion::Command { .. } => "<command-name>",
+                },
+                span,
+            ),
+            Completion::List(list) => match list {
+                NuCow::Borrowed(list) => list
+                    .iter()
+                    .map(|&e| e.into_value(span))
+                    .collect::<Vec<Value>>()
+                    .into_value(span),
+                NuCow::Owned(list) => list
+                    .iter()
+                    .cloned()
+                    .map(|e| e.into_value(span))
+                    .collect::<Vec<Value>>()
+                    .into_value(span),
+            },
+        }
+    }
+}
+
+/// Command categories
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Category {
     Bits,
@@ -50,6 +255,7 @@ pub enum Category {
     Date,
     Debug,
     Default,
+    Deprecated,
     Removed,
     Env,
     Experimental,
@@ -64,6 +270,7 @@ pub enum Category {
     Network,
     Path,
     Platform,
+    Plugin,
     Random,
     Shells,
     Strings,
@@ -84,6 +291,7 @@ impl std::fmt::Display for Category {
             Category::Date => "date",
             Category::Debug => "debug",
             Category::Default => "default",
+            Category::Deprecated => "deprecated",
             Category::Removed => "removed",
             Category::Env => "env",
             Category::Experimental => "experimental",
@@ -98,6 +306,7 @@ impl std::fmt::Display for Category {
             Category::Network => "network",
             Category::Path => "path",
             Category::Platform => "platform",
+            Category::Plugin => "plugin",
             Category::Random => "random",
             Category::Shells => "shells",
             Category::Strings => "strings",
@@ -109,11 +318,49 @@ impl std::fmt::Display for Category {
     }
 }
 
+pub fn category_from_string(category: &str) -> Category {
+    match category {
+        "bits" => Category::Bits,
+        "bytes" => Category::Bytes,
+        "chart" => Category::Chart,
+        "conversions" => Category::Conversions,
+        // Let's protect our own "core" commands by preventing scripts from having this category.
+        "core" => Category::Custom("custom_core".to_string()),
+        "database" => Category::Database,
+        "date" => Category::Date,
+        "debug" => Category::Debug,
+        "default" => Category::Default,
+        "deprecated" => Category::Deprecated,
+        "removed" => Category::Removed,
+        "env" => Category::Env,
+        "experimental" => Category::Experimental,
+        "filesystem" => Category::FileSystem,
+        "filter" => Category::Filters,
+        "formats" => Category::Formats,
+        "generators" => Category::Generators,
+        "hash" => Category::Hash,
+        "history" => Category::History,
+        "math" => Category::Math,
+        "misc" => Category::Misc,
+        "network" => Category::Network,
+        "path" => Category::Path,
+        "platform" => Category::Platform,
+        "plugin" => Category::Plugin,
+        "random" => Category::Random,
+        "shells" => Category::Shells,
+        "strings" => Category::Strings,
+        "system" => Category::System,
+        "viewers" => Category::Viewers,
+        _ => Category::Custom(category.to_string()),
+    }
+}
+
+/// Signature information of a [`Command`]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Signature {
     pub name: String,
-    pub usage: String,
-    pub extra_usage: String,
+    pub description: String,
+    pub extra_description: String,
     pub search_terms: Vec<String>,
     pub required_positional: Vec<PositionalArg>,
     pub optional_positional: Vec<PositionalArg>,
@@ -124,6 +371,7 @@ pub struct Signature {
     pub is_filter: bool,
     pub creates_scope: bool,
     pub allows_unknown_args: bool,
+    pub complete: Option<CommandWideCompleter>,
     // Signature category used to classify commands stored in the list of declarations
     pub category: Category,
 }
@@ -131,7 +379,7 @@ pub struct Signature {
 impl PartialEq for Signature {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
-            && self.usage == other.usage
+            && self.description == other.description
             && self.required_positional == other.required_positional
             && self.optional_positional == other.optional_positional
             && self.rest_positional == other.rest_positional
@@ -141,12 +389,35 @@ impl PartialEq for Signature {
 
 impl Eq for Signature {}
 
+fn type_involves_custom(ty: &Type) -> bool {
+    match ty {
+        Type::Custom(_) => true,
+        Type::OneOf(types) => types.iter().any(type_involves_custom),
+        Type::List(inner) => type_involves_custom(inner),
+        _ => false,
+    }
+}
+
+fn is_structured_type(ty: &Type) -> bool {
+    matches!(ty, Type::List(_) | Type::Table(_) | Type::Record(_))
+}
+
+/// Custom values are assignable to list/table/record so `get` / `into record` type-check.
+/// That special case must not steal the output type of a real custom IO pair
+/// (`semver | into string` is a string, not `oneof<list, table, record>`).
+fn is_custom_structured_fallback(input: &Type, declared: &Type) -> bool {
+    type_involves_custom(input)
+        && is_structured_type(declared)
+        && input.compare_types(declared).is_none()
+}
+
 impl Signature {
+    /// Creates a new signature for a command with `name`
     pub fn new(name: impl Into<String>) -> Signature {
         Signature {
             name: name.into(),
-            usage: String::new(),
-            extra_usage: String::new(),
+            description: String::new(),
+            extra_description: String::new(),
             search_terms: vec![],
             required_positional: vec![],
             optional_positional: vec![],
@@ -158,50 +429,69 @@ impl Signature {
             creates_scope: false,
             category: Category::Default,
             allows_unknown_args: false,
+            complete: None,
         }
     }
 
-    // Gets the input type from the signature
+    /// Gets the input type from the signature
+    ///
+    /// - If the input was unspecified  [`Type::Any`] is returned.
+    /// - If the signature has a single input type, it is returned.
+    /// - If there are multiple input types, a [union](Type::union) of them is returned.
     pub fn get_input_type(&self) -> Type {
-        match self.input_output_types.len() {
-            0 => Type::Any,
-            1 => self.input_output_types[0].0.clone(),
-            _ => {
-                let first = &self.input_output_types[0].0;
-                if self
-                    .input_output_types
-                    .iter()
-                    .all(|(input, _)| input == first)
-                {
-                    first.clone()
-                } else {
-                    Type::Any
-                }
-            }
+        match self.input_output_types.as_slice() {
+            [] => Type::Any,
+            [(input, _output)] => input.clone(),
+            multiple => Type::one_of(multiple.iter().map(|(input, _)| input.clone())),
         }
     }
 
-    // Gets the output type from the signature
-    pub fn get_output_type(&self) -> Type {
-        match self.input_output_types.len() {
-            0 => Type::Any,
-            1 => self.input_output_types[0].1.clone(),
-            _ => {
-                let first = &self.input_output_types[0].1;
-                if self
-                    .input_output_types
-                    .iter()
-                    .all(|(_, output)| output == first)
-                {
-                    first.clone()
-                } else {
-                    Type::Any
+    /// Gets the output type from the signature based on `input`
+    ///
+    /// - If the signature's output was unspecified [`Type::Any`] is returned.
+    /// - If `input` is [`None`], it's treated as [`Type::Any`]. i.e. all IO pairs are considered.
+    /// - IO pairs where the given `input` is [assignable to](crate::CompareTypes::is_assignable_to)
+    ///   the input type are considered valid.
+    /// - Custom values are assignable to list/table/record. Those fallback pairs are ignored
+    ///   when a lattice match exists (so `semver | into string` is `string`).
+    /// - [Union](TypeSet::union) of remaining outputs is returned.
+    /// - If there are no valid IO pairs for the given `input`, [`None`] is returned.
+    // XXX: remove?
+    pub fn get_output_type(&self, input_type: Option<&Type>) -> Option<Type> {
+        if self.input_output_types.is_empty() {
+            return Some(Type::Any);
+        }
+        let input = input_type.unwrap_or(&Type::Any);
+        // Entries whose input type accepts `input` are the candidates; among those, the ones
+        // that are not merely a structured-type fallback for a custom value are preferred. Two
+        // passes without temporary collections: this runs for every call the parser
+        // type-checks.
+        let mut any_match = false;
+        let mut any_strict_match = false;
+        for (in_ty, _) in &self.input_output_types {
+            if input.is_assignable_to(in_ty) {
+                any_match = true;
+                if !is_custom_structured_fallback(input, in_ty) {
+                    any_strict_match = true;
+                    break;
                 }
             }
         }
+        if !any_match {
+            return None;
+        }
+
+        self.input_output_types
+            .iter()
+            .filter(|(in_ty, _)| {
+                input.is_assignable_to(in_ty)
+                    && (!any_strict_match || !is_custom_structured_fallback(input, in_ty))
+            })
+            .map(|(_, out)| out.clone())
+            .reduce(Type::union)
     }
 
-    // Add a default help option to a signature
+    /// Add a default help option to a signature
     pub fn add_help(mut self) -> Signature {
         // default help flag
         let flag = Flag {
@@ -212,25 +502,33 @@ impl Signature {
             required: false,
             var_id: None,
             default_value: None,
+            completion: None,
         };
         self.named.push(flag);
         self
     }
 
-    // Build an internal signature with default help option
+    /// Build an internal signature with default help option
+    ///
+    /// This is equivalent to `Signature::new(name).add_help()`.
     pub fn build(name: impl Into<String>) -> Signature {
         Signature::new(name.into()).add_help()
     }
 
     /// Add a description to the signature
-    pub fn usage(mut self, msg: impl Into<String>) -> Signature {
-        self.usage = msg.into();
+    ///
+    /// This should be a single sentence as it is the part shown for example in the completion
+    /// menu.
+    pub fn description(mut self, msg: impl Into<String>) -> Signature {
+        self.description = msg.into();
         self
     }
 
-    /// Add an extra description to the signature
-    pub fn extra_usage(mut self, msg: impl Into<String>) -> Signature {
-        self.extra_usage = msg.into();
+    /// Add an extra description to the signature.
+    ///
+    /// Here additional documentation can be added
+    pub fn extra_description(mut self, msg: impl Into<String>) -> Signature {
+        self.extra_description = msg.into();
         self
     }
 
@@ -247,14 +545,50 @@ impl Signature {
             .into_iter()
             .map(|term| term.to_string())
             .collect();
-        self.extra_usage = command.extra_usage().to_string();
-        self.usage = command.usage().to_string();
+        self.extra_description = command.extra_description().to_string();
+        self.description = command.description().to_string();
         self
     }
 
     /// Allow unknown signature parameters
     pub fn allows_unknown_args(mut self) -> Signature {
         self.allows_unknown_args = true;
+        self
+    }
+
+    pub fn param(mut self, param: impl Into<Parameter>) -> Self {
+        let param: Parameter = param.into();
+        match param {
+            Parameter::Flag(flag) => {
+                if let Some(s) = flag.short {
+                    assert!(
+                        !self.get_shorts().contains(&s),
+                        "There may be duplicate short flags for '-{s}'"
+                    );
+                }
+
+                let name = flag.long.as_str();
+                assert!(
+                    !self.get_names().contains(&name),
+                    "There may be duplicate name flags for '--{name}'"
+                );
+
+                self.named.push(flag);
+            }
+            Parameter::Required(positional_arg) => {
+                self.required_positional.push(positional_arg);
+            }
+            Parameter::Optional(positional_arg) => {
+                self.optional_positional.push(positional_arg);
+            }
+            Parameter::Rest(positional_arg) => {
+                assert!(
+                    self.rest_positional.is_none(),
+                    "Tried to set rest arguments more than once"
+                );
+                self.rest_positional = Some(positional_arg);
+            }
+        }
         self
     }
 
@@ -271,6 +605,7 @@ impl Signature {
             shape: shape.into(),
             var_id: None,
             default_value: None,
+            completion: None,
         });
 
         self
@@ -289,11 +624,19 @@ impl Signature {
             shape: shape.into(),
             var_id: None,
             default_value: None,
+            completion: None,
         });
 
         self
     }
 
+    /// Add a rest positional parameter
+    ///
+    /// Rest positionals (also called [rest parameters][rp]) are treated as
+    /// optional: passing 0 arguments is a valid call.  If the command requires
+    /// at least one argument, it must be checked by the implementation.
+    ///
+    /// [rp]: https://www.nushell.sh/book/custom_commands.html#rest-parameters
     pub fn rest(
         mut self,
         name: &str,
@@ -306,6 +649,7 @@ impl Signature {
             shape: shape.into(),
             var_id: None,
             default_value: None,
+            completion: None,
         });
 
         self
@@ -345,6 +689,7 @@ impl Signature {
             desc: desc.into(),
             var_id: None,
             default_value: None,
+            completion: None,
         });
 
         self
@@ -368,6 +713,7 @@ impl Signature {
             desc: desc.into(),
             var_id: None,
             default_value: None,
+            completion: None,
         });
 
         self
@@ -390,6 +736,7 @@ impl Signature {
             desc: desc.into(),
             var_id: None,
             default_value: None,
+            completion: None,
         });
 
         self
@@ -426,6 +773,10 @@ impl Signature {
         self
     }
 
+    /// A string rendering of the command signature
+    ///
+    /// If the command has flags, all of them will be shown together as
+    /// `{flags}`.
     pub fn call_signature(&self) -> String {
         let mut one_liner = String::new();
         one_liner.push_str(&self.name);
@@ -467,24 +818,25 @@ impl Signature {
         self.named.iter().map(|f| f.long.as_str()).collect()
     }
 
-    /// Checks if short or long are already present
-    /// Panics if one of them is found
+    /// Checks if short or long options are already present
+    ///
+    /// ## Panics
+    ///
+    /// Panics if one of them is found.
+    // XXX: return result instead of a panic
     fn check_names(&self, name: impl Into<String>, short: Option<char>) -> (String, Option<char>) {
-        let s = short.map(|c| {
-            debug_assert!(
-                !self.get_shorts().contains(&c),
-                "There may be duplicate short flags for '-{}'",
-                c
+        let s = short.inspect(|c| {
+            assert!(
+                !self.get_shorts().contains(c),
+                "There may be duplicate short flags for '-{c}'"
             );
-            c
         });
 
         let name = {
             let name: String = name.into();
-            debug_assert!(
+            assert!(
                 !self.get_names().contains(&name.as_str()),
-                "There may be duplicate name flags for '--{}'",
-                name
+                "There may be duplicate name flags for '--{name}'"
             );
             name
         };
@@ -492,18 +844,26 @@ impl Signature {
         (name, s)
     }
 
-    pub fn get_positional(&self, position: usize) -> Option<PositionalArg> {
+    /// Returns an argument with the index `position`
+    ///
+    /// It will index, in order, required arguments, then optional, then the
+    /// trailing `...rest` argument. Note that the `...rest` argument must be
+    /// a [`Value::List`], therefore this method may not work as intended when
+    /// the closure uses a rest argument.
+    pub fn get_positional(&self, position: usize) -> Option<&PositionalArg> {
         if position < self.required_positional.len() {
-            self.required_positional.get(position).cloned()
+            self.required_positional.get(position)
         } else if position < (self.required_positional.len() + self.optional_positional.len()) {
             self.optional_positional
                 .get(position - self.required_positional.len())
-                .cloned()
         } else {
-            self.rest_positional.clone()
+            self.rest_positional.as_ref()
         }
     }
 
+    /// Returns the number of (optional) positional parameters in a signature
+    ///
+    /// This does _not_ include the `...rest` parameter, even if it's present.
     pub fn num_positionals(&self) -> usize {
         let mut total = self.required_positional.len() + self.optional_positional.len();
 
@@ -522,29 +882,11 @@ impl Signature {
         total
     }
 
-    pub fn num_positionals_after(&self, idx: usize) -> usize {
-        let mut total = 0;
-
-        for (curr, positional) in self.required_positional.iter().enumerate() {
-            match positional.shape {
-                SyntaxShape::Keyword(..) => {
-                    // Keywords have a required argument, so account for that
-                    if curr > idx {
-                        total += 2;
-                    }
-                }
-                _ => {
-                    if curr > idx {
-                        total += 1;
-                    }
-                }
-            }
-        }
-        total
-    }
-
     /// Find the matching long flag
     pub fn get_long_flag(&self, name: &str) -> Option<Flag> {
+        if name.is_empty() {
+            return None;
+        }
         for flag in &self.named {
             if flag.long == name {
                 return Some(flag.clone());
@@ -556,10 +898,10 @@ impl Signature {
     /// Find the matching long flag
     pub fn get_short_flag(&self, short: char) -> Option<Flag> {
         for flag in &self.named {
-            if let Some(short_flag) = &flag.short {
-                if *short_flag == short {
-                    return Some(flag.clone());
-                }
+            if let Some(short_flag) = &flag.short
+                && *short_flag == short
+            {
+                return Some(flag.clone());
             }
         }
         None
@@ -575,52 +917,38 @@ impl Signature {
     /// signature so other definitions can see it. This placeholder is later replaced with the
     /// full definition in a second pass of the parser.
     pub fn predeclare(self) -> Box<dyn Command> {
-        Box::new(Predeclaration { signature: self })
+        self.predeclare_with_command_type(CommandType::Builtin)
     }
 
-    /// Combines a signature and a block into a runnable block
-    pub fn into_block_command(self, block_id: BlockId) -> Box<dyn Command> {
-        Box::new(BlockCommand {
+    /// Create a placeholder implementation of Command as a way to predeclare a definition's
+    /// signature with an explicit command type.
+    pub fn predeclare_with_command_type(self, command_type: CommandType) -> Box<dyn Command> {
+        Box::new(Predeclaration {
             signature: self,
-            block_id,
+            command_type,
         })
     }
 
-    pub fn formatted_flags(self) -> String {
-        if self.named.len() < 11 {
-            let mut s = "Available flags:".to_string();
-            for flag in self.named {
-                if let Some(short) = flag.short {
-                    let _ = write!(s, " --{}(-{}),", flag.long, short);
-                } else {
-                    let _ = write!(s, " --{},", flag.long);
-                }
-            }
-            s.remove(s.len() - 1);
-            let _ = write!(s, ". Use `--help` for more information.");
-            s
-        } else {
-            let mut s = "Some available flags:".to_string();
-            for flag in self.named {
-                if let Some(short) = flag.short {
-                    let _ = write!(s, " --{}(-{}),", flag.long, short);
-                } else {
-                    let _ = write!(s, " --{},", flag.long);
-                }
-            }
-            s.remove(s.len() - 1);
-            let _ = write!(
-                s,
-                "... Use `--help` for a full list of flags and more information."
-            );
-            s
-        }
+    /// Combines a signature and a block into a runnable block
+    pub fn into_block_command(
+        self,
+        block_id: BlockId,
+        attributes: Vec<(String, Value)>,
+        examples: Vec<CustomExample>,
+    ) -> Box<dyn Command> {
+        Box::new(BlockCommand {
+            signature: self,
+            block_id,
+            attributes,
+            examples,
+        })
     }
 }
 
 #[derive(Clone)]
 struct Predeclaration {
     signature: Signature,
+    command_type: CommandType,
 }
 
 impl Command for Predeclaration {
@@ -632,12 +960,12 @@ impl Command for Predeclaration {
         self.signature.clone()
     }
 
-    fn usage(&self) -> &str {
-        &self.signature.usage
+    fn description(&self) -> &str {
+        &self.signature.description
     }
 
-    fn extra_usage(&self) -> &str {
-        &self.signature.extra_usage
+    fn extra_description(&self) -> &str {
+        &self.signature.extra_description
     }
 
     fn run(
@@ -648,6 +976,10 @@ impl Command for Predeclaration {
         _input: PipelineData,
     ) -> Result<PipelineData, crate::ShellError> {
         panic!("Internal error: can't run a predeclaration without a body")
+    }
+
+    fn command_type(&self) -> CommandType {
+        self.command_type
     }
 }
 
@@ -670,10 +1002,29 @@ fn get_positional_short_name(arg: &PositionalArg, is_required: bool) -> String {
     }
 }
 
+#[derive(Clone, DeriveFromValue)]
+pub struct CustomExample {
+    pub example: String,
+    pub description: String,
+    pub result: Option<Value>,
+}
+
+impl CustomExample {
+    pub fn to_example(&self) -> Example<'_> {
+        Example {
+            example: self.example.as_str(),
+            description: self.description.as_str(),
+            result: self.result.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct BlockCommand {
     signature: Signature,
     block_id: BlockId,
+    attributes: Vec<(String, Value)>,
+    examples: Vec<CustomExample>,
 }
 
 impl Command for BlockCommand {
@@ -685,12 +1036,12 @@ impl Command for BlockCommand {
         self.signature.clone()
     }
 
-    fn usage(&self) -> &str {
-        &self.signature.usage
+    fn description(&self) -> &str {
+        &self.signature.description
     }
 
-    fn extra_usage(&self) -> &str {
-        &self.signature.extra_usage
+    fn extra_description(&self) -> &str {
+        &self.signature.extra_description
     }
 
     fn run(
@@ -700,16 +1051,48 @@ impl Command for BlockCommand {
         _call: &Call,
         _input: PipelineData,
     ) -> Result<crate::PipelineData, crate::ShellError> {
-        Err(ShellError::GenericError {
-            error: "Internal error: can't run custom command with 'run', use block_id".into(),
-            msg: "".into(),
-            span: None,
-            help: None,
-            inner: vec![],
-        })
+        Err(ShellError::Generic(GenericError::new_internal(
+            "Internal error: can't run custom command with 'run', use block_id",
+            "",
+        )))
     }
 
-    fn get_block_id(&self) -> Option<BlockId> {
+    fn command_type(&self) -> CommandType {
+        CommandType::Custom
+    }
+
+    fn block_id(&self) -> Option<BlockId> {
         Some(self.block_id)
+    }
+
+    fn attributes(&self) -> Vec<(String, Value)> {
+        self.attributes.clone()
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        self.examples
+            .iter()
+            .map(CustomExample::to_example)
+            .collect()
+    }
+
+    fn search_terms(&self) -> Vec<&str> {
+        self.signature
+            .search_terms
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn deprecation_info(&self) -> Vec<DeprecationEntry> {
+        self.attributes
+            .iter()
+            .filter_map(|(key, value)| {
+                (key == "deprecated")
+                    .then_some(value.clone())
+                    .map(DeprecationEntry::from_value)
+                    .and_then(Result::ok)
+            })
+            .collect()
     }
 }

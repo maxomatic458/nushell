@@ -1,14 +1,9 @@
-use nu_engine::get_full_help;
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    Category, IntoPipelineData, PipelineData, ShellError, Signature, Type, Value,
-};
+use nu_engine::{command_prelude::*, get_full_help};
 
 #[derive(Clone)]
-pub struct PathCommand;
+pub struct Path;
 
-impl Command for PathCommand {
+impl Command for Path {
     fn name(&self) -> &str {
         "path"
     }
@@ -19,12 +14,12 @@ impl Command for PathCommand {
             .category(Category::Path)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Explore and manipulate paths."
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"You must use one of the following subcommands. Using this command as-is will only produce this help message.
+    fn extra_description(&self) -> &str {
+        "You must use one of the following subcommands. Using this command as-is will only produce this help message.
 
 There are three ways to represent a path:
 
@@ -37,7 +32,7 @@ There are three ways to represent a path:
 
 All subcommands accept all three variants as an input. Furthermore, the 'path
 join' subcommand can be used to join the structured path or path parts back into
-the path literal."#
+the path literal."
     }
 
     fn run(
@@ -48,13 +43,7 @@ the path literal."#
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         Ok(Value::string(
-            get_full_help(
-                &PathCommand.signature(),
-                &PathCommand.examples(),
-                engine_state,
-                stack,
-                self.is_parser_keyword(),
-            ),
+            get_full_help(self, engine_state, stack, call.head),
             call.head,
         )
         .into_pipeline_data())

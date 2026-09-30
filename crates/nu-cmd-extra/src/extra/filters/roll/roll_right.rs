@@ -1,12 +1,5 @@
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, IntoPipelineData, PipelineData, ShellError, Signature, SyntaxShape,
-    Type, Value,
-};
-
-use super::{horizontal_rotate_value, HorizontalDirection};
+use super::{HorizontalDirection, horizontal_rotate_value};
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
 pub struct RollRight;
@@ -23,28 +16,28 @@ impl Command for RollRight {
     fn signature(&self) -> Signature {
         Signature::build(self.name())
             .input_output_types(vec![
-                (Type::Record(vec![]), Type::Record(vec![])),
-                (Type::Table(vec![]), Type::Table(vec![])),
+                (Type::record(), Type::record()),
+                (Type::table(), Type::table()),
             ])
             .named(
                 "by",
                 SyntaxShape::Int,
-                "Number of columns to roll",
+                "Number of columns to roll.",
                 Some('b'),
             )
             .switch(
                 "cells-only",
-                "rotates columns leaving headers fixed",
+                "Rotates columns leaving headers fixed.",
                 Some('c'),
             )
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Roll table columns right."
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "Rolls columns of a record to the right",
@@ -97,15 +90,16 @@ impl Command for RollRight {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
+        let mut input = input.into_stream_or_original(engine_state);
         let by: Option<usize> = call.get_flag(engine_state, stack, "by")?;
-        let metadata = input.metadata();
+        let metadata = input.take_metadata();
 
         let cells_only = call.has_flag(engine_state, stack, "cells-only")?;
-        let value = input.into_value(call.head);
+        let value = input.into_value(call.head)?;
         let rotated_value =
             horizontal_rotate_value(value, by, cells_only, &HorizontalDirection::Right)?;
 
-        Ok(rotated_value.into_pipeline_data().set_metadata(metadata))
+        Ok(rotated_value.into_pipeline_data_with_metadata(metadata))
     }
 }
 
@@ -114,9 +108,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(RollRight {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(RollRight)
     }
 }

@@ -1,10 +1,5 @@
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    Category, Example, PipelineData, ShellError, Signature, SyntaxShape, Type, Value,
-};
-
 use super::utils;
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
 pub struct All;
@@ -19,13 +14,13 @@ impl Command for All {
             .input_output_types(vec![(Type::List(Box::new(Type::Any)), Type::Bool)])
             .required(
                 "predicate",
-                SyntaxShape::Closure(Some(vec![SyntaxShape::Any, SyntaxShape::Int])),
-                "A closure that must evaluate to a boolean.",
+                SyntaxShape::RowCondition,
+                "Row condition or closure that evaluates to a boolean.",
             )
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Test if every element of the input fulfills a predicate expression."
     }
 
@@ -33,25 +28,30 @@ impl Command for All {
         vec!["every", "and"]
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Check if each row's status is the string 'UP'",
+                description: "Check if a list contains only true values.",
+                example: "[false true true false] | all {}",
+                result: Some(Value::test_bool(false)),
+            },
+            Example {
+                description: "Check if each row's status is the string 'UP'.",
                 example: "[[status]; [UP] [UP]] | all {|el| $el.status == UP }",
                 result: Some(Value::test_bool(true)),
             },
             Example {
-                description: "Check that each item is a string",
-                example: "[foo bar 2 baz] | all {|| ($in | describe) == 'string' }",
+                description: "Check that each item is a string.",
+                example: "[foo bar 2 baz] | all ($it | describe) == 'string'",
                 result: Some(Value::test_bool(false)),
             },
             Example {
-                description: "Check that all values are equal to twice their index",
+                description: "Check that all values are equal to twice their index.",
                 example: "[0 2 4 6] | enumerate | all {|i| $i.item == $i.index * 2 }",
                 result: Some(Value::test_bool(true)),
             },
             Example {
-                description: "Check that all of the values are even, using a stored closure",
+                description: "Check that all of the values are even, using a stored closure.",
                 example: "let cond = {|el| ($el mod 2) == 0 }; [2 4 6 8] | all $cond",
                 result: Some(Value::test_bool(true)),
             },
@@ -74,9 +74,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(All)
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(All)
     }
 }

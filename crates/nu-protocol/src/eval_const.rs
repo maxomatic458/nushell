@@ -1,17 +1,31 @@
+//! Implementation of const-evaluation
+//!
+//! This enables you to assign `const`-constants and execute parse-time code dependent on this.
+//! e.g. `source $my_const`
 use crate::{
-    ast::{Assignment, Block, Call, Expr, Expression, ExternalArgument, PipelineElement},
-    engine::{EngineState, StateWorkingSet},
+    BlockId, Config, HistoryPath, PipelineData, Record, ShellError, Span, Value, VarId,
+    ast::{self, Assignment, Block, Call, Expr, Expression, ExternalArgument},
+    debugger::{DebugContext, WithoutDebug},
+    engine::{
+        Argument, Closure, CommandType, EngineState, Stack, StateWorkingSet,
+        named_flags::normalize_engine_arguments,
+    },
     eval_base::Eval,
-    record, Config, HistoryFileFormat, PipelineData, Record, ShellError, Span, Value, VarId,
+    ir, record,
+    shell_error::generic::GenericError,
 };
 use nu_system::os_info::{get_kernel_version, get_os_arch, get_os_family, get_os_name};
 use std::{
-    borrow::Cow,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
-pub fn create_nu_constant(engine_state: &EngineState, span: Span) -> Result<Value, ShellError> {
+/// Create a Value for `$nu`.
+// Note: When adding new constants to $nu, please update the doc at https://nushell.sh/book/special_variables.html
+// or at least add a TODO/reminder issue in nushell.github.io so we don't lose track of it.
+pub(crate) fn create_nu_constant(engine_state: &EngineState, span: Span) -> Value {
     fn canonicalize_path(engine_state: &EngineState, path: &Path) -> PathBuf {
+        #[allow(deprecated)]
         let cwd = engine_state.current_work_dir();
 
         if path.exists() {
@@ -26,139 +40,149 @@ pub fn create_nu_constant(engine_state: &EngineState, span: Span) -> Result<Valu
 
     let mut record = Record::new();
 
+    let config_home = &engine_state.config_dirs.config_home;
+    let canon_config_home = canonicalize_path(engine_state, config_home);
+
     record.push(
         "default-config-dir",
-        if let Some(mut path) = nu_path::config_dir() {
-            path.push("nushell");
-            Value::string(path.to_string_lossy(), span)
-        } else {
-            Value::error(
-                ShellError::IOError {
-                    msg: "Could not get config directory".into(),
-                },
-                span,
-            )
-        },
+        Value::string(canon_config_home.to_string_lossy(), span),
     );
 
     record.push(
         "config-path",
-        if let Some(path) = engine_state.get_config_path("config-path") {
-            let canon_config_path = canonicalize_path(engine_state, path);
-            Value::string(canon_config_path.to_string_lossy(), span)
-        } else if let Some(mut path) = nu_path::config_dir() {
-            path.push("nushell");
-            path.push("config.nu");
-            Value::string(path.to_string_lossy(), span)
-        } else {
-            Value::error(
-                ShellError::IOError {
-                    msg: "Could not get config directory".into(),
-                },
-                span,
-            )
-        },
+        Value::string(
+            canonicalize_path(engine_state, engine_state.config_dirs.config_file.as_path())
+                .to_string_lossy(),
+            span,
+        ),
     );
 
     record.push(
         "env-path",
-        if let Some(path) = engine_state.get_config_path("env-path") {
-            let canon_env_path = canonicalize_path(engine_state, path);
-            Value::string(canon_env_path.to_string_lossy(), span)
-        } else if let Some(mut path) = nu_path::config_dir() {
-            path.push("nushell");
-            path.push("env.nu");
-            Value::string(path.to_string_lossy(), span)
-        } else {
-            Value::error(
-                ShellError::IOError {
-                    msg: "Could not find environment path".into(),
-                },
-                span,
-            )
-        },
+        Value::string(
+            canonicalize_path(engine_state, engine_state.config_dirs.env_file.as_path())
+                .to_string_lossy(),
+            span,
+        ),
     );
 
     record.push(
         "history-path",
-        if let Some(mut path) = nu_path::config_dir() {
-            path.push("nushell");
-            match engine_state.config.history.file_format {
-                HistoryFileFormat::Sqlite => {
-                    path.push("history.sqlite3");
-                }
-                HistoryFileFormat::PlainText => {
-                    path.push("history.txt");
-                }
+        match &engine_state.config.history.path {
+            HistoryPath::Disabled => Value::string("", span),
+            HistoryPath::Custom(custom_path) => {
+                let effective_path = if custom_path.is_dir() {
+                    custom_path.join(engine_state.config.history.file_format.default_file_name())
+                } else {
+                    custom_path.clone()
+                };
+                let canon_hist_path = canonicalize_path(engine_state, &effective_path);
+                Value::string(canon_hist_path.to_string_lossy(), span)
             }
-            let canon_hist_path = canonicalize_path(engine_state, &path);
-            Value::string(canon_hist_path.to_string_lossy(), span)
-        } else {
-            Value::error(
-                ShellError::IOError {
-                    msg: "Could not find history path".into(),
-                },
-                span,
-            )
+            HistoryPath::Default => {
+                // Use the same resolution path as history backends so `$nu.history-path`
+                // always matches the file reedline opens.
+                let hist_path = engine_state
+                    .config
+                    .history
+                    .file_path(config_home)
+                    .unwrap_or_else(|| {
+                        config_home
+                            .join(engine_state.config.history.file_format.default_file_name())
+                    });
+                let canon_hist_path = canonicalize_path(engine_state, &hist_path);
+                Value::string(canon_hist_path.to_string_lossy(), span)
+            }
         },
     );
 
     record.push(
         "loginshell-path",
-        if let Some(mut path) = nu_path::config_dir() {
-            path.push("nushell");
-            path.push("login.nu");
-            let canon_login_path = canonicalize_path(engine_state, &path);
-            Value::string(canon_login_path.to_string_lossy(), span)
-        } else {
-            Value::error(
-                ShellError::IOError {
-                    msg: "Could not find login shell path".into(),
-                },
-                span,
-            )
-        },
+        Value::string(
+            canonicalize_path(engine_state, &config_home.join("login.nu")).to_string_lossy(),
+            span,
+        ),
     );
 
     #[cfg(feature = "plugin")]
     {
+        // Prefer the live plugin_path (set once at startup from config_dirs).
+        let plugin_path = engine_state
+            .plugin_path
+            .as_deref()
+            .unwrap_or_else(|| engine_state.config_dirs.plugin_file.as_path());
         record.push(
             "plugin-path",
-            if let Some(path) = &engine_state.plugin_signatures {
-                let canon_plugin_path = canonicalize_path(engine_state, path);
-                Value::string(canon_plugin_path.to_string_lossy(), span)
-            } else if let Some(mut plugin_path) = nu_path::config_dir() {
-                // If there are no signatures, we should still populate the plugin path
-                plugin_path.push("nushell");
-                plugin_path.push("plugin.nu");
-                Value::string(plugin_path.to_string_lossy(), span)
-            } else {
-                Value::error(
-                    ShellError::IOError {
-                        msg: "Could not get plugin signature location".into(),
-                    },
-                    span,
-                )
-            },
+            Value::string(
+                canonicalize_path(engine_state, plugin_path).to_string_lossy(),
+                span,
+            ),
         );
     }
 
+    let home_dir = &engine_state.config_dirs.home_dir;
     record.push(
-        "home-path",
-        if let Some(path) = nu_path::home_dir() {
-            let canon_home_path = canonicalize_path(engine_state, &path);
-            Value::string(canon_home_path.to_string_lossy(), span)
-        } else {
+        "home-dir",
+        if home_dir.as_os_str().is_empty() {
             Value::error(
-                ShellError::IOError {
-                    msg: "Could not get home path".into(),
-                },
+                ShellError::Generic(GenericError::new(
+                    "setting $nu.home-dir failed",
+                    "Could not get home directory",
+                    span,
+                )),
+                span,
+            )
+        } else {
+            Value::string(
+                canonicalize_path(engine_state, home_dir).to_string_lossy(),
                 span,
             )
         },
     );
 
-    record.push("temp-path", {
+    record.push(
+        "data-dir",
+        Value::string(
+            canonicalize_path(engine_state, &engine_state.config_dirs.data_home).to_string_lossy(),
+            span,
+        ),
+    );
+
+    record.push(
+        "cache-dir",
+        Value::string(
+            canonicalize_path(engine_state, &engine_state.config_dirs.cache_home).to_string_lossy(),
+            span,
+        ),
+    );
+
+    record.push(
+        "vendor-autoload-dirs",
+        Value::list(
+            engine_state
+                .config_dirs
+                .vendor_autoload_dirs
+                .iter()
+                .map(|path| Value::string(path.to_string_lossy(), span))
+                .collect(),
+            span,
+        ),
+    );
+
+    record.push(
+        "user-autoload-dirs",
+        Value::list(
+            engine_state
+                .config_dirs
+                .user_autoload_dirs
+                .iter()
+                .map(|path| Value::string(path.to_string_lossy(), span))
+                .collect(),
+            span,
+        ),
+    );
+
+    record.push("temp-dir", {
         let canon_temp_path = canonicalize_path(engine_state, &std::env::temp_dir());
         Value::string(canon_temp_path.to_string_lossy(), span)
     });
@@ -201,15 +225,21 @@ pub fn create_nu_constant(engine_state: &EngineState, span: Span) -> Result<Valu
             Value::string(current_exe.to_string_lossy(), span)
         } else {
             Value::error(
-                ShellError::IOError {
-                    msg: "Could not get current executable path".to_string(),
-                },
+                ShellError::Generic(GenericError::new(
+                    "setting $nu.current-exe failed",
+                    "Could not get current executable path",
+                    span,
+                )),
                 span,
             )
         },
     );
 
-    Ok(Value::record(record, span))
+    record.push("is-lsp", Value::bool(engine_state.is_lsp, span));
+    record.push("is-mcp", Value::bool(engine_state.is_mcp, span));
+    record.push("is-dap", Value::bool(engine_state.is_dap, span));
+
+    Value::record(record, span)
 }
 
 fn eval_const_call(
@@ -229,7 +259,145 @@ fn eval_const_call(
         return Err(ShellError::NotAConstHelp { span: call.head });
     }
 
-    decl.run_const(working_set, call, input)
+    // Keyword `if` needs AST branch structure; IR-shaped flat Values are not enough.
+    if decl.command_type() == CommandType::Keyword && decl.name() == "if" {
+        return eval_const_if(working_set, call, input);
+    }
+
+    // Keyword const: parse_const already set const_val; AST args include VarDecl (not a Value).
+    if decl.command_type() == CommandType::Keyword && decl.name() == "const" {
+        return Ok(PipelineData::empty());
+    }
+
+    let mut stack = Stack::new();
+    let ir_call = build_const_ir_call(working_set, call, &decl.signature(), &mut stack)?;
+    let result = decl.run_const(working_set, &mut stack, &(&ir_call).into(), input);
+    ir_call.leave(&mut stack);
+    result
+}
+
+/// Evaluate a single const-call argument expression to a [`Value`].
+///
+/// A positional declared as [`SyntaxShape::Block`](crate::SyntaxShape::Block) parses to
+/// [`Expr::Block`] and is materialized as a capture-free [`Closure`] so const commands can
+/// read its source text (e.g. `attr example`). Captures are not known during const
+/// evaluation (`block.captures` is filled at the end of parsing), so the closure must not be
+/// executed. Closures and row conditions are deliberately left to [`eval_constant`], which
+/// rejects them with `NotAConstant`; materializing them here would let e.g.
+/// `const c = (echo {|| $v })` parse and then fail at runtime with a missing capture.
+fn eval_const_call_arg(
+    working_set: &StateWorkingSet,
+    expr: &Expression,
+) -> Result<Value, ShellError> {
+    match &expr.expr {
+        Expr::Block(block_id) => Ok(Value::closure(
+            Closure {
+                block_id: *block_id,
+                captures: vec![],
+            },
+            expr.span,
+        )),
+        _ => eval_constant(working_set, expr),
+    }
+}
+
+fn build_const_ir_call(
+    working_set: &StateWorkingSet,
+    call: &Call,
+    signature: &crate::Signature,
+    stack: &mut Stack,
+) -> Result<ir::Call, ShellError> {
+    let mut builder = ir::Call::build(call.decl_id, call.head);
+
+    for arg in &call.arguments {
+        match arg {
+            ast::Argument::Positional(expr) | ast::Argument::Unknown(expr) => {
+                let val = eval_const_call_arg(working_set, expr)?;
+                builder.add_positional(stack, expr.span, val);
+            }
+            ast::Argument::Spread(expr) => {
+                let val = eval_const_call_arg(working_set, expr)?;
+                builder.add_spread(stack, expr.span, val);
+            }
+            ast::Argument::Named((long, short, maybe_expr)) => {
+                let short_name = short.as_ref().map(|s| s.item.as_str()).unwrap_or("");
+                if let Some(expr) = maybe_expr {
+                    let val = eval_const_call_arg(working_set, expr)?;
+                    builder.add_named(stack, &long.item, short_name, arg.span(), val);
+                } else {
+                    builder.add_flag(stack, &long.item, short_name, arg.span());
+                }
+            }
+        }
+    }
+
+    for (name, expr) in &call.parser_info {
+        let data: std::sync::Arc<[u8]> = name.as_bytes().into();
+        let name_slice = ir::DataSlice {
+            start: 0,
+            len: name.len().try_into().expect("parser info name too big"),
+        };
+        builder.add_argument(
+            stack,
+            Argument::ParserInfo {
+                data,
+                name: name_slice,
+                info: Box::new(expr.clone()),
+            },
+        );
+    }
+
+    let mut ir_call = builder.finish();
+    // Match runtime IR: expand record flag spreads and omit null named args that
+    // do not accept `nothing`.
+    let raw: Vec<Argument> = stack
+        .arguments
+        .drain_args(ir_call.args_base, ir_call.args_len)
+        .collect();
+    let expanded = normalize_engine_arguments(signature, raw)?;
+    ir_call.args_len = expanded.len();
+    for arg in expanded {
+        stack.arguments.push(arg);
+    }
+
+    Ok(ir_call)
+}
+
+/// Const evaluation of `if` using AST structure (not IR-shaped call args).
+fn eval_const_if(
+    working_set: &StateWorkingSet,
+    call: &Call,
+    input: PipelineData,
+) -> Result<PipelineData, ShellError> {
+    let mut iter = call.positional_iter();
+    let cond = iter.next().expect("checked through parser");
+    let then_expr = iter.next().expect("checked through parser");
+    let else_case = iter.next();
+
+    let then_block = then_expr
+        .as_block()
+        .ok_or_else(|| ShellError::TypeMismatch {
+            err_message: "expected block".into(),
+            span: then_expr.span,
+        })?;
+
+    if eval_constant(working_set, cond)?.as_bool()? {
+        let block = working_set.get_block(then_block);
+        eval_const_subexpression(working_set, block, input, block.span.unwrap_or(call.head))
+    } else if let Some(else_case) = else_case {
+        if let Some(else_expr) = else_case.as_keyword() {
+            if let Some(block_id) = else_expr.as_block() {
+                let block = working_set.get_block(block_id);
+                eval_const_subexpression(working_set, block, input, block.span.unwrap_or(call.head))
+            } else {
+                eval_constant_with_input(working_set, else_expr, input)
+            }
+        } else {
+            eval_constant_with_input(working_set, else_case, input)
+        }
+    } else {
+        Ok(PipelineData::empty())
+    }
 }
 
 pub fn eval_const_subexpression(
@@ -240,11 +408,11 @@ pub fn eval_const_subexpression(
 ) -> Result<PipelineData, ShellError> {
     for pipeline in block.pipelines.iter() {
         for element in pipeline.elements.iter() {
-            let PipelineElement::Expression(_, expr) = element else {
+            if element.redirection.is_some() {
                 return Err(ShellError::NotAConstant { span });
-            };
+            }
 
-            input = eval_constant_with_input(working_set, expr, input)?
+            input = eval_constant_with_input(working_set, &element.expr, input)?
         }
     }
 
@@ -260,9 +428,9 @@ pub fn eval_constant_with_input(
         Expr::Call(call) => eval_const_call(working_set, call, input),
         Expr::Subexpression(block_id) => {
             let block = working_set.get_block(*block_id);
-            eval_const_subexpression(working_set, block, input, expr.span)
+            eval_const_subexpression(working_set, block, input, expr.span(&working_set))
         }
-        _ => eval_constant(working_set, expr).map(|v| PipelineData::Value(v, None)),
+        _ => eval_constant(working_set, expr).map(|v| PipelineData::value(v, None)),
     }
 }
 
@@ -271,7 +439,8 @@ pub fn eval_constant(
     working_set: &StateWorkingSet,
     expr: &Expression,
 ) -> Result<Value, ShellError> {
-    <EvalConst as Eval>::eval(working_set, &mut (), expr)
+    // TODO: Allow debugging const eval
+    <EvalConst as Eval>::eval::<WithoutDebug>(working_set, &mut (), expr)
 }
 
 struct EvalConst;
@@ -281,28 +450,8 @@ impl Eval for EvalConst {
 
     type MutState = ();
 
-    fn get_config<'a>(state: Self::State<'a>, _: &mut ()) -> Cow<'a, Config> {
-        Cow::Borrowed(state.get_config())
-    }
-
-    fn eval_filepath(
-        _: &StateWorkingSet,
-        _: &mut (),
-        path: String,
-        _: bool,
-        span: Span,
-    ) -> Result<Value, ShellError> {
-        Ok(Value::string(path, span))
-    }
-
-    fn eval_directory(
-        _: &StateWorkingSet,
-        _: &mut (),
-        _: String,
-        _: bool,
-        span: Span,
-    ) -> Result<Value, ShellError> {
-        Err(ShellError::NotAConstant { span })
+    fn get_config(state: Self::State<'_>, _: &mut ()) -> Arc<Config> {
+        state.get_config().clone()
     }
 
     fn eval_var(
@@ -317,14 +466,15 @@ impl Eval for EvalConst {
         }
     }
 
-    fn eval_call(
+    fn eval_call<D: DebugContext>(
         working_set: &StateWorkingSet,
         _: &mut (),
         call: &Call,
         span: Span,
     ) -> Result<Value, ShellError> {
+        // TODO: Allow debugging const eval
         // TODO: eval.rs uses call.head for the span rather than expr.span
-        Ok(eval_const_call(working_set, call, PipelineData::empty())?.into_value(span))
+        eval_const_call(working_set, call, PipelineData::empty())?.into_value(span)
     }
 
     fn eval_external_call(
@@ -332,24 +482,38 @@ impl Eval for EvalConst {
         _: &mut (),
         _: &Expression,
         _: &[ExternalArgument],
-        _: bool,
         span: Span,
     ) -> Result<Value, ShellError> {
         // TODO: It may be more helpful to give not_a_const_command error
         Err(ShellError::NotAConstant { span })
     }
 
-    fn eval_subexpression(
+    fn eval_collect<D: DebugContext>(
+        _: &StateWorkingSet,
+        _: &mut (),
+        _var_id: VarId,
+        expr: &Expression,
+    ) -> Result<Value, ShellError> {
+        Err(ShellError::NotAConstant { span: expr.span })
+    }
+
+    fn eval_subexpression<D: DebugContext>(
         working_set: &StateWorkingSet,
         _: &mut (),
-        block_id: usize,
+        block_id: BlockId,
         span: Span,
     ) -> Result<Value, ShellError> {
+        // If parsing errors exist in the subexpression, don't bother to evaluate it.
+        if working_set
+            .parse_errors
+            .iter()
+            .any(|error| span.contains_span(error.span()))
+        {
+            return Err(ShellError::ParseErrorInConstant { span });
+        }
+        // TODO: Allow debugging const eval
         let block = working_set.get_block(block_id);
-        Ok(
-            eval_const_subexpression(working_set, block, PipelineData::empty(), span)?
-                .into_value(span),
-        )
+        eval_const_subexpression(working_set, block, PipelineData::empty(), span)?.into_value(span)
     }
 
     fn regex_match(
@@ -363,7 +527,7 @@ impl Eval for EvalConst {
         Err(ShellError::NotAConstant { span: expr_span })
     }
 
-    fn eval_assignment(
+    fn eval_assignment<D: DebugContext>(
         _: &StateWorkingSet,
         _: &mut (),
         _: &Expression,
@@ -372,13 +536,14 @@ impl Eval for EvalConst {
         _op_span: Span,
         expr_span: Span,
     ) -> Result<Value, ShellError> {
+        // TODO: Allow debugging const eval
         Err(ShellError::NotAConstant { span: expr_span })
     }
 
     fn eval_row_condition_or_closure(
         _: &StateWorkingSet,
         _: &mut (),
-        _: usize,
+        _: BlockId,
         span: Span,
     ) -> Result<Value, ShellError> {
         Err(ShellError::NotAConstant { span })
@@ -388,7 +553,9 @@ impl Eval for EvalConst {
         Err(ShellError::NotAConstant { span })
     }
 
-    fn unreachable(expr: &Expression) -> Result<Value, ShellError> {
-        Err(ShellError::NotAConstant { span: expr.span })
+    fn unreachable(working_set: &StateWorkingSet, expr: &Expression) -> Result<Value, ShellError> {
+        Err(ShellError::NotAConstant {
+            span: expr.span(&working_set),
+        })
     }
 }

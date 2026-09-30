@@ -1,4 +1,4 @@
-use nu_protocol::{Flag, PositionalArg, Signature, SyntaxShape};
+use nu_protocol::{CompareTypes, Flag, PositionalArg, Signature, SyntaxShape, Type, TypeSet};
 
 #[test]
 fn test_signature() {
@@ -9,25 +9,30 @@ fn test_signature() {
     assert_eq!(signature, from_build);
 
     // constructing signature with description
-    let signature = Signature::new("signature").usage("example usage");
-    assert_eq!(signature.usage, "example usage".to_string())
+    let signature = Signature::new("signature").description("example description");
+    assert_eq!(signature.description, "example description".to_string())
 }
 
 #[test]
 fn test_signature_chained() {
     let signature = Signature::new("new_signature")
-        .usage("description")
-        .required("required", SyntaxShape::String, "required description")
-        .optional("optional", SyntaxShape::String, "optional description")
+        .description("description")
+        .required("required", SyntaxShape::String, "Required description.")
+        .optional("optional", SyntaxShape::String, "Optional description.")
         .required_named(
             "req-named",
             SyntaxShape::String,
-            "required named description",
+            "Required named description.",
             Some('r'),
         )
-        .named("named", SyntaxShape::String, "named description", Some('n'))
-        .switch("switch", "switch description", None)
-        .rest("rest", SyntaxShape::String, "rest description");
+        .named(
+            "named",
+            SyntaxShape::String,
+            "Named description.",
+            Some('n'),
+        )
+        .switch("switch", "Switch description.", None)
+        .rest("rest", SyntaxShape::String, "Rest description.");
 
     assert_eq!(signature.required_positional.len(), 1);
     assert_eq!(signature.optional_positional.len(), 1);
@@ -39,32 +44,35 @@ fn test_signature_chained() {
 
     assert_eq!(
         signature.get_positional(0),
-        Some(PositionalArg {
+        Some(&PositionalArg {
             name: "required".to_string(),
-            desc: "required description".to_string(),
+            desc: "Required description.".to_string(),
             shape: SyntaxShape::String,
             var_id: None,
             default_value: None,
+            completion: None,
         })
     );
     assert_eq!(
         signature.get_positional(1),
-        Some(PositionalArg {
+        Some(&PositionalArg {
             name: "optional".to_string(),
-            desc: "optional description".to_string(),
+            desc: "Optional description.".to_string(),
             shape: SyntaxShape::String,
             var_id: None,
             default_value: None,
+            completion: None,
         })
     );
     assert_eq!(
         signature.get_positional(2),
-        Some(PositionalArg {
+        Some(&PositionalArg {
             name: "rest".to_string(),
-            desc: "rest description".to_string(),
+            desc: "Rest description.".to_string(),
             shape: SyntaxShape::String,
             var_id: None,
             default_value: None,
+            completion: None,
         })
     );
 
@@ -75,9 +83,10 @@ fn test_signature_chained() {
             short: Some('r'),
             arg: Some(SyntaxShape::String),
             required: true,
-            desc: "required named description".to_string(),
+            desc: "Required named description.".to_string(),
             var_id: None,
             default_value: None,
+            completion: None,
         })
     );
 
@@ -88,9 +97,10 @@ fn test_signature_chained() {
             short: Some('r'),
             arg: Some(SyntaxShape::String),
             required: true,
-            desc: "required named description".to_string(),
+            desc: "Required named description.".to_string(),
             var_id: None,
             default_value: None,
+            completion: None,
         })
     );
 }
@@ -103,10 +113,15 @@ fn test_signature_same_short() {
         .required_named(
             "required-named",
             SyntaxShape::String,
-            "required named description",
+            "Required named description.",
             Some('n'),
         )
-        .named("named", SyntaxShape::String, "named description", Some('n'));
+        .named(
+            "named",
+            SyntaxShape::String,
+            "Named description.",
+            Some('n'),
+        );
 }
 
 #[test]
@@ -117,36 +132,41 @@ fn test_signature_same_name() {
         .required_named(
             "name",
             SyntaxShape::String,
-            "required named description",
+            "Required named description.",
             Some('r'),
         )
-        .named("name", SyntaxShape::String, "named description", Some('n'));
+        .named("name", SyntaxShape::String, "Named description.", Some('n'));
 }
 
 #[test]
 fn test_signature_round_trip() {
     let signature = Signature::new("new_signature")
-        .usage("description")
-        .required("first", SyntaxShape::String, "first required")
-        .required("second", SyntaxShape::Int, "second required")
-        .optional("optional", SyntaxShape::String, "optional description")
+        .description("description")
+        .required("first", SyntaxShape::String, "First required.")
+        .required("second", SyntaxShape::Int, "Second required.")
+        .optional("optional", SyntaxShape::String, "Optional description.")
         .required_named(
             "req-named",
             SyntaxShape::String,
-            "required named description",
+            "Required named description.",
             Some('r'),
         )
-        .named("named", SyntaxShape::String, "named description", Some('n'))
-        .switch("switch", "switch description", None)
-        .rest("rest", SyntaxShape::String, "rest description")
+        .named(
+            "named",
+            SyntaxShape::String,
+            "Named description.",
+            Some('n'),
+        )
+        .switch("switch", "Switch description.", None)
+        .rest("rest", SyntaxShape::String, "Rest description.")
         .category(nu_protocol::Category::Conversions);
 
     let string = serde_json::to_string_pretty(&signature).unwrap();
     let returned: Signature = serde_json::from_str(&string).unwrap();
 
     assert_eq!(signature.name, returned.name);
-    assert_eq!(signature.usage, returned.usage);
-    assert_eq!(signature.extra_usage, returned.extra_usage);
+    assert_eq!(signature.description, returned.description);
+    assert_eq!(signature.extra_description, returned.extra_description);
     assert_eq!(signature.is_filter, returned.is_filter);
     assert_eq!(signature.category, returned.category);
 
@@ -169,4 +189,94 @@ fn test_signature_round_trip() {
         .for_each(|(lhs, rhs)| assert_eq!(lhs, rhs));
 
     assert_eq!(signature.rest_positional, returned.rest_positional,);
+}
+
+fn into_string_like_signature() -> Signature {
+    Signature::new("into string").input_output_types(vec![
+        (Type::Int, Type::String),
+        (Type::custom("semver"), Type::String),
+        (
+            Type::List(Box::new(Type::Any)),
+            Type::List(Box::new(Type::String)),
+        ),
+        (Type::table(), Type::table()),
+        (Type::record(), Type::record()),
+    ])
+}
+
+#[test]
+fn get_output_type_custom_does_not_use_structured_fallback() {
+    let sig = into_string_like_signature();
+
+    assert_eq!(
+        sig.get_output_type(Some(&Type::custom("semver"))),
+        Some(Type::String)
+    );
+    assert_eq!(sig.get_output_type(Some(&Type::Int)), Some(Type::String));
+    assert_eq!(
+        sig.get_output_type(Some(&Type::record())),
+        Some(Type::record())
+    );
+}
+
+#[test]
+fn get_output_type_list_of_custom_uses_list_pair() {
+    let sig = into_string_like_signature();
+    let list_string = Type::list(Type::String);
+
+    let from_list_any = sig.get_output_type(Some(&Type::list(Type::Any))).unwrap();
+    assert!(from_list_any.is_assignable_to(&list_string));
+
+    let from_list_custom = sig
+        .get_output_type(Some(&Type::list(Type::custom("semver"))))
+        .unwrap();
+    assert!(from_list_custom.is_assignable_to(&list_string));
+}
+
+#[test]
+fn get_output_type_custom_unioned_with_nothing_is_still_string() {
+    let sig = into_string_like_signature();
+    let input = Type::custom("semver").union(Type::Nothing);
+
+    assert_eq!(sig.get_output_type(Some(&input)), Some(Type::String));
+}
+
+#[test]
+fn get_output_type_returns_none_when_no_pair_matches() {
+    let sig = Signature::new("only-int").input_output_types(vec![(Type::Int, Type::String)]);
+
+    assert_eq!(sig.get_output_type(Some(&Type::Bool)), None);
+}
+
+#[test]
+fn get_output_type_nothing_union_does_not_collapse_get_to_nothing() {
+    // `parse_internal_call` unions pipeline input with `nothing`. Ranking by
+    // compare_types made `get`'s `(nothing, nothing)` pair win over `(list, any)`,
+    // so `list | get $i | split chars` inferred error input.
+    let sig = Signature::new("get").input_output_types(vec![
+        (Type::list(Type::Any), Type::Any),
+        (Type::table(), Type::Any),
+        (Type::record(), Type::Any),
+        (Type::Nothing, Type::Nothing),
+    ]);
+    let input = Type::list(Type::String).union(Type::Nothing);
+    let output = sig.get_output_type(Some(&input)).unwrap();
+
+    assert_ne!(output, Type::Nothing);
+    assert!(output.is_assignable_to(&Type::Any) || matches!(output, Type::Any));
+}
+
+#[test]
+fn get_output_type_any_input_on_into_datetime_includes_datetime() {
+    let sig = Signature::new("into datetime").input_output_types(vec![
+        (Type::Date, Type::Date),
+        (Type::String, Type::Date),
+        (Type::table(), Type::table()),
+        (Type::record(), Type::record()),
+        (Type::Any, Type::table()),
+    ]);
+
+    let from_any = sig.get_output_type(Some(&Type::Any)).unwrap();
+    assert_ne!(from_any, Type::table());
+    assert!(from_any.is_assignable_to(&Type::Date));
 }

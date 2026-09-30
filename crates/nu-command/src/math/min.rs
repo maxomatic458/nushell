@@ -1,15 +1,13 @@
-use crate::math::reducers::{reducer_for, Reduce};
-use crate::math::utils::run_with_function;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, PipelineData, ShellError, Signature, Span, Type, Value,
+use crate::math::{
+    reducers::{Reduce, reducer_for},
+    utils::{run_with_function_with_cell_paths, run_with_function_with_cell_paths_const},
 };
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct MathMin;
 
-impl Command for SubCommand {
+impl Command for MathMin {
     fn name(&self) -> &str {
         "math min"
     }
@@ -22,14 +20,19 @@ impl Command for SubCommand {
                 (Type::List(Box::new(Type::Filesize)), Type::Filesize),
                 (Type::List(Box::new(Type::Any)), Type::Any),
                 (Type::Range, Type::Number),
-                (Type::Table(vec![]), Type::Record(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::record()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true)
+            .rest(
+                "columns",
+                SyntaxShape::CellPath,
+                "The cell-paths/columns to operate on.",
+            )
             .category(Category::Math)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Finds the minimum within a list of values or tables."
     }
 
@@ -37,25 +40,39 @@ impl Command for SubCommand {
         vec!["minimum", "smallest"]
     }
 
+    fn is_const(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
-        _engine_state: &EngineState,
-        _stack: &mut Stack,
+        engine_state: &EngineState,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        run_with_function(call, input, minimum)
+        run_with_function_with_cell_paths(engine_state, stack, call, input, minimum)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn run_const(
+        &self,
+        working_set: &StateWorkingSet,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        run_with_function_with_cell_paths_const(working_set, stack, call, input, minimum)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Compute the minimum of a list of numbers",
+                description: "Compute the minimum of a list of numbers.",
                 example: "[-50 100 25] | math min",
                 result: Some(Value::test_int(-50)),
             },
             Example {
-                description: "Compute the minima of the columns of a table",
+                description: "Compute the minima of the columns of a table.",
                 example: "[{a: 1 b: 3} {a: 2 b: -1}] | math min",
                 result: Some(Value::test_record(record! {
                     "a" => Value::test_int(1),
@@ -63,9 +80,28 @@ impl Command for SubCommand {
                 })),
             },
             Example {
-                description: "Find the minimum of a list of arbitrary values (Warning: Weird)",
+                description: "Find the minimum of a list of arbitrary values (Warning: Weird).",
                 example: "[-50 'hello' true] | math min",
                 result: Some(Value::test_bool(true)),
+            },
+            Example {
+                description: "Compute the minimum of list-valued columns in a record.",
+                example: "{alice: [5 3 9], bob: [2 7]} | math min",
+                result: Some(Value::test_record(record! {
+                    "alice" => Value::test_int(3),
+                    "bob" => Value::test_int(2),
+                })),
+            },
+            Example {
+                description: "Compute the minimum of a single column using a cell path.",
+                example: "{alice: [5 3 9], bob: [2 7]} | math min alice",
+                result: Some(Value::test_record(record! {
+                    "alice" => Value::test_int(3),
+                    "bob" => Value::list(
+                        vec![Value::test_int(2), Value::test_int(7)],
+                        Span::test_data(),
+                    ),
+                })),
             },
         ]
     }
@@ -81,9 +117,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(MathMin)
     }
 }

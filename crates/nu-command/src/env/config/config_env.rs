@@ -1,12 +1,5 @@
-use nu_engine::{env_to_strings, CallExt};
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    Category, Example, IntoPipelineData, PipelineData, ShellError, Signature, Type, Value,
-};
-
-use super::utils::gen_command;
-use nu_cmd_base::util::get_editor;
+use nu_config::ConfigFileKind;
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
 pub struct ConfigEnv;
@@ -20,29 +13,38 @@ impl Command for ConfigEnv {
         Signature::build(self.name())
             .category(Category::Env)
             .input_output_types(vec![(Type::Nothing, Type::Any)])
-            .switch("default", "Print default `env.nu` file instead.", Some('d'))
+            .switch(
+                "default",
+                "Print the internal default `env.nu` file instead.",
+                Some('d'),
+            )
+            .switch(
+                "doc",
+                "Print a commented `env.nu` with documentation instead.",
+                Some('s'),
+            )
         // TODO: Signature narrower than what run actually supports theoretically
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Edit nu environment configurations."
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "allow user to open and update nu env",
+                description: "Open user's env.nu in the default editor.",
                 example: "config env",
                 result: None,
             },
             Example {
-                description: "allow user to print default `env.nu` file",
-                example: "config env --default,",
+                description: "Pretty-print a commented `env.nu` that explains common settings.",
+                example: "config env --doc | nu-highlight,",
                 result: None,
             },
             Example {
-                description: "allow saving the default `env.nu` locally",
-                example: "config env --default | save -f ~/.config/nushell/default_env.nu",
+                description: "Pretty-print the internal `env.nu` file which is loaded before the user's environment.",
+                example: "config env --default | nu-highlight,",
                 result: None,
             },
         ]
@@ -53,35 +55,8 @@ impl Command for ConfigEnv {
         engine_state: &EngineState,
         stack: &mut Stack,
         call: &Call,
-        input: PipelineData,
+        _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        // `--default` flag handling
-        if call.has_flag(engine_state, stack, "default")? {
-            let head = call.head;
-            return Ok(Value::string(nu_utils::get_default_env(), head).into_pipeline_data());
-        }
-
-        let env_vars_str = env_to_strings(engine_state, stack)?;
-        let nu_config = match engine_state.get_config_path("env-path") {
-            Some(path) => path.clone(),
-            None => {
-                return Err(ShellError::GenericError {
-                    error: "Could not find $nu.env-path".into(),
-                    msg: "Could not find $nu.env-path".into(),
-                    span: None,
-                    help: None,
-                    inner: vec![],
-                });
-            }
-        };
-
-        let (item, config_args) = get_editor(engine_state, stack, call.head)?;
-
-        gen_command(call.head, nu_config, item, config_args, env_vars_str).run_with_input(
-            engine_state,
-            stack,
-            input,
-            true,
-        )
+        super::config_::handle_call(ConfigFileKind::Env, engine_state, stack, call)
     }
 }

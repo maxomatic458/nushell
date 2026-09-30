@@ -1,108 +1,206 @@
+#![doc = include_str!("../README.md")]
+use log::trace;
+use nu_parser::parse;
+use nu_protocol::{
+    VirtualPathId,
+    engine::{FileStack, StateWorkingSet, VirtualPath},
+    report_parse_error,
+};
 use std::path::PathBuf;
 
-use nu_engine::{env::current_dir, eval_block};
-use nu_parser::parse;
-use nu_protocol::engine::{Stack, StateWorkingSet, VirtualPath};
-use nu_protocol::{report_error, PipelineData};
+fn create_virt_file(working_set: &mut StateWorkingSet, name: &str, content: &str) -> VirtualPathId {
+    let sanitized_name = PathBuf::from(name).to_string_lossy().to_string();
+    let file_id = working_set.add_file(&sanitized_name, content.as_bytes());
 
-// Virtual std directory unlikely to appear in user's file system
-const NU_STDLIB_VIRTUAL_DIR: &str = "NU_STDLIB_VIRTUAL_DIR";
+    working_set.add_virtual_path(sanitized_name, VirtualPath::File(file_id))
+}
 
 pub fn load_standard_library(
     engine_state: &mut nu_protocol::engine::EngineState,
 ) -> Result<(), miette::ErrReport> {
-    let (block, delta) = {
-        // Using full virtual path to avoid potential conflicts with user having 'std' directory
-        // in their working directory.
-        let std_dir = PathBuf::from(NU_STDLIB_VIRTUAL_DIR).join("std");
+    trace!("load_standard_library");
 
-        let mut std_files = vec![
-            ("mod.nu", include_str!("../std/mod.nu")),
-            ("dirs.nu", include_str!("../std/dirs.nu")),
-            ("dt.nu", include_str!("../std/dt.nu")),
-            ("help.nu", include_str!("../std/help.nu")),
-            ("iter.nu", include_str!("../std/iter.nu")),
-            ("log.nu", include_str!("../std/log.nu")),
-            ("assert.nu", include_str!("../std/assert.nu")),
-            ("xml.nu", include_str!("../std/xml.nu")),
-            ("input.nu", include_str!("../std/input.nu")),
-            ("math.nu", include_str!("../std/math.nu")),
-            ("formats.nu", include_str!("../std/formats.nu")),
-        ];
+    let mut working_set = StateWorkingSet::new(engine_state);
 
-        let mut working_set = StateWorkingSet::new(engine_state);
-        let mut std_virt_paths = vec![];
+    // Contents of the std virtual directory
+    let mut std_virt_paths = vec![];
 
-        for (name, content) in std_files.drain(..) {
-            let name = std_dir.join(name);
+    // std/mod.nu
+    let std_mod_virt_file_id = create_virt_file(
+        &mut working_set,
+        "std/mod.nu",
+        include_str!("../std/mod.nu"),
+    );
+    std_virt_paths.push(std_mod_virt_file_id);
 
-            let file_id =
-                working_set.add_file(name.to_string_lossy().to_string(), content.as_bytes());
-            let virtual_file_id = working_set.add_virtual_path(
-                name.to_string_lossy().to_string(),
-                VirtualPath::File(file_id),
-            );
-            std_virt_paths.push(virtual_file_id);
-        }
+    // Submodules/subdirectories ... std/<module>/mod.nu
+    let mut std_submodules = vec![
+        // Loaded at startup - Not technically part of std
+        (
+            "mod.nu",
+            "std/prelude",
+            include_str!("../std/prelude/mod.nu"),
+        ),
+        // std submodules
+        ("mod.nu", "std/assert", include_str!("../std/assert/mod.nu")),
+        ("mod.nu", "std/bench", include_str!("../std/bench/mod.nu")),
+        ("mod.nu", "std/dirs", include_str!("../std/dirs/mod.nu")),
+        ("mod.nu", "std/dt", include_str!("../std/dt/mod.nu")),
+        (
+            "mod.nu",
+            "std/formats",
+            include_str!("../std/formats/mod.nu"),
+        ),
+        ("mod.nu", "std/help", include_str!("../std/help/mod.nu")),
+        ("mod.nu", "std/input", include_str!("../std/input/mod.nu")),
+        ("mod.nu", "std/iter", include_str!("../std/iter/mod.nu")),
+        ("mod.nu", "std/log", include_str!("../std/log/mod.nu")),
+        ("mod.nu", "std/math", include_str!("../std/math/mod.nu")),
+        ("mod.nu", "std/util", include_str!("../std/util/mod.nu")),
+        ("mod.nu", "std/xml", include_str!("../std/xml/mod.nu")),
+        ("mod.nu", "std/config", include_str!("../std/config/mod.nu")),
+        (
+            "mod.nu",
+            "std/testing",
+            include_str!("../std/testing/mod.nu"),
+        ),
+        ("mod.nu", "std/clip", include_str!("../std/clip/mod.nu")),
+        ("mod.nu", "std/random", include_str!("../std/random/mod.nu")),
+    ];
 
-        let std_dir = std_dir.to_string_lossy().to_string();
-        let source = format!(
-            r#"
-# Define the `std` module
-module {std_dir}
+    for (filename, std_subdir_name, content) in std_submodules.drain(..) {
+        let mod_dir = PathBuf::from(std_subdir_name);
+        let name = mod_dir.join(filename);
+        let virt_file_id = create_virt_file(&mut working_set, &name.to_string_lossy(), content);
 
-# Prelude
-use std dirs [
-    enter
-    shells
-    g
-    n
-    p
-    dexit
-]
-use std pwd
-"#
+        // Place file in virtual subdir
+        let mod_dir_filelist = vec![virt_file_id];
+
+        let virt_dir_id = working_set.add_virtual_path(
+            mod_dir.to_string_lossy().to_string(),
+            VirtualPath::Dir(mod_dir_filelist),
         );
+        // Add the subdir to the list of paths in std
+        std_virt_paths.push(virt_dir_id);
+    }
 
-        let _ = working_set.add_virtual_path(std_dir, VirtualPath::Dir(std_virt_paths));
+    // Create std virtual dir with all subdirs and files
+    let std_dir = PathBuf::from("std").to_string_lossy().to_string();
+    let _ = working_set.add_virtual_path(std_dir, VirtualPath::Dir(std_virt_paths));
 
-        // Change the currently parsed directory
-        let prev_currently_parsed_cwd = working_set.currently_parsed_cwd.clone();
-        working_set.currently_parsed_cwd = Some(PathBuf::from(NU_STDLIB_VIRTUAL_DIR));
+    // Add std-rfc files
+    let mut std_rfc_virt_paths = vec![];
+
+    // std-rfc/mod.nu
+    let std_rfc_mod_virt_file_id = create_virt_file(
+        &mut working_set,
+        "std-rfc/mod.nu",
+        include_str!("../std-rfc/mod.nu"),
+    );
+    std_rfc_virt_paths.push(std_rfc_mod_virt_file_id);
+
+    // Submodules/subdirectories ... std-rfc/<module>/mod.nu
+    let mut std_rfc_submodules = vec![
+        (
+            "mod.nu",
+            "std-rfc/conversions",
+            include_str!("../std-rfc/conversions/mod.nu"),
+        ),
+        (
+            "mod.nu",
+            "std-rfc/date",
+            include_str!("../std-rfc/date/mod.nu"),
+        ),
+        #[cfg(feature = "sqlite")]
+        ("mod.nu", "std-rfc/kv", include_str!("../std-rfc/kv/mod.nu")),
+        (
+            "mod.nu",
+            "std-rfc/path",
+            include_str!("../std-rfc/path/mod.nu"),
+        ),
+        (
+            "mod.nu",
+            "std-rfc/str",
+            include_str!("../std-rfc/str/mod.nu"),
+        ),
+        (
+            "mod.nu",
+            "std-rfc/tables",
+            include_str!("../std-rfc/tables/mod.nu"),
+        ),
+        (
+            "mod.nu",
+            "std-rfc/iter",
+            include_str!("../std-rfc/iter/mod.nu"),
+        ),
+        (
+            "mod.nu",
+            "std-rfc/random",
+            include_str!("../std-rfc/random/mod.nu"),
+        ),
+        (
+            "mod.nu",
+            "std-rfc/xml",
+            include_str!("../std-rfc/xml/mod.nu"),
+        ),
+        ("mod.nu", "std-rfc/pb", include_str!("../std-rfc/pb/mod.nu")),
+        (
+            "mod.nu",
+            "std-rfc/url",
+            include_str!("../std-rfc/url/mod.nu"),
+        ),
+    ];
+
+    for (filename, std_rfc_subdir_name, content) in std_rfc_submodules.drain(..) {
+        let mod_dir = PathBuf::from(std_rfc_subdir_name);
+        let name = mod_dir.join(filename);
+        let virt_file_id = create_virt_file(&mut working_set, &name.to_string_lossy(), content);
+
+        // Place file in virtual subdir
+        let mod_dir_filelist = vec![virt_file_id];
+
+        let virt_dir_id = working_set.add_virtual_path(
+            mod_dir.to_string_lossy().to_string(),
+            VirtualPath::Dir(mod_dir_filelist),
+        );
+        // Add the subdir to the list of paths in std
+        std_rfc_virt_paths.push(virt_dir_id);
+    }
+
+    // Create std virtual dir with all subdirs and files
+    let std_rfc_dir = PathBuf::from("std-rfc").to_string_lossy().to_string();
+    let _ = working_set.add_virtual_path(std_rfc_dir, VirtualPath::Dir(std_rfc_virt_paths));
+
+    // Load prelude
+    let (_, delta) = {
+        let source = "
+# Prelude
+use std/prelude *
+";
+
+        // Add a placeholder file to the stack of files being evaluated.
+        // The name of this file doesn't matter; it's only there to set the current working directory to NU_STDLIB_VIRTUAL_DIR.
+        let placeholder = PathBuf::from("load std/prelude");
+        working_set.files = FileStack::with_file(placeholder);
 
         let block = parse(
             &mut working_set,
-            Some("loading stdlib"),
+            Some("loading stdlib prelude"),
             source.as_bytes(),
             false,
         );
 
-        if let Some(err) = working_set.parse_errors.first() {
-            report_error(&working_set, err);
-        }
+        // Remove the placeholder file from the stack of files being evaluated.
+        working_set.files.pop();
 
-        // Restore the currently parsed directory back
-        working_set.currently_parsed_cwd = prev_currently_parsed_cwd;
+        if let Some(err) = working_set.parse_errors.first() {
+            report_parse_error(None, &working_set, err);
+        }
 
         (block, working_set.render())
     };
 
     engine_state.merge_delta(delta)?;
-
-    // We need to evaluate the module in order to run the `export-env` blocks.
-    let mut stack = Stack::new();
-    let pipeline_data = PipelineData::Empty;
-    eval_block(
-        engine_state,
-        &mut stack,
-        &block,
-        pipeline_data,
-        false,
-        false,
-    )?;
-
-    let cwd = current_dir(engine_state, &stack)?;
-    engine_state.merge_env(&mut stack, cwd)?;
 
     Ok(())
 }

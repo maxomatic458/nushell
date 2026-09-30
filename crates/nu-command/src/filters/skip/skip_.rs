@@ -1,12 +1,6 @@
-use std::convert::TryInto;
-
-use nu_engine::CallExt;
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    record, Category, Example, IntoInterruptiblePipelineData, IntoPipelineData, PipelineData,
-    ShellError, Signature, SyntaxShape, Type, Value,
-};
+#[cfg(feature = "sqlite")]
+use crate::database::QueryPlan;
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
 pub struct Skip;
@@ -19,32 +13,37 @@ impl Command for Skip {
     fn signature(&self) -> Signature {
         Signature::build(self.name())
             .input_output_types(vec![
-                (Type::Table(vec![]), Type::Table(vec![])),
+                (Type::table(), Type::table()),
+                (Type::Binary, Type::Binary),
                 (
                     Type::List(Box::new(Type::Any)),
                     Type::List(Box::new(Type::Any)),
                 ),
             ])
-            .optional("n", SyntaxShape::Int, "The number of elements to skip.")
+            .optional(
+                "n",
+                SyntaxShape::OneOf(vec![SyntaxShape::Int, SyntaxShape::Filesize]),
+                "The number of elements to skip.",
+            )
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
-        "Skip the first several rows of the input. Counterpart of `drop`. Opposite of `first`."
+    fn description(&self) -> &str {
+        "Skip the first several rows of the input. Counterpart of `drop`. Opposite of `first`. For binary input, n can also be specified as a filesize."
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"To skip specific numbered rows, try `drop nth`. To skip specific named columns, try `reject`."#
+    fn extra_description(&self) -> &str {
+        "To skip specific numbered rows, try `drop nth`. To skip specific named columns, try `reject`."
     }
 
     fn search_terms(&self) -> Vec<&str> {
         vec!["ignore", "remove", "last", "slice", "tail"]
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Skip the first value of a list",
+                description: "Skip the first value of a list.",
                 example: "[2 4 6 8] | skip 1",
                 result: Some(Value::test_list(vec![
                     Value::test_int(4),
@@ -53,11 +52,21 @@ impl Command for Skip {
                 ])),
             },
             Example {
-                description: "Skip two rows of a table",
+                description: "Skip two rows of a table.",
                 example: "[[editions]; [2015] [2018] [2021]] | skip 2",
                 result: Some(Value::test_list(vec![Value::test_record(record! {
                     "editions" => Value::test_int(2021),
                 })])),
+            },
+            Example {
+                description: "Skip 2 bytes of a binary value.",
+                example: "0x[01 23 45 67] | skip 2",
+                result: Some(Value::test_binary(vec![0x45, 0x67])),
+            },
+            Example {
+                description: "Skip 2 bytes of a binary value, using a filesize argument.",
+                example: "0x[01 23 45 67] | skip 2b",
+                result: Some(Value::test_binary(vec![0x45, 0x67])),
             },
         ]
     }
@@ -68,79 +77,101 @@ impl Command for Skip {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let n: Option<Value> = call.opt(engine_state, stack, 0)?;
-        let metadata = input.metadata();
+        let n_val: Option<Value> = call.opt(engine_state, stack, 0)?;
+        let is_filesize = n_val
+            .as_ref()
+            .is_some_and(|v| matches!(v, Value::Filesize { .. }));
 
-        let n: usize = match n {
-            Some(v) => {
-                let span = v.span();
-                match v {
-                    Value::Int { val, .. } => {
-                        val.try_into().map_err(|err| ShellError::TypeMismatch {
-                            err_message: format!("Could not convert {val} to unsigned int: {err}"),
-                            span,
-                        })?
-                    }
-                    _ => {
-                        return Err(ShellError::TypeMismatch {
-                            err_message: "expected int".into(),
-                            span,
-                        })
+        let n: usize =
+            match n_val {
+                Some(v) => {
+                    let span = v.span();
+                    match v {
+                        Value::Int { val, .. } => usize::try_from(val)
+                            .map_err(|_| ShellError::NeedsPositiveValue { span })?,
+                        Value::Filesize { val, .. } => usize::try_from(val)
+                            .map_err(|_| ShellError::NeedsPositiveValue { span })?,
+                        ref val => {
+                            return Err(ShellError::RuntimeTypeMismatch {
+                                expected: Type::custom("int or filesize"),
+                                actual: val.get_type(),
+                                span: val.span(),
+                            });
+                        }
                     }
                 }
+                None => 1,
+            };
+
+        if is_filesize {
+            let is_binary = matches!(
+                &input,
+                PipelineData::Value(Value::Binary { .. }, _) | PipelineData::ByteStream(..)
+            );
+            if !is_binary {
+                return Err(ShellError::IncompatibleParametersSingle {
+                    msg: "Filesize is only supported for binary/byte stream input".into(),
+                    span: input.span().unwrap_or(call.head),
+                });
             }
-            None => 1,
-        };
+        }
 
-        let ctrlc = engine_state.ctrlc.clone();
         let input_span = input.span().unwrap_or(call.head);
+
+        #[cfg(feature = "sqlite")]
+        if let PipelineData::Value(Value::Custom { val, .. }, metadata) = &input
+            && let Some(plan) = QueryPlan::try_from_any(val.as_any())
+        {
+            let plan = plan.with_offset(n as i64);
+            return plan
+                .execute(call.head)
+                .map(|data| data.set_metadata(metadata.clone()));
+        }
+
         match input {
-            PipelineData::ExternalStream {
-                stdout: Some(stream),
-                span: bytes_span,
-                metadata,
-                ..
-            } => {
-                let mut remaining = n;
-                let mut output = vec![];
-
-                for frame in stream {
-                    let frame = frame?;
-
-                    match frame {
-                        Value::String { val, .. } => {
-                            let bytes = val.as_bytes();
-                            if bytes.len() < remaining {
-                                remaining -= bytes.len();
-                                //output.extend_from_slice(bytes)
-                            } else {
-                                output.extend_from_slice(&bytes[remaining..]);
-                                break;
-                            }
-                        }
-                        Value::Binary { val: bytes, .. } => {
-                            if bytes.len() < remaining {
-                                remaining -= bytes.len();
-                            } else {
-                                output.extend_from_slice(&bytes[remaining..]);
-                                break;
-                            }
-                        }
-                        _ => unreachable!("Raw streams are either bytes or strings"),
-                    }
+            PipelineData::ByteStream(stream, metadata) => {
+                if stream.type_().is_binary_coercible() {
+                    let span = stream.span();
+                    Ok(PipelineData::byte_stream(
+                        stream.skip(span, n as u64)?,
+                        // if we've skipped over n (greater than 0) amount of binary data and we're
+                        // looking at y bytes, the data is really no longer a png image, it's just
+                        // some raw bytes. so, in that case there's no need to still have a
+                        // metadata content_type of image/png.
+                        metadata.map(|m| if n > 0 { m.with_content_type(None) } else { m }),
+                    ))
+                } else {
+                    Err(ShellError::OnlySupportsThisInputType {
+                        exp_input_type: "list, binary or range".into(),
+                        wrong_type: stream.type_().describe().into(),
+                        dst_span: call.head,
+                        src_span: stream.span(),
+                    })
                 }
-
-                Ok(Value::binary(output, bytes_span).into_pipeline_data_with_metadata(metadata))
             }
             PipelineData::Value(Value::Binary { val, .. }, metadata) => {
-                let bytes = val.into_iter().skip(n).collect::<Vec<_>>();
-
+                let bytes = match val.try_into_owned() {
+                    Ok(bytes) => bytes.into_iter().skip(n).collect(),
+                    Err(val) => val.as_slice().get(n..).unwrap_or_default().to_vec(),
+                };
+                // if we've skipped over n (greater than 0) amount of binary data and we're
+                // looking at y bytes, the data is really no longer a png image, it's just
+                // some raw bytes. so, in that case there's no need to still have a
+                // metadata content_type of image/png.
+                let metadata = metadata.map(|m| if n > 0 { m.with_content_type(None) } else { m });
                 Ok(Value::binary(bytes, input_span).into_pipeline_data_with_metadata(metadata))
             }
-            _ => Ok(input
-                .into_iter_strict(call.head)?
-                .skip(n)
-                .into_pipeline_data_with_metadata(metadata, ctrlc)),
+            mut input => {
+                let metadata = input.take_metadata();
+                Ok(input
+                    .into_iter_strict(call.head)?
+                    .skip(n)
+                    .into_pipeline_data_with_metadata(
+                        input_span,
+                        engine_state.signals().clone(),
+                        metadata,
+                    ))
+            }
         }
     }
 }
@@ -150,9 +181,7 @@ mod tests {
     use crate::Skip;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Skip {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Skip)
     }
 }

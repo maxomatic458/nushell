@@ -1,17 +1,12 @@
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, PipelineData, Range, ShellError, Signature, Span, Spanned, SyntaxShape,
-    Type, Value,
-};
-use rand::prelude::{thread_rng, Rng};
-use std::cmp::Ordering;
+use nu_engine::command_prelude::*;
+use nu_protocol::{FloatRange, Range};
+use rand::random_range;
+use std::ops::Bound;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct RandomFloat;
 
-impl Command for SubCommand {
+impl Command for RandomFloat {
     fn name(&self) -> &str {
         "random float"
     }
@@ -24,7 +19,7 @@ impl Command for SubCommand {
             .category(Category::Random)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Generate a random float within a range [min..max]."
     }
 
@@ -42,25 +37,25 @@ impl Command for SubCommand {
         float(engine_state, stack, call)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Generate a default float value between 0 and 1",
+                description: "Generate a default float value between 0 and 1.",
                 example: "random float",
                 result: None,
             },
             Example {
-                description: "Generate a random float less than or equal to 500",
+                description: "Generate a random float less than or equal to 500.",
                 example: "random float ..500",
                 result: None,
             },
             Example {
-                description: "Generate a random float greater than or equal to 100000",
+                description: "Generate a random float greater than or equal to 100000.",
                 example: "random float 100000..",
                 result: None,
             },
             Example {
-                description: "Generate a random float between 1.0 and 1.1",
+                description: "Generate a random float between 1.0 and 1.1.",
                 example: "random float 1.0..1.1",
                 result: None,
             },
@@ -73,43 +68,37 @@ fn float(
     stack: &mut Stack,
     call: &Call,
 ) -> Result<PipelineData, ShellError> {
-    let mut range_span = call.head;
+    let span = call.head;
     let range: Option<Spanned<Range>> = call.opt(engine_state, stack, 0)?;
 
-    let (min, max) = if let Some(spanned_range) = range {
-        let r = spanned_range.item;
-        range_span = spanned_range.span;
+    match range {
+        Some(range) => {
+            let range_span = range.span;
+            let range = FloatRange::from(range.item);
 
-        if r.is_end_inclusive() {
-            (r.from.as_float()?, r.to.as_float()?)
-        } else if r.to.as_float()? >= 1.0 {
-            (r.from.as_float()?, r.to.as_float()? - 1.0)
-        } else {
-            (0.0, 0.0)
+            if range.step() < 0.0 {
+                return Err(ShellError::InvalidRange {
+                    left_flank: range.start().to_string(),
+                    right_flank: match range.end() {
+                        Bound::Included(end) | Bound::Excluded(end) => end.to_string(),
+                        Bound::Unbounded => "".into(),
+                    },
+                    span: range_span,
+                });
+            }
+
+            let value = match range.end() {
+                Bound::Included(end) => random_range(range.start()..=end),
+                Bound::Excluded(end) => random_range(range.start()..end),
+                Bound::Unbounded => random_range(range.start()..f64::MAX),
+            };
+
+            Ok(PipelineData::value(Value::float(value, span), None))
         }
-    } else {
-        (0.0, 1.0)
-    };
-
-    match min.partial_cmp(&max) {
-        Some(Ordering::Greater) => Err(ShellError::InvalidRange {
-            left_flank: min.to_string(),
-            right_flank: max.to_string(),
-            span: range_span,
-        }),
-        Some(Ordering::Equal) => Ok(PipelineData::Value(
-            Value::float(min, Span::new(64, 64)),
+        None => Ok(PipelineData::value(
+            Value::float(random_range(0.0..1.0), span),
             None,
         )),
-        _ => {
-            let mut thread_rng = thread_rng();
-            let result: f64 = thread_rng.gen_range(min..max);
-
-            Ok(PipelineData::Value(
-                Value::float(result, Span::new(64, 64)),
-                None,
-            ))
-        }
     }
 }
 
@@ -118,9 +107,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(RandomFloat)
     }
 }

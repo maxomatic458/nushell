@@ -1,13 +1,6 @@
-use crate::help::highlight_search_in_table;
-use nu_color_config::StyleComputer;
-use nu_engine::{get_full_help, CallExt};
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    record, span, Category, IntoInterruptiblePipelineData, IntoPipelineData, PipelineData,
-    ShellError, Signature, Span, Spanned, SyntaxShape, Type, Value,
-};
-use std::borrow::Borrow;
+use crate::filters::find_internal;
+use nu_engine::{command_prelude::*, get_full_help};
+use nu_protocol::DeclId;
 
 #[derive(Clone)]
 pub struct HelpCommands;
@@ -17,7 +10,7 @@ impl Command for HelpCommands {
         "help commands"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Show help on nushell commands."
     }
 
@@ -32,10 +25,10 @@ impl Command for HelpCommands {
             .named(
                 "find",
                 SyntaxShape::String,
-                "string to find in command names, usage, and search terms",
+                "String to find in command names, descriptions, and search terms.",
                 Some('f'),
             )
-            .input_output_types(vec![(Type::Nothing, Type::Table(vec![]))])
+            .input_output_types(vec![(Type::Nothing, Type::table())])
             .allow_variants_without_examples(true)
     }
 
@@ -59,36 +52,21 @@ pub fn help_commands(
     let find: Option<Spanned<String>> = call.get_flag(engine_state, stack, "find")?;
     let rest: Vec<Spanned<String>> = call.rest(engine_state, stack, 0)?;
 
-    // 🚩The following two-lines are copied from filters/find.rs:
-    let style_computer = StyleComputer::from_config(engine_state, stack);
-    // Currently, search results all use the same style.
-    // Also note that this sample string is passed into user-written code (the closure that may or may not be
-    // defined for "string").
-    let string_style = style_computer.compute("string", &Value::string("search result", head));
-    let highlight_style =
-        style_computer.compute("search_result", &Value::string("search result", head));
-
     if let Some(f) = find {
         let all_cmds_vec = build_help_commands(engine_state, head);
-        let found_cmds_vec = highlight_search_in_table(
+        return find_internal(
             all_cmds_vec,
+            engine_state,
+            stack,
             &f.item,
-            &["name", "usage", "search_terms"],
-            &string_style,
-            &highlight_style,
-        )?;
-
-        return Ok(found_cmds_vec
-            .into_iter()
-            .into_pipeline_data(engine_state.ctrlc.clone()));
+            &["name", "description", "search_terms"],
+            true,
+            head,
+        );
     }
 
     if rest.is_empty() {
-        let found_cmds_vec = build_help_commands(engine_state, head);
-
-        Ok(found_cmds_vec
-            .into_iter()
-            .into_pipeline_data(engine_state.ctrlc.clone()))
+        Ok(build_help_commands(engine_state, head))
     } else {
         let mut name = String::new();
 
@@ -99,41 +77,91 @@ pub fn help_commands(
             name.push_str(&r.item);
         }
 
-        let output = engine_state
-            .get_signatures_with_examples(false)
-            .iter()
-            .filter(|(signature, _, _, _, _)| signature.name == name)
-            .map(|(signature, examples, _, _, is_parser_keyword)| {
-                get_full_help(signature, examples, engine_state, stack, *is_parser_keyword)
-            })
-            .collect::<Vec<String>>();
+        // Try to find the command, resolving aliases if necessary
+        let decl_id = find_decl_with_alias_resolution(engine_state, name.as_bytes());
 
-        if !output.is_empty() {
-            Ok(
-                Value::string(output.join("======================\n\n"), call.head)
-                    .into_pipeline_data(),
-            )
+        if let Some(decl) = decl_id {
+            let cmd = engine_state.get_decl(decl);
+
+            // Get the canonical signature for this declaration so we can detect when the
+            // user asked for a module-qualified name (e.g. `clip prefix`) and adjust the
+            // Usage line in the generated help text accordingly.
+            let sig = engine_state.get_signature(cmd).update_from_command(cmd);
+
+            let mut help_text = get_full_help(cmd, engine_state, stack, head);
+
+            // If the requested name differs from the signature's base name (module-qualified
+            // request), replace the first occurrence of the usage call name so help shows
+            // the qualified form the user asked for.
+            if name != sig.name {
+                let search = format!("> {}", sig.name);
+                let replace = format!("> {}", name);
+                help_text = help_text.replacen(&search, &replace, 1);
+            }
+
+            Ok(Value::string(help_text, call.head).into_pipeline_data())
         } else {
             Err(ShellError::CommandNotFound {
-                span: span(&[rest[0].span, rest[rest.len() - 1].span]),
+                span: Span::merge_many(rest.iter().map(|s| s.span)),
             })
         }
     }
 }
 
-fn build_help_commands(engine_state: &EngineState, span: Span) -> Vec<Value> {
+fn find_decl_with_alias_resolution(engine_state: &EngineState, name: &[u8]) -> Option<DeclId> {
+    let name_str = String::from_utf8_lossy(name);
+    let parts: Vec<&str> = name_str.split_whitespace().collect();
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    if let Some(decl_id) = engine_state.find_decl(name, &[]) {
+        return Some(decl_id);
+    }
+
+    if let Some(first_decl_id) = engine_state.find_decl(parts[0].as_bytes(), &[]) {
+        let first_decl = engine_state.get_decl(first_decl_id);
+
+        // If it's an alias, try to resolve with remaining parts
+        if let Some(alias) = first_decl.as_alias()
+            && let nu_protocol::ast::Expression {
+                expr: nu_protocol::ast::Expr::Call(call),
+                ..
+            } = &alias.wrapped_call
+        {
+            let aliased_decl = engine_state.get_decl(call.decl_id);
+            let aliased_name = aliased_decl.name();
+
+            // If we have more parts, try to find "aliased_name + remaining parts"
+            if parts.len() > 1 {
+                let full_name = format!("{} {}", aliased_name, parts[1..].join(" "));
+                return find_decl_with_alias_resolution(engine_state, full_name.as_bytes());
+            } else {
+                // Just the alias, return the aliased command
+                return Some(call.decl_id);
+            }
+        }
+    }
+
+    None
+}
+
+fn build_help_commands(engine_state: &EngineState, span: Span) -> PipelineData {
     let commands = engine_state.get_decls_sorted(false);
     let mut found_cmds_vec = Vec::new();
 
-    for (_, decl_id) in commands {
+    for (decl_name_bytes, decl_id) in commands {
         let decl = engine_state.get_decl(decl_id);
-        let sig = decl.signature().update_from_command(decl.borrow());
+        let sig = decl.signature().update_from_command(decl);
 
-        let key = sig.name;
-        let usage = sig.usage;
+        // Use the overlay-visible name (decl_name_bytes) as the help `name` so module-qualified
+        // names (e.g. "clip prefix") are shown instead of the bare signature name.
+        let key = String::from_utf8_lossy(&decl_name_bytes).to_string();
+        let description = sig.description;
         let search_terms = sig.search_terms;
 
-        let command_type = format!("{:?}", decl.command_type()).to_ascii_lowercase();
+        let command_type = decl.command_type().to_string();
 
         // Build table of parameters
         let param_table = {
@@ -176,14 +204,11 @@ fn build_help_commands(engine_state: &EngineState, span: Span) -> Vec<Value> {
             }
 
             for named_param in &sig.named {
-                let name = if let Some(short) = named_param.short {
-                    if named_param.long.is_empty() {
-                        format!("-{}", short)
-                    } else {
-                        format!("--{}(-{})", named_param.long, short)
-                    }
-                } else {
-                    format!("--{}", named_param.long)
+                let name = match (named_param.long_name(), named_param.short) {
+                    (Some(long), Some(short)) => format!("--{long}(-{short})"),
+                    (Some(long), None) => format!("--{long}"),
+                    (None, Some(short)) => format!("-{short}"),
+                    (None, None) => format!("--{}", named_param.long),
                 };
 
                 let typ = if let Some(arg) = &named_param.arg {
@@ -227,24 +252,24 @@ fn build_help_commands(engine_state: &EngineState, span: Span) -> Vec<Value> {
             "name" => Value::string(key, span),
             "category" => Value::string(sig.category.to_string(), span),
             "command_type" => Value::string(command_type, span),
-            "usage" => Value::string(usage, span),
+            "description" => Value::string(description, span),
             "params" => param_table,
             "input_output" => input_output_table,
             "search_terms" => Value::string(search_terms.join(", "), span),
+            "is_const" => Value::bool(decl.is_const(), span),
         };
 
         found_cmds_vec.push(Value::record(record, span));
     }
 
-    found_cmds_vec
+    Value::list(found_cmds_vec, span).into_pipeline_data()
 }
 
 #[cfg(test)]
 mod test {
     #[test]
-    fn test_examples() {
+    fn test_examples() -> nu_test_support::Result {
         use super::HelpCommands;
-        use crate::test_examples;
-        test_examples(HelpCommands {})
+        nu_test_support::test().examples(HelpCommands)
     }
 }

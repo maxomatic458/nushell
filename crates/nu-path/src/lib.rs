@@ -1,10 +1,20 @@
+#![doc = include_str!("../README.md")]
+mod assert_path_eq;
+mod components;
 pub mod dots;
-mod expansions;
+pub mod expansions;
+pub mod form;
 mod helpers;
+mod path;
 mod tilde;
-mod util;
+mod trailing_slash;
 
-pub use expansions::{canonicalize_with, expand_path_with, expand_to_real_path};
-pub use helpers::{config_dir, home_dir};
+pub use components::components;
+pub use expansions::{
+    absolute_with, canonicalize_with, expand_path, expand_path_with, expand_to_real_path,
+    locate_in_dirs,
+};
+pub use helpers::{home_dir, is_windows_device_path};
+pub use path::*;
 pub use tilde::expand_tilde;
-pub use util::trim_trailing_slash;
+pub use trailing_slash::{has_trailing_slash, strip_trailing_slash};

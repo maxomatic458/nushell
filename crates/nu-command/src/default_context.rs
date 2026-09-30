@@ -1,9 +1,6 @@
+use crate::*;
 use nu_protocol::engine::{EngineState, StateWorkingSet};
 
-use crate::{
-    help::{HelpAliases, HelpCommands, HelpEscapes, HelpExterns, HelpModules, HelpOperators},
-    *,
-};
 pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
     let delta = {
         let mut working_set = StateWorkingSet::new(&engine_state);
@@ -30,18 +27,24 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
         }
 
         // Filters
+        #[cfg(feature = "rand")]
+        bind_command! {
+            Shuffle
+        }
         bind_command! {
             All,
             Any,
             Append,
+            Chunks,
             Columns,
+            Combinations,
             Compact,
             Default,
+            Difference,
             Drop,
             DropColumn,
             DropNth,
             Each,
-            Empty,
             Enumerate,
             Every,
             Filter,
@@ -49,15 +52,18 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             First,
             Flatten,
             Get,
-            Group,
             GroupBy,
             Headers,
             Insert,
+            IsEmpty,
+            IsNotEmpty,
+            Interleave,
+            Intersect,
             Items,
             Join,
-            SplitBy,
             Take,
             Merge,
+            MergeDeep,
             Move,
             TakeWhile,
             TakeUntil,
@@ -65,23 +71,27 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             Length,
             Lines,
             ParEach,
+            Peek,
+            Permutations,
+            ChunkBy,
             Prepend,
-            Range,
             Reduce,
             Reject,
             Rename,
             Reverse,
             Select,
-            Shuffle,
             Skip,
             SkipUntil,
             SkipWhile,
+            Slice,
             Sort,
             SortBy,
             SplitList,
+            Tee,
             Transpose,
             Uniq,
             UniqBy,
+            Union,
             Upsert,
             Update,
             Values,
@@ -93,6 +103,9 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
 
         // Misc
         bind_command! {
+            DeleteVar,
+            Panic,
+            Run,
             Source,
             Tutor,
         };
@@ -101,6 +114,7 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
         bind_command! {
             Path,
             PathBasename,
+            PathSelf,
             PathDirname,
             PathExists,
             PathExpand,
@@ -112,12 +126,23 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
         };
 
         // System
+        #[cfg(feature = "os")]
         bind_command! {
             Complete,
             External,
             Exec,
             NuCheck,
+            RunInternal,
             Sys,
+            SysCpu,
+            SysDisks,
+            SysHost,
+            SysMem,
+            SysNet,
+            SysTemp,
+            SysUsers,
+            UName,
+            Which,
         };
 
         // Help
@@ -128,6 +153,7 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             HelpCommands,
             HelpModules,
             HelpOperators,
+            HelpPipeAndRedirect,
             HelpEscapes,
         };
 
@@ -135,52 +161,74 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
         bind_command! {
             Ast,
             Debug,
+            DebugEnv,
+            DebugExperimentalOptions,
             DebugInfo,
+            DebugProfile,
             Explain,
             Inspect,
             Metadata,
+            MetadataAccess,
+            MetadataSet,
             TimeIt,
             View,
+            ViewBlocks,
             ViewFiles,
+            ViewIr,
             ViewSource,
             ViewSpan,
         };
 
-        #[cfg(windows)]
-        bind_command! { RegistryQuery }
+        #[cfg(all(feature = "os", windows))]
+        bind_command! { Registry, RegistryQuery }
 
-        #[cfg(any(
-            target_os = "android",
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "windows"
+        #[cfg(all(
+            feature = "os",
+            any(
+                target_os = "android",
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "macos",
+                target_os = "windows"
+            )
         ))]
         bind_command! { Ps };
 
-        #[cfg(feature = "which-support")]
-        bind_command! { Which };
-
         // Strings
         bind_command! {
+            Ansi,
+            AnsiLink,
+            AnsiStrip,
             Char,
             Decode,
             Encode,
+            DecodeHex,
+            EncodeHex,
+            DecodeBase32,
+            EncodeBase32,
+            DecodeBase32Hex,
+            EncodeBase32Hex,
             DecodeBase64,
             EncodeBase64,
+            Detect,
             DetectColumns,
+            DetectType,
             Parse,
             Split,
             SplitChars,
             SplitColumn,
             SplitRow,
             SplitWords,
-            StrEscapeGlob,
             Str,
             StrCapitalize,
             StrContains,
             StrDistance,
             StrDowncase,
+            StrLowercase,
             StrEndswith,
+            StrEscapeRegex,
             StrExpand,
             StrJoin,
             StrReplace,
@@ -192,6 +240,7 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             StrSubstring,
             StrTrim,
             StrUpcase,
+            StrUppercase,
             Format,
             FormatDate,
             FormatDuration,
@@ -199,52 +248,72 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
         };
 
         // FileSystem
+        #[cfg(feature = "os")]
         bind_command! {
             Cd,
             Ls,
-            Mkdir,
             UMkdir,
             Mktemp,
-            Mv,
             UMv,
             UCp,
             Open,
             Start,
             Rm,
             Save,
-            Touch,
+            UTouch,
             Glob,
             Watch,
+            Idx,
+            IdxInit,
+            IdxStatus,
+            IdxFind,
+            IdxSearch,
+            IdxWatch,
+            IdxDrop,
+            IdxDirs,
+            IdxFiles,
         };
 
         // Platform
+        #[cfg(all(feature = "os", not(target_arch = "wasm32")))]
+        if nu_experimental::NATIVE_CLIP.get() {
+            bind_command! {
+                ClipCommand,
+                ClipCopy,
+                ClipPaste,
+            };
+        }
+
+        #[cfg(feature = "os")]
         bind_command! {
-            Ansi,
-            AnsiLink,
-            AnsiStrip,
             Clear,
             Du,
             Input,
             InputList,
             InputListen,
+            IsRedirected,
             IsTerminal,
             Kill,
             Sleep,
+            Term,
             TermSize,
+            TermQuery,
             Whoami,
         };
 
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "os"))]
         bind_command! { ULimit };
+
+        #[cfg(all(unix, feature = "os"))]
+        bind_command! { UMask };
 
         // Date
         bind_command! {
             Date,
+            DateFromHuman,
             DateHumanize,
             DateListTimezones,
             DateNow,
-            DateToRecord,
-            DateToTable,
             DateToTimezone,
         };
 
@@ -258,6 +327,9 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             From,
             FromCsv,
             FromJson,
+            FromMd,
+            FromMsgpack,
+            FromMsgpackz,
             FromNuon,
             FromOds,
             FromSsv,
@@ -265,21 +337,26 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             FromTsv,
             FromXlsx,
             FromXml,
-            FromYaml,
-            FromYml,
+            FROM_YAML,
+            FROM_YML,
+            FromKdl,
             To,
             ToCsv,
             ToJson,
             ToMd,
+            ToMsgpack,
+            ToMsgpackz,
             ToNuon,
-            ToText,
+            TO_TEXT,
+            TO_TXT,
             ToToml,
             ToTsv,
-            Touch,
+            ToKdl,
             Upsert,
             Where,
             ToXml,
-            ToYaml,
+            TO_YAML,
+            TO_YML,
         };
 
         // Viewers
@@ -300,9 +377,43 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             IntoFloat,
             IntoFilesize,
             IntoInt,
+            IntoMatrix,
             IntoRecord,
+            IntoSemver,
+            IntoSemverRange,
             IntoString,
+            IntoGlob,
             IntoValue,
+            SplitCellPath,
+        };
+
+        // Semver
+        bind_command! {
+            Semver,
+            SemverBump,
+        };
+
+        // Matrix
+        bind_command! {
+            Matrix,
+            MatrixZeros,
+            MatrixIdentity,
+            MatrixGetRow,
+            MatrixGetCol,
+            MatrixSetRow,
+            MatrixSetCol,
+            MatrixAdd,
+            MatrixSubtract,
+            MatrixScale,
+            MatrixMultiply,
+            MatrixTranspose,
+            MatrixReshape,
+            MatrixMap,
+            MatrixReduce,
+            MatrixSum,
+            MatrixMean,
+            MatrixMax,
+            MatrixIntoNu,
         };
 
         // Env
@@ -313,8 +424,10 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             WithEnv,
             ConfigNu,
             ConfigEnv,
+            ConfigFlatten,
             ConfigMeta,
             ConfigReset,
+            ConfigUseColors,
         };
 
         // Math
@@ -322,6 +435,7 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             Math,
             MathAbs,
             MathAvg,
+            MathCbrt,
             MathCeil,
             MathFloor,
             MathMax,
@@ -341,6 +455,7 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
         bind_command! {
             Bytes,
             BytesLen,
+            BytesSplit,
             BytesStartsWith,
             BytesEndsWith,
             BytesReverse,
@@ -354,6 +469,7 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
         }
 
         // Network
+        #[cfg(feature = "network")]
         bind_command! {
             Http,
             HttpDelete,
@@ -363,24 +479,31 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             HttpPost,
             HttpPut,
             HttpOptions,
+            HttpPool,
+            Port,
+            VersionCheck,
+        }
+        bind_command! {
             Url,
             UrlBuildQuery,
+            UrlSplitQuery,
             UrlDecode,
             UrlEncode,
             UrlJoin,
             UrlParse,
-            Port,
         }
 
         // Random
+        #[cfg(feature = "rand")]
         bind_command! {
             Random,
             RandomBool,
             RandomChars,
-            RandomDice,
             RandomFloat,
             RandomInt,
+            RandomPass,
             RandomUuid,
+            RandomBinary
         };
 
         // Generators
@@ -397,12 +520,31 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             Hash,
             HashMd5::default(),
             HashSha256::default(),
+            HashSha512::default(),
         };
 
         // Experimental
         bind_command! {
             IsAdmin,
+            JobSpawn,
+            JobList,
+            JobKill,
+            JobId,
+            JobDescribe,
+            Job,
         };
+
+        #[cfg(not(target_family = "wasm"))]
+        bind_command! {
+            JobSend,
+            JobRecv,
+            JobFlush,
+        }
+
+        #[cfg(all(unix, feature = "os"))]
+        bind_command! {
+            JobUnfreeze,
+        }
 
         // Removed
         bind_command! {

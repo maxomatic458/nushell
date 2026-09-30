@@ -1,6 +1,5 @@
-use nu_protocol::engine::{EngineState, StateWorkingSet};
-
 use crate::commands::*;
+use nu_protocol::engine::{EngineState, StateWorkingSet};
 
 pub fn add_cli_context(mut engine_state: EngineState) -> EngineState {
     let delta = {
@@ -13,13 +12,27 @@ pub fn add_cli_context(mut engine_state: EngineState) -> EngineState {
         }
 
         bind_command! {
+            Abbreviations,
+            AbbreviationsList,
             Commandline,
+            CommandlineComplete,
+            CommandlineEdit,
+            CommandlineGetCursor,
+            CommandlineSetCursor,
+            CommandlineSetPrompt,
             History,
-            HistorySession,
             Keybindings,
             KeybindingsDefault,
             KeybindingsList,
             KeybindingsListen,
+            NuHighlight,
+            Print,
+        };
+
+        #[cfg(feature = "sqlite")]
+        bind_command! {
+            HistoryImport,
+            HistorySession
         };
 
         working_set.render()

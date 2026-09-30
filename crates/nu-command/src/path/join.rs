@@ -1,14 +1,7 @@
-use std::path::{Path, PathBuf};
-
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{EngineState, Stack, StateWorkingSet};
-use nu_protocol::{
-    engine::Command, Category, Example, PipelineData, Record, ShellError, Signature, Span, Spanned,
-    SyntaxShape, Type, Value,
-};
-
 use super::PathSubcommandArguments;
+use nu_engine::command_prelude::*;
+use nu_protocol::engine::StateWorkingSet;
+use std::path::{Path, PathBuf};
 
 struct Arguments {
     append: Vec<Spanned<String>>,
@@ -17,9 +10,9 @@ struct Arguments {
 impl PathSubcommandArguments for Arguments {}
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct PathJoin;
 
-impl Command for SubCommand {
+impl Command for PathJoin {
     fn name(&self) -> &str {
         "path join"
     }
@@ -29,8 +22,8 @@ impl Command for SubCommand {
             .input_output_types(vec![
                 (Type::String, Type::String),
                 (Type::List(Box::new(Type::String)), Type::String),
-                (Type::Record(vec![]), Type::String),
-                (Type::Table(vec![]), Type::List(Box::new(Type::String))),
+                (Type::record(), Type::String),
+                (Type::table(), Type::List(Box::new(Type::String))),
             ])
             .rest(
                 "append",
@@ -40,13 +33,13 @@ impl Command for SubCommand {
             .category(Category::Path)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Join a structured path or a list of path parts."
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"Optionally, append an additional path to the result. It is designed to accept
-the output of 'path parse' and 'path split' subcommands."#
+    fn extra_description(&self) -> &str {
+        "Optionally, append an additional path to the result. It is designed to accept
+the output of 'path parse' and 'path split' subcommands."
     }
 
     fn is_const(&self) -> bool {
@@ -70,52 +63,52 @@ the output of 'path parse' and 'path split' subcommands."#
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let args = Arguments {
-            append: call.rest_const(working_set, 0)?,
+            append: call.rest_const(working_set, stack, 0)?,
         };
 
         run(call, &args, input)
     }
 
     #[cfg(windows)]
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Append a filename to a path",
+                description: "Append a filename to a path.",
                 example: r"'C:\Users\viking' | path join spam.txt",
                 result: Some(Value::test_string(r"C:\Users\viking\spam.txt")),
             },
             Example {
-                description: "Append a filename to a path",
+                description: "Append a filename to a path.",
                 example: r"'C:\Users\viking' | path join spams this_spam.txt",
                 result: Some(Value::test_string(r"C:\Users\viking\spams\this_spam.txt")),
             },
             Example {
-                description: "Use relative paths, e.g. '..' will go up one directory",
+                description: "Use relative paths, e.g. '..' will go up one directory.",
                 example: r"'C:\Users\viking' | path join .. folder",
                 result: Some(Value::test_string(r"C:\Users\viking\..\folder")),
             },
             Example {
-                description:
-                    "Use absolute paths, e.g. '/' will bring you to the top level directory",
+                description: "Use absolute paths, e.g. '/' will bring you to the top level directory.",
                 example: r"'C:\Users\viking' | path join / folder",
-                result: Some(Value::test_string(r"C:/folder")),
+                result: Some(Value::test_string("C:/folder")),
             },
             Example {
-                description: "Join a list of parts into a path",
+                description: "Join a list of parts into a path.",
                 example: r"[ 'C:' '\' 'Users' 'viking' 'spam.txt' ] | path join",
                 result: Some(Value::test_string(r"C:\Users\viking\spam.txt")),
             },
             Example {
-                description: "Join a structured path into a path",
+                description: "Join a structured path into a path.",
                 example: r"{ parent: 'C:\Users\viking', stem: 'spam', extension: 'txt' } | path join",
                 result: Some(Value::test_string(r"C:\Users\viking\spam.txt")),
             },
             Example {
-                description: "Join a table of structured paths into a list of paths",
+                description: "Join a table of structured paths into a list of paths.",
                 example: r"[ [parent stem extension]; ['C:\Users\viking' 'spam' 'txt']] | path join",
                 result: Some(Value::list(
                     vec![Value::test_string(r"C:\Users\viking\spam.txt")],
@@ -126,44 +119,43 @@ the output of 'path parse' and 'path split' subcommands."#
     }
 
     #[cfg(not(windows))]
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Append a filename to a path",
-                example: r"'/home/viking' | path join spam.txt",
-                result: Some(Value::test_string(r"/home/viking/spam.txt")),
+                description: "Append a filename to a path.",
+                example: "'/home/viking' | path join spam.txt",
+                result: Some(Value::test_string("/home/viking/spam.txt")),
             },
             Example {
-                description: "Append a filename to a path",
-                example: r"'/home/viking' | path join spams this_spam.txt",
-                result: Some(Value::test_string(r"/home/viking/spams/this_spam.txt")),
+                description: "Append a filename to a path.",
+                example: "'/home/viking' | path join spams this_spam.txt",
+                result: Some(Value::test_string("/home/viking/spams/this_spam.txt")),
             },
             Example {
-                description: "Use relative paths, e.g. '..' will go up one directory",
-                example: r"'/home/viking' | path join .. folder",
-                result: Some(Value::test_string(r"/home/viking/../folder")),
+                description: "Use relative paths, e.g. '..' will go up one directory.",
+                example: "'/home/viking' | path join .. folder",
+                result: Some(Value::test_string("/home/viking/../folder")),
             },
             Example {
-                description:
-                    "Use absolute paths, e.g. '/' will bring you to the top level directory",
-                example: r"'/home/viking' | path join / folder",
-                result: Some(Value::test_string(r"/folder")),
+                description: "Use absolute paths, e.g. '/' will bring you to the top level directory.",
+                example: "'/home/viking' | path join / folder",
+                result: Some(Value::test_string("/folder")),
             },
             Example {
-                description: "Join a list of parts into a path",
-                example: r"[ '/' 'home' 'viking' 'spam.txt' ] | path join",
-                result: Some(Value::test_string(r"/home/viking/spam.txt")),
+                description: "Join a list of parts into a path.",
+                example: "[ '/' 'home' 'viking' 'spam.txt' ] | path join",
+                result: Some(Value::test_string("/home/viking/spam.txt")),
             },
             Example {
-                description: "Join a structured path into a path",
-                example: r"{ parent: '/home/viking', stem: 'spam', extension: 'txt' } | path join",
-                result: Some(Value::test_string(r"/home/viking/spam.txt")),
+                description: "Join a structured path into a path.",
+                example: "{ parent: '/home/viking', stem: 'spam', extension: 'txt' } | path join",
+                result: Some(Value::test_string("/home/viking/spam.txt")),
             },
             Example {
-                description: "Join a table of structured paths into a list of paths",
-                example: r"[[ parent stem extension ]; [ '/home/viking' 'spam' 'txt' ]] | path join",
+                description: "Join a table of structured paths into a list of paths.",
+                example: "[[ parent stem extension ]; [ '/home/viking' 'spam' 'txt' ]] | path join",
                 result: Some(Value::list(
-                    vec![Value::test_string(r"/home/viking/spam.txt")],
+                    vec![Value::test_string("/home/viking/spam.txt")],
                     Span::test_data(),
                 )),
             },
@@ -174,21 +166,17 @@ the output of 'path parse' and 'path split' subcommands."#
 fn run(call: &Call, args: &Arguments, input: PipelineData) -> Result<PipelineData, ShellError> {
     let head = call.head;
 
-    let metadata = input.metadata();
-
     match input {
-        PipelineData::Value(val, md) => Ok(PipelineData::Value(handle_value(val, args, head), md)),
-        PipelineData::ListStream(..) => Ok(PipelineData::Value(
-            handle_value(input.into_value(head), args, head),
+        PipelineData::Value(val, md) => Ok(PipelineData::value(handle_value(val, args, head), md)),
+        PipelineData::ListStream(stream, metadata) => Ok(PipelineData::value(
+            handle_value(stream.into_value()?, args, head),
             metadata,
         )),
-        PipelineData::Empty { .. } => Err(ShellError::PipelineEmpty { dst_span: head }),
-        _ => Err(ShellError::UnsupportedInput {
-            msg: "Input value cannot be joined".to_string(),
-            input: "value originates from here".into(),
-            msg_span: head,
-            input_span: input.span().unwrap_or(call.head),
-        }),
+        PipelineData::ByteStream(stream, metadata) => Ok(PipelineData::value(
+            handle_value(stream.into_value()?, args, head),
+            metadata,
+        )),
+        PipelineData::Empty => Err(ShellError::PipelineEmpty { dst_span: head }),
     }
 }
 
@@ -213,7 +201,7 @@ fn join_single(path: &Path, head: Span, args: &Arguments) -> Value {
 }
 
 fn join_list(parts: &[Value], head: Span, span: Span, args: &Arguments) -> Value {
-    let path: Result<PathBuf, ShellError> = parts.iter().map(Value::as_string).collect();
+    let path: Result<PathBuf, ShellError> = parts.iter().map(Value::coerce_string).collect();
 
     match path {
         Ok(ref path) => join_single(path, head, args),
@@ -228,11 +216,18 @@ fn join_list(parts: &[Value], head: Span, span: Span, args: &Arguments) -> Value
 
                     Value::list(vals, span)
                 }
-                Err(_) => Value::error(
-                    ShellError::PipelineMismatch {
+                Err(ShellError::CantConvert { from_type, .. }) => Value::error(
+                    ShellError::OnlySupportsThisInputType {
                         exp_input_type: "string or record".into(),
+                        wrong_type: from_type,
                         dst_span: head,
                         src_span: span,
+                    },
+                    span,
+                ),
+                Err(_) => Value::error(
+                    ShellError::NushellFailed {
+                        msg: "failed to join path".into(),
                     },
                     span,
                 ),
@@ -252,9 +247,14 @@ fn merge_record(record: &Record, head: Span, span: Span) -> Result<PathBuf, Shel
     for key in record.columns() {
         if !super::ALLOWED_COLUMNS.contains(&key.as_str()) {
             let allowed_cols = super::ALLOWED_COLUMNS.join(", ");
-            return Err(ShellError::UnsupportedInput { msg: format!(
+            return Err(ShellError::UnsupportedInput {
+                msg: format!(
                     "Column '{key}' is not valid for a structured path. Allowed columns on this platform are: {allowed_cols}"
-                ), input: "value originates from here".into(), msg_span: head, input_span: span });
+                ),
+                input: "value originates from here".into(),
+                msg_span: head,
+                input_span: span,
+            });
         }
     }
 
@@ -262,29 +262,29 @@ fn merge_record(record: &Record, head: Span, span: Span) -> Result<PathBuf, Shel
 
     #[cfg(windows)]
     if let Some(val) = record.get("prefix") {
-        let p = val.as_string()?;
+        let p = val.coerce_str()?;
         if !p.is_empty() {
-            result.push(p);
+            result.push(p.as_ref());
         }
     }
 
     if let Some(val) = record.get("parent") {
-        let p = val.as_string()?;
+        let p = val.coerce_str()?;
         if !p.is_empty() {
-            result.push(p);
+            result.push(p.as_ref());
         }
     }
 
     let mut basename = String::new();
     if let Some(val) = record.get("stem") {
-        let p = val.as_string()?;
+        let p = val.coerce_str()?;
         if !p.is_empty() {
             basename.push_str(&p);
         }
     }
 
     if let Some(val) = record.get("extension") {
-        let p = val.as_string()?;
+        let p = val.coerce_str()?;
         if !p.is_empty() {
             basename.push('.');
             basename.push_str(&p);
@@ -303,9 +303,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(PathJoin)
     }
 }

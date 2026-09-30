@@ -1,22 +1,19 @@
-use std::path::Path;
-
-use nu_path::expand_tilde;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{EngineState, Stack, StateWorkingSet};
-use nu_protocol::{
-    engine::Command, Category, Example, PipelineData, ShellError, Signature, Span, Type, Value,
-};
-
 use super::PathSubcommandArguments;
+use nu_engine::command_prelude::*;
+use nu_path::AbsolutePathBuf;
+use nu_protocol::{engine::StateWorkingSet, shell_error::io::IoError};
+use std::{io, path::Path};
 
-struct Arguments;
+struct Arguments {
+    pwd: AbsolutePathBuf,
+}
 
 impl PathSubcommandArguments for Arguments {}
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct PathType;
 
-impl Command for SubCommand {
+impl Command for PathType {
     fn name(&self) -> &str {
         "path type"
     }
@@ -34,13 +31,13 @@ impl Command for SubCommand {
             .category(Category::Path)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Get the type of the object a path refers to (e.g., file, dir, symlink)."
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"This checks the file system to confirm the path's object type.
-If nothing is found, an empty string will be returned."#
+    fn extra_description(&self) -> &str {
+        "This checks the file system to confirm the path's object type.
+If the path does not exist, null will be returned."
     }
 
     fn is_const(&self) -> bool {
@@ -50,51 +47,61 @@ If nothing is found, an empty string will be returned."#
     fn run(
         &self,
         engine_state: &EngineState,
-        _stack: &mut Stack,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let head = call.head;
-        let args = Arguments;
+        let args = Arguments {
+            pwd: engine_state.cwd(Some(stack))?,
+        };
 
         // This doesn't match explicit nulls
-        if matches!(input, PipelineData::Empty) {
+        if let PipelineData::Empty = input {
             return Err(ShellError::PipelineEmpty { dst_span: head });
         }
         input.map(
-            move |value| super::operate(&r#type, &args, value, head),
-            engine_state.ctrlc.clone(),
+            move |value| super::operate(&path_type, &args, value, head),
+            engine_state.signals(),
         )
     }
 
     fn run_const(
         &self,
         working_set: &StateWorkingSet,
+        _stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let head = call.head;
-        let args = Arguments;
+        let args = Arguments {
+            pwd: working_set.permanent().cwd(None)?,
+        };
 
         // This doesn't match explicit nulls
-        if matches!(input, PipelineData::Empty) {
+        if let PipelineData::Empty = input {
             return Err(ShellError::PipelineEmpty { dst_span: head });
         }
         input.map(
-            move |value| super::operate(&r#type, &args, value, head),
-            working_set.permanent().ctrlc.clone(),
+            move |value| super::operate(&path_type, &args, value, head),
+            working_set.permanent().signals(),
         )
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Show type of a filepath",
+                description: "Show type of a filepath.",
                 example: "'.' | path type",
                 result: Some(Value::test_string("dir")),
             },
             Example {
-                description: "Show type of a filepaths in a list",
+                description: "Empty string is not a path.",
+                example: "'' | path type | is-empty",
+                result: Some(Value::test_bool(true)),
+            },
+            Example {
+                description: "Show type of filepaths in a list.",
                 example: "ls | get name | path type",
                 result: None,
             },
@@ -102,21 +109,18 @@ If nothing is found, an empty string will be returned."#
     }
 }
 
-fn r#type(path: &Path, span: Span, _: &Arguments) -> Value {
-    let meta = if path.starts_with("~") {
-        let p = expand_tilde(path);
-        std::fs::symlink_metadata(p)
-    } else {
-        std::fs::symlink_metadata(path)
-    };
-
-    Value::string(
-        match &meta {
-            Ok(data) => get_file_type(data),
-            Err(_) => "",
-        },
-        span,
-    )
+fn path_type(path: &Path, span: Span, args: &Arguments) -> Value {
+    // To the OS, an empty string is just the CWD,
+    // however logically we want to treat it as an invalid path.
+    if path == "" {
+        return Value::nothing(span);
+    }
+    let path = nu_path::expand_path_with(path, &args.pwd, true);
+    match path.symlink_metadata() {
+        Ok(metadata) => Value::string(get_file_type(&metadata), span),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Value::nothing(span),
+        Err(err) => Value::error(IoError::new(err, span, None).into(), span),
+    }
 }
 
 fn get_file_type(md: &std::fs::Metadata) -> &str {
@@ -151,9 +155,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(PathType)
     }
 }

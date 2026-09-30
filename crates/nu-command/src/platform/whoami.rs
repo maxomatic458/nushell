@@ -1,8 +1,6 @@
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Example, IntoPipelineData, PipelineData, ShellError, Signature, Type, Value,
-};
+use nu_engine::command_prelude::*;
+use nu_protocol::shell_error::generic::GenericError;
+use uucore::{localized_help_template, translate};
 
 #[derive(Clone)]
 pub struct Whoami;
@@ -12,7 +10,7 @@ impl Command for Whoami {
         "whoami"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Get the current username using uutils/coreutils whoami."
     }
 
@@ -34,25 +32,26 @@ impl Command for Whoami {
         call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
+        // setup the uutils error translation
+        let _ = localized_help_template("touch");
+
         let output = match uu_whoami::whoami() {
             Ok(username) => username.to_string_lossy().to_string(),
             Err(e) => {
-                return Err(ShellError::GenericError {
-                    error: "Failed to get username".into(),
-                    msg: e.to_string(),
-                    span: Some(call.head),
-                    help: None,
-                    inner: vec![],
-                })
+                return Err(ShellError::Generic(GenericError::new(
+                    format!("{e}"),
+                    translate!(&e.to_string()),
+                    call.head,
+                )));
             }
         };
 
         Ok(Value::string(output, call.head).into_pipeline_data())
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
-            description: "Get the current username",
+            description: "Get the current username.",
             example: "whoami",
             result: None,
         }]
@@ -64,8 +63,7 @@ mod tests {
     use super::Whoami;
 
     #[test]
-    fn examples_work_as_expected() {
-        use crate::test_examples;
-        test_examples(Whoami {})
+    fn examples_work_as_expected() -> nu_test_support::Result {
+        nu_test_support::test().examples(Whoami)
     }
 }

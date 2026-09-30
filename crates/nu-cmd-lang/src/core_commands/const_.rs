@@ -1,6 +1,5 @@
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{Category, Example, PipelineData, ShellError, Signature, SyntaxShape, Type};
+use nu_engine::command_prelude::*;
+use nu_protocol::engine::CommandType;
 
 #[derive(Clone)]
 pub struct Const;
@@ -10,7 +9,7 @@ impl Command for Const {
         "const"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Create a parse-time constant."
     }
 
@@ -18,7 +17,11 @@ impl Command for Const {
         Signature::build("const")
             .input_output_types(vec![(Type::Nothing, Type::Nothing)])
             .allow_variants_without_examples(true)
-            .required("const_name", SyntaxShape::VarWithOptType, "Constant name.")
+            .required(
+                "const_name",
+                SyntaxShape::VarWithOptType,
+                "The constant name to create.",
+            )
             .required(
                 "initial_value",
                 SyntaxShape::Keyword(b"=".to_vec(), Box::new(SyntaxShape::MathExpression)),
@@ -27,13 +30,13 @@ impl Command for Const {
             .category(Category::Core)
     }
 
-    fn extra_usage(&self) -> &str {
-        r#"This command is a parser keyword. For details, check:
-  https://www.nushell.sh/book/thinking_in_nu.html"#
+    fn extra_description(&self) -> &str {
+        "This command is a parser keyword. For details, check:
+  https://www.nushell.sh/book/thinking_in_nu.html"
     }
 
-    fn is_parser_keyword(&self) -> bool {
-        true
+    fn command_type(&self) -> CommandType {
+        CommandType::Keyword
     }
 
     fn search_terms(&self) -> Vec<&str> {
@@ -42,35 +45,34 @@ impl Command for Const {
 
     fn run(
         &self,
-        engine_state: &EngineState,
-        stack: &mut Stack,
-        call: &Call,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        _call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let var_id = if let Some(id) = call.positional_nth(0).and_then(|pos| pos.as_var()) {
-            id
-        } else {
-            return Err(ShellError::NushellFailedSpanned {
-                msg: "Could not get variable".to_string(),
-                label: "variable not added by the parser".to_string(),
-                span: call.head,
-            });
-        };
-
-        if let Some(constval) = &engine_state.get_var(var_id).const_val {
-            stack.add_var(var_id, constval.clone());
-
-            Ok(PipelineData::empty())
-        } else {
-            Err(ShellError::NushellFailedSpanned {
-                msg: "Missing Constant".to_string(),
-                label: "constant not added by the parser".to_string(),
-                span: call.head,
-            })
-        }
+        // This is compiled specially by the IR compiler. The code here is never used when
+        // running in IR mode.
+        eprintln!(
+            "Tried to execute 'run' for the 'const' command: this code path should never be reached in IR mode"
+        );
+        unreachable!()
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn run_const(
+        &self,
+        _working_set: &StateWorkingSet,
+        _stack: &mut Stack,
+        _call: &Call,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        Ok(PipelineData::empty())
+    }
+
+    fn is_const(&self) -> bool {
+        true
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "Create a new parse-time constant.",
@@ -78,7 +80,7 @@ impl Command for Const {
                 result: None,
             },
             Example {
-                description: "Create a composite constant value",
+                description: "Create a composite constant value.",
                 example: "const x = { a: 10, b: 20 }",
                 result: None,
             },
@@ -93,10 +95,8 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(Const {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Const)
     }
 
     #[test]

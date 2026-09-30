@@ -1,10 +1,4 @@
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, IntoInterruptiblePipelineData, IntoPipelineData, PipelineData,
-    ShellError, Signature, Span, Spanned, SyntaxShape, Type, Value,
-};
+use nu_engine::command_prelude::*;
 
 use std::collections::HashSet;
 
@@ -19,9 +13,10 @@ impl Command for DropColumn {
     fn signature(&self) -> Signature {
         Signature::build(self.name())
             .input_output_types(vec![
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
             ])
+            .switch("left", "Drop columns from the left.", Some('l'))
             .optional(
                 "columns",
                 SyntaxShape::Int,
@@ -30,12 +25,12 @@ impl Command for DropColumn {
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Remove N columns at the right-hand end of the input table. To remove columns by name, use `reject`."
     }
 
     fn search_terms(&self) -> Vec<&str> {
-        vec!["delete"]
+        vec!["delete", "remove"]
     }
 
     fn run(
@@ -45,23 +40,15 @@ impl Command for DropColumn {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
+        let input = input.into_stream_or_original(engine_state);
         // the number of columns to drop
-        let columns: Option<Spanned<i64>> = call.opt(engine_state, stack, 0)?;
+        let columns = call.opt::<usize>(engine_state, stack, 0)?.unwrap_or(1);
+        let from_left = call.has_flag(engine_state, stack, "left")?;
 
-        let columns = if let Some(columns) = columns {
-            if columns.item < 0 {
-                return Err(ShellError::NeedsPositiveValue { span: columns.span });
-            } else {
-                columns.item as usize
-            }
-        } else {
-            1
-        };
-
-        drop_cols(engine_state, input, call.head, columns)
+        drop_cols(engine_state, input, call.head, columns, from_left)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "Remove the last column of a table",
@@ -78,6 +65,21 @@ impl Command for DropColumn {
                     record! { "lib" => Value::test_string("nu-lib") },
                 )),
             },
+            Example {
+                description: "Remove the first column of a table",
+                example: "[[lib, extension]; [nu-lib, rs] [nu-core, rb]] | drop column --left",
+                result: Some(Value::test_list(vec![
+                    Value::test_record(record! { "extension" => Value::test_string("rs") }),
+                    Value::test_record(record! { "extension" => Value::test_string("rb") }),
+                ])),
+            },
+            Example {
+                description: "Remove the first column of a record",
+                example: "{lib: nu-lib, extension: rs} | drop column --left",
+                result: Some(Value::test_record(
+                    record! { "extension" => Value::test_string("rs") },
+                )),
+            },
         ]
     }
 }
@@ -87,6 +89,7 @@ fn drop_cols(
     input: PipelineData,
     head: Span,
     columns: usize,
+    from_left: bool,
 ) -> Result<PipelineData, ShellError> {
     // For simplicity and performance, we use the first row's columns
     // as the columns for the whole table, and assume that later rows/records
@@ -94,11 +97,11 @@ fn drop_cols(
     // `[{a: 1}, {b: 2}] | drop column`
     // This will drop the column "a" instead of "b" even though column "b"
     // is displayed farther to the right.
-    let metadata = input.metadata();
     match input {
-        PipelineData::ListStream(mut stream, ..) => {
+        PipelineData::ListStream(stream, metadata) => {
+            let mut stream = stream.into_iter();
             if let Some(mut first) = stream.next() {
-                let drop_cols = drop_cols_set(&mut first, head, columns)?;
+                let drop_cols = drop_cols_set(&mut first, head, columns, from_left)?;
 
                 Ok(std::iter::once(first)
                     .chain(stream.map(move |mut v| {
@@ -107,49 +110,69 @@ fn drop_cols(
                             Err(e) => Value::error(e, head),
                         }
                     }))
-                    .into_pipeline_data_with_metadata(metadata, engine_state.ctrlc.clone()))
+                    .into_pipeline_data_with_metadata(
+                        head,
+                        engine_state.signals().clone(),
+                        metadata,
+                    ))
             } else {
-                Ok(PipelineData::Empty)
+                Ok(PipelineData::empty())
             }
         }
-        PipelineData::Value(v, ..) => {
+        PipelineData::Value(mut v, metadata) => {
             let span = v.span();
             match v {
                 Value::List { mut vals, .. } => {
-                    if let Some((first, rest)) = vals.split_first_mut() {
-                        let drop_cols = drop_cols_set(first, head, columns)?;
+                    if let Some((first, rest)) = vals.to_mut().split_first_mut() {
+                        let drop_cols = drop_cols_set(first, head, columns, from_left)?;
                         for val in rest {
                             drop_record_cols(val, head, &drop_cols)?
                         }
                     }
-                    Ok(Value::list(vals, span).into_pipeline_data_with_metadata(metadata))
+                    Ok(Value::list(vals.into_owned(), span)
+                        .into_pipeline_data_with_metadata(metadata))
                 }
                 Value::Record {
-                    val: mut record, ..
+                    val: ref mut record,
+                    ..
                 } => {
                     let len = record.len().saturating_sub(columns);
-                    record.truncate(len);
-                    Ok(Value::record(record, span).into_pipeline_data_with_metadata(metadata))
+                    if from_left {
+                        record.to_mut().truncate_front(len);
+                    } else {
+                        record.to_mut().truncate(len);
+                    }
+                    Ok(v.into_pipeline_data_with_metadata(metadata))
                 }
                 // Propagate errors
                 Value::Error { error, .. } => Err(*error),
                 val => Err(unsupported_value_error(&val, head)),
             }
         }
-        PipelineData::Empty => Ok(PipelineData::Empty),
-        PipelineData::ExternalStream { span, .. } => Err(ShellError::OnlySupportsThisInputType {
+        PipelineData::Empty => Ok(PipelineData::empty()),
+        PipelineData::ByteStream(stream, ..) => Err(ShellError::OnlySupportsThisInputType {
             exp_input_type: "table or record".into(),
-            wrong_type: "raw data".into(),
+            wrong_type: stream.type_().describe().into(),
             dst_span: head,
-            src_span: span,
+            src_span: stream.span(),
         }),
     }
 }
 
-fn drop_cols_set(val: &mut Value, head: Span, drop: usize) -> Result<HashSet<String>, ShellError> {
+fn drop_cols_set(
+    val: &mut Value,
+    head: Span,
+    drop: usize,
+    from_left: bool,
+) -> Result<HashSet<String>, ShellError> {
     if let Value::Record { val: record, .. } = val {
         let len = record.len().saturating_sub(drop);
-        Ok(record.drain(len..).map(|(col, _)| col).collect())
+        let columns = if from_left {
+            record.to_mut().drain(..drop).map(|(col, _)| col).collect()
+        } else {
+            record.to_mut().drain(len..).map(|(col, _)| col).collect()
+        };
+        Ok(columns)
     } else {
         Err(unsupported_value_error(val, head))
     }
@@ -161,7 +184,7 @@ fn drop_record_cols(
     drop_cols: &HashSet<String>,
 ) -> Result<(), ShellError> {
     if let Value::Record { val, .. } = val {
-        val.retain(|col, _| !drop_cols.contains(col));
+        val.to_mut().retain(|col, _| !drop_cols.contains(col));
         Ok(())
     } else {
         Err(unsupported_value_error(val, head))
@@ -182,7 +205,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        crate::test_examples(DropColumn)
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(DropColumn)
     }
 }

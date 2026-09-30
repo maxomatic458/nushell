@@ -1,4 +1,5 @@
 mod alias;
+mod attr;
 mod break_;
 mod collect;
 mod const_;
@@ -7,6 +8,7 @@ mod def;
 mod describe;
 mod do_;
 mod echo;
+mod error;
 mod error_make;
 mod export;
 mod export_alias;
@@ -21,7 +23,6 @@ mod hide;
 mod hide_env;
 mod if_;
 mod ignore;
-mod lazy_make;
 mod let_;
 mod loop_;
 mod match_;
@@ -36,6 +37,7 @@ mod version;
 mod while_;
 
 pub use alias::Alias;
+pub use attr::*;
 pub use break_::Break;
 pub use collect::Collect;
 pub use const_::Const;
@@ -44,6 +46,7 @@ pub use def::Def;
 pub use describe::Describe;
 pub use do_::Do;
 pub use echo::Echo;
+pub use error::Error;
 pub use error_make::ErrorMake;
 pub use export::ExportCommand;
 pub use export_alias::ExportAlias;
@@ -58,7 +61,6 @@ pub use hide::Hide;
 pub use hide_env::HideEnv;
 pub use if_::If;
 pub use ignore::Ignore;
-pub use lazy_make::LazyMake;
 pub use let_::Let;
 pub use loop_::Loop;
 pub use match_::Match;
@@ -69,10 +71,5 @@ pub use return_::Return;
 pub use scope::*;
 pub use try_::Try;
 pub use use_::Use;
-pub use version::Version;
+pub use version::{VERSION, VERSION_NU_FEATURES, Version};
 pub use while_::While;
-//#[cfg(feature = "plugin")]
-mod register;
-
-//#[cfg(feature = "plugin")]
-pub use register::Register;

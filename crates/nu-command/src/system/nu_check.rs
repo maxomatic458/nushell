@@ -1,10 +1,12 @@
-use nu_engine::{find_in_dirs_env, get_dirs_var_from_call, CallExt};
-use nu_parser::{parse, parse_module_block, unescape_unquote_string};
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack, StateWorkingSet};
+use nu_engine::{command_prelude::*, find_in_dirs_env, get_dirs_var_from_call};
+use nu_parser::{parse, parse_module_block, parse_module_file_or_dir, unescape_unquote_string};
 use nu_protocol::{
-    Category, Example, PipelineData, ShellError, Signature, Span, Spanned, SyntaxShape, Type, Value,
+    engine::{FileStack, StateWorkingSet},
+    report_parse_error,
+    shell_error::generic::GenericError,
+    shell_error::io::IoError,
 };
+use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
 pub struct NuCheck;
@@ -16,19 +18,23 @@ impl Command for NuCheck {
 
     fn signature(&self) -> Signature {
         Signature::build("nu-check")
-            .input_output_types(vec![(Type::String, Type::Bool),
-            (Type::ListStream, Type::Bool),
-            (Type::List(Box::new(Type::Any)), Type::Bool)])
+            .input_output_types(vec![
+                (Type::Nothing, Type::Bool),
+                (Type::String, Type::Bool),
+                (Type::List(Box::new(Type::Any)), Type::Bool),
+                // FIXME Type::Any input added to disable pipeline input type checking, as run-time checks can raise undesirable type errors
+                // which aren't caught by the parser. see https://github.com/nushell/nushell/pull/14922 for more details
+                (Type::Any, Type::Bool),
+            ])
             // type is string to avoid automatically canonicalizing the path
             .optional("path", SyntaxShape::String, "File path to parse.")
-            .switch("as-module", "Parse content as module", Some('m'))
-            .switch("debug", "Show error messages", Some('d'))
-            .switch("all", "Parse content as script first, returns result if success, otherwise, try with module", Some('a'))
+            .switch("as-module", "Parse content as module.", Some('m'))
+            .switch("debug", "Show error messages.", Some('d'))
             .category(Category::Strings)
     }
 
-    fn usage(&self) -> &str {
-        "Validate and parse input content."
+    fn description(&self) -> &str {
+        "Validate and parse Nushell input content."
     }
 
     fn search_terms(&self) -> Vec<&str> {
@@ -42,142 +48,96 @@ impl Command for NuCheck {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let path: Option<Spanned<String>> = call.opt(engine_state, stack, 0)?;
-        let is_module = call.has_flag(engine_state, stack, "as-module")?;
+        let path_arg: Option<Spanned<String>> = call.opt(engine_state, stack, 0)?;
+        let as_module = call.has_flag(engine_state, stack, "as-module")?;
         let is_debug = call.has_flag(engine_state, stack, "debug")?;
-        let is_all = call.has_flag(engine_state, stack, "all")?;
-        let config = engine_state.get_config();
-        let mut contents = vec![];
 
         // DO NOT ever try to merge the working_set in this command
         let mut working_set = StateWorkingSet::new(engine_state);
 
-        if is_all && is_module {
-            return Err(ShellError::GenericError {
-                error: "Detected command flags conflict".into(),
-                msg: "You cannot have both `--all` and `--as-module` on the same command line, please refer to `nu-check --help` for more details".into(),
-                span: Some(call.head),
-                help: None,
-                inner: vec![]
-            });
-        }
+        let input_span = input.span().unwrap_or(call.head);
 
-        let span = input.span().unwrap_or(call.head);
         match input {
             PipelineData::Value(Value::String { val, .. }, ..) => {
                 let contents = Vec::from(val);
-                if is_all {
-                    heuristic_parse(&mut working_set, None, &contents, is_debug, call.head)
-                } else if is_module {
-                    parse_module(&mut working_set, None, &contents, is_debug, span)
+                if as_module {
+                    parse_module(&mut working_set, None, &contents, is_debug, input_span)
                 } else {
-                    parse_script(&mut working_set, None, &contents, is_debug, span)
+                    parse_script(&mut working_set, None, &contents, is_debug, input_span)
                 }
             }
             PipelineData::ListStream(stream, ..) => {
-                let list_stream = stream.into_string("\n", config);
+                let config = stack.get_config(engine_state);
+                let list_stream = stream.into_string("\n", &config);
                 let contents = Vec::from(list_stream);
 
-                if is_all {
-                    heuristic_parse(&mut working_set, None, &contents, is_debug, call.head)
-                } else if is_module {
+                if as_module {
                     parse_module(&mut working_set, None, &contents, is_debug, call.head)
                 } else {
                     parse_script(&mut working_set, None, &contents, is_debug, call.head)
                 }
             }
-            PipelineData::ExternalStream {
-                stdout: Some(stream),
-                ..
-            } => {
-                let raw_stream: Vec<_> = stream.stream.collect();
-                for r in raw_stream {
-                    match r {
-                        Ok(v) => contents.extend(v),
-                        Err(error) => return Err(error),
-                    };
-                }
+            PipelineData::ByteStream(stream, ..) => {
+                let contents = stream.into_bytes()?;
 
-                if is_all {
-                    heuristic_parse(&mut working_set, None, &contents, is_debug, call.head)
-                } else if is_module {
+                if as_module {
                     parse_module(&mut working_set, None, &contents, is_debug, call.head)
                 } else {
                     parse_script(&mut working_set, None, &contents, is_debug, call.head)
                 }
             }
             _ => {
-                if let Some(path_str) = path {
+                if let Some(path_str) = path_arg {
+                    let path_span = path_str.span;
+
                     // look up the path as relative to FILE_PWD or inside NU_LIB_DIRS (same process as source-env)
                     let path = match find_in_dirs_env(
                         &path_str.item,
                         engine_state,
                         stack,
-                        get_dirs_var_from_call(call),
+                        get_dirs_var_from_call(stack, call),
                     ) {
-                        Ok(path) => {
-                            if let Some(path) = path {
-                                path
-                            } else {
-                                return Err(ShellError::FileNotFound {
-                                    span: path_str.span,
-                                });
-                            }
+                        Ok(Some(path)) => path,
+                        Ok(None) => {
+                            return Err(ShellError::Io(IoError::new(
+                                ErrorKind::FileNotFound,
+                                path_span,
+                                PathBuf::from(path_str.item),
+                            )));
                         }
-                        Err(error) => return Err(error),
+                        Err(err) => return Err(err),
                     };
 
-                    // get the expanded path as a string
-                    let path_str = path.to_string_lossy().to_string();
-
-                    let ext: Vec<_> = path_str.rsplitn(2, '.').collect();
-                    if ext[0] != "nu" {
-                        return Err(ShellError::GenericError {
-                            error: "Cannot parse input".into(),
-                            msg: "File extension must be the type of .nu".into(),
-                            span: Some(call.head),
-                            help: None,
-                            inner: vec![],
-                        });
+                    if as_module || path.is_dir() {
+                        parse_file_or_dir_module(
+                            path.to_string_lossy().as_bytes(),
+                            &mut working_set,
+                            is_debug,
+                            path_span,
+                            call.head,
+                        )
+                    } else {
+                        // Unlike `parse_file_or_dir_module`, `parse_file_script` parses the content directly,
+                        // without adding the file to the stack. Therefore we need to handle this manually.
+                        working_set.files = FileStack::with_file(path.clone());
+                        parse_file_script(&path, &mut working_set, is_debug, path_span, call.head)
+                        // The working set is not merged, so no need to pop the file from the stack.
                     }
-
-                    // Change currently parsed directory
-                    let prev_currently_parsed_cwd = if let Some(parent) = path.parent() {
-                        let prev = working_set.currently_parsed_cwd.clone();
-
-                        working_set.currently_parsed_cwd = Some(parent.into());
-
-                        prev
-                    } else {
-                        working_set.currently_parsed_cwd.clone()
-                    };
-
-                    let result = if is_all {
-                        heuristic_parse_file(path_str, &mut working_set, call, is_debug)
-                    } else if is_module {
-                        parse_file_module(path_str, &mut working_set, call, is_debug)
-                    } else {
-                        parse_file_script(path_str, &mut working_set, call, is_debug)
-                    };
-
-                    // Restore the currently parsed directory back
-                    working_set.currently_parsed_cwd = prev_currently_parsed_cwd;
-
-                    result
                 } else {
-                    Err(ShellError::GenericError {
-                        error: "Failed to execute command".into(),
-                        msg: "Please run 'nu-check --help' for more details".into(),
-                        span: Some(call.head),
-                        help: None,
-                        inner: vec![],
-                    })
+                    Err(ShellError::Generic(
+                        GenericError::new(
+                            "Failed to execute command",
+                            "Requires path argument if ran without pipeline input",
+                            call.head,
+                        )
+                        .with_help("Please run 'nu-check --help' for more details"),
+                    ))
                 }
             }
         }
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "Parse a input file as script(Default)",
@@ -195,7 +155,7 @@ impl Command for NuCheck {
                 result: None,
             },
             Example {
-                description: "Parse an external stream as script by showing error message",
+                description: "Parse a byte stream as script by showing error message",
                 example: "open foo.nu | nu-check --debug script.nu",
                 result: None,
             },
@@ -209,106 +169,7 @@ impl Command for NuCheck {
                 example: "$'two(char nl)lines' | nu-check ",
                 result: None,
             },
-            Example {
-                description: "Heuristically parse which begins with script first, if it sees a failure, try module afterwards",
-                example: "nu-check -a script.nu",
-                result: None,
-            },
-            Example {
-                description: "Heuristically parse by showing error message",
-                example: "open foo.nu | lines | nu-check --all --debug",
-                result: None,
-            },
         ]
-    }
-}
-
-fn heuristic_parse(
-    working_set: &mut StateWorkingSet,
-    filename: Option<&str>,
-    contents: &[u8],
-    is_debug: bool,
-    span: Span,
-) -> Result<PipelineData, ShellError> {
-    match parse_script(working_set, filename, contents, is_debug, span) {
-        Ok(v) => Ok(v),
-        Err(_) => {
-            match parse_module(
-                working_set,
-                filename.map(|f| f.to_string()),
-                contents,
-                is_debug,
-                span,
-            ) {
-                Ok(v) => Ok(v),
-                Err(_) => {
-                    if is_debug {
-                        Err(ShellError::GenericError {
-                            error: "Failed to parse content,tried both script and module".into(),
-                            msg: "syntax error".into(),
-                            span: Some(span),
-                            help: Some("Run `nu-check --help` for more details".into()),
-                            inner: vec![],
-                        })
-                    } else {
-                        Ok(PipelineData::Value(Value::bool(false, span), None))
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn heuristic_parse_file(
-    path: String,
-    working_set: &mut StateWorkingSet,
-    call: &Call,
-    is_debug: bool,
-) -> Result<PipelineData, ShellError> {
-    let starting_error_count = working_set.parse_errors.len();
-    let bytes = working_set.get_span_contents(call.head);
-    let (filename, err) = unescape_unquote_string(bytes, call.head);
-    if let Some(err) = err {
-        working_set.error(err);
-    }
-    if starting_error_count == working_set.parse_errors.len() {
-        if let Ok(contents) = std::fs::read(path) {
-            match parse_script(
-                working_set,
-                Some(filename.as_str()),
-                &contents,
-                is_debug,
-                call.head,
-            ) {
-                Ok(v) => Ok(v),
-                Err(_) => {
-                    match parse_module(working_set, Some(filename), &contents, is_debug, call.head)
-                    {
-                        Ok(v) => Ok(v),
-                        Err(_) => {
-                            if is_debug {
-                                Err(ShellError::GenericError {
-                                    error: "Failed to parse content,tried both script and module"
-                                        .into(),
-                                    msg: "syntax error".into(),
-                                    span: Some(call.head),
-                                    help: Some("Run `nu-check --help` for more details".into()),
-                                    inner: vec![],
-                                })
-                            } else {
-                                Ok(PipelineData::Value(Value::bool(false, call.head), None))
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            Err(ShellError::IOError {
-                msg: "Can not read input".to_string(),
-            })
-        }
-    } else {
-        Err(ShellError::NotFound { span: call.head })
     }
 }
 
@@ -317,38 +178,26 @@ fn parse_module(
     filename: Option<String>,
     contents: &[u8],
     is_debug: bool,
-    span: Span,
+    call_head: Span,
 ) -> Result<PipelineData, ShellError> {
     let filename = filename.unwrap_or_else(|| "empty".to_string());
 
-    let file_id = working_set.add_file(filename.clone(), contents);
+    let file_id = working_set.add_file(&filename, contents);
     let new_span = working_set.get_span_for_file(file_id);
 
     let starting_error_count = working_set.parse_errors.len();
     parse_module_block(working_set, new_span, filename.as_bytes());
 
-    if starting_error_count != working_set.parse_errors.len() {
-        if is_debug {
-            let msg = format!(
-                r#"Found : {}"#,
-                working_set
-                    .parse_errors
-                    .first()
-                    .expect("Unable to parse content as module")
-            );
-            Err(ShellError::GenericError {
-                error: "Failed to parse content".into(),
-                msg,
-                span: Some(span),
-                help: Some("If the content is intended to be a script, please try to remove `--as-module` flag ".into()),
-                inner: vec![],
-            })
-        } else {
-            Ok(PipelineData::Value(Value::bool(false, new_span), None))
-        }
-    } else {
-        Ok(PipelineData::Value(Value::bool(true, new_span), None))
-    }
+    check_parse(
+        starting_error_count,
+        working_set,
+        is_debug,
+        Some(
+            "If the content is intended to be a script, please try to remove `--as-module` flag "
+                .to_string(),
+        ),
+        call_head,
+    )
 }
 
 fn parse_script(
@@ -356,86 +205,113 @@ fn parse_script(
     filename: Option<&str>,
     contents: &[u8],
     is_debug: bool,
-    span: Span,
+    call_head: Span,
 ) -> Result<PipelineData, ShellError> {
     let starting_error_count = working_set.parse_errors.len();
     parse(working_set, filename, contents, false);
+    check_parse(starting_error_count, working_set, is_debug, None, call_head)
+}
+
+fn check_parse(
+    starting_error_count: usize,
+    working_set: &StateWorkingSet,
+    is_debug: bool,
+    help: Option<String>,
+    call_head: Span,
+) -> Result<PipelineData, ShellError> {
     if starting_error_count != working_set.parse_errors.len() {
-        let msg = format!(
-            r#"Found : {}"#,
-            working_set
-                .parse_errors
-                .first()
-                .expect("Unable to parse content")
-        );
+        let parse_err = working_set
+            .parse_errors
+            .first()
+            .expect("Missing parser error");
+
         if is_debug {
-            Err(ShellError::GenericError {
-                error: "Failed to parse content".into(),
-                msg,
-                span: Some(span),
-                help: Some("If the content is intended to be a module, please consider flag of `--as-module` ".into()),
-                inner: vec![],
-            })
+            // Print the real miette diagnostic (with file contents / labels) first.
+            report_parse_error(None, working_set, parse_err);
+
+            let msg = format!("Found : {parse_err}");
+            let mut err = GenericError::new("Failed to parse content", msg, call_head);
+            if let Some(help) = help {
+                err = err.with_help(help);
+            }
+            Err(ShellError::Generic(err))
         } else {
-            Ok(PipelineData::Value(Value::bool(false, span), None))
+            Ok(PipelineData::value(Value::bool(false, call_head), None))
         }
     } else {
-        Ok(PipelineData::Value(Value::bool(true, span), None))
+        Ok(PipelineData::value(Value::bool(true, call_head), None))
     }
 }
 
 fn parse_file_script(
-    path: String,
+    path: &Path,
     working_set: &mut StateWorkingSet,
-    call: &Call,
     is_debug: bool,
+    path_span: Span,
+    call_head: Span,
 ) -> Result<PipelineData, ShellError> {
-    let starting_error_count = working_set.parse_errors.len();
-    let bytes = working_set.get_span_contents(call.head);
-    let (filename, err) = unescape_unquote_string(bytes, call.head);
-    if let Some(err) = err {
-        working_set.error(err)
-    }
-    if starting_error_count == working_set.parse_errors.len() {
-        if let Ok(contents) = std::fs::read(path) {
-            parse_script(
-                working_set,
-                Some(filename.as_str()),
-                &contents,
-                is_debug,
-                call.head,
-            )
-        } else {
-            Err(ShellError::IOError {
-                msg: "Can not read path".to_string(),
-            })
-        }
-    } else {
-        Err(ShellError::NotFound { span: call.head })
+    let filename = check_path(working_set, path_span, call_head)?;
+
+    match std::fs::read(path) {
+        Ok(contents) => parse_script(working_set, Some(&filename), &contents, is_debug, call_head),
+        Err(err) => Err(ShellError::Io(IoError::new(
+            err.not_found_as(NotFound::File),
+            path_span,
+            PathBuf::from(path),
+        ))),
     }
 }
 
-fn parse_file_module(
-    path: String,
+fn parse_file_or_dir_module(
+    path_bytes: &[u8],
     working_set: &mut StateWorkingSet,
-    call: &Call,
     is_debug: bool,
+    path_span: Span,
+    call_head: Span,
 ) -> Result<PipelineData, ShellError> {
+    let _ = check_path(working_set, path_span, call_head)?;
+
     let starting_error_count = working_set.parse_errors.len();
-    let bytes = working_set.get_span_contents(call.head);
-    let (filename, err) = unescape_unquote_string(bytes, call.head);
-    if let Some(err) = err {
-        working_set.error(err);
-    }
-    if starting_error_count == working_set.parse_errors.len() {
-        if let Ok(contents) = std::fs::read(path) {
-            parse_module(working_set, Some(filename), &contents, is_debug, call.head)
+    let _ = parse_module_file_or_dir(working_set, path_bytes, path_span, None);
+
+    if starting_error_count != working_set.parse_errors.len() {
+        if is_debug {
+            let parse_err = working_set
+                .parse_errors
+                .first()
+                .expect("Missing parser error");
+            report_parse_error(None, working_set, parse_err);
+            let msg = format!("Found : {parse_err}");
+            Err(ShellError::Generic(
+                GenericError::new("Failed to parse content", msg, path_span).with_help(
+                    "If the content is intended to be a script, please try to remove `--as-module` flag ",
+                ),
+            ))
         } else {
-            Err(ShellError::IOError {
-                msg: "Can not read path".to_string(),
-            })
+            Ok(PipelineData::value(Value::bool(false, call_head), None))
         }
     } else {
-        Err(ShellError::NotFound { span: call.head })
+        Ok(PipelineData::value(Value::bool(true, call_head), None))
+    }
+}
+
+fn check_path(
+    working_set: &mut StateWorkingSet,
+    path_span: Span,
+    call_head: Span,
+) -> Result<String, ShellError> {
+    let bytes = working_set.get_span_contents(path_span);
+    let (filename, err) = unescape_unquote_string(bytes, path_span);
+    if let Some(e) = err {
+        Err(ShellError::Generic(
+            GenericError::new(
+                "Could not escape filename",
+                "could not escape filename",
+                call_head,
+            )
+            .with_help(format!("Returned error: {e}")),
+        ))
+    } else {
+        Ok(filename)
     }
 }

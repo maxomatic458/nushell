@@ -1,16 +1,14 @@
-use crate::math::reducers::{reducer_for, Reduce};
-use crate::math::utils::run_with_function;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, PipelineData, ShellError, Signature, Span, Type, Value,
+use crate::math::{
+    reducers::{Reduce, reducer_for},
+    utils::{run_with_function_with_cell_paths, run_with_function_with_cell_paths_const},
 };
+use nu_engine::command_prelude::*;
 
 const NS_PER_SEC: i64 = 1_000_000_000;
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct MathAvg;
 
-impl Command for SubCommand {
+impl Command for MathAvg {
     fn name(&self) -> &str {
         "math avg"
     }
@@ -25,14 +23,19 @@ impl Command for SubCommand {
                 (Type::List(Box::new(Type::Number)), Type::Number),
                 (Type::Number, Type::Number),
                 (Type::Range, Type::Number),
-                (Type::Table(vec![]), Type::Record(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::record()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true)
+            .rest(
+                "columns",
+                SyntaxShape::CellPath,
+                "The cell-paths/columns to operate on.",
+            )
             .category(Category::Math)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Returns the average of a list of numbers."
     }
 
@@ -40,34 +43,67 @@ impl Command for SubCommand {
         vec!["average", "mean", "statistics"]
     }
 
+    fn is_const(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
-        _engine_state: &EngineState,
-        _stack: &mut Stack,
+        engine_state: &EngineState,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        run_with_function(call, input, average)
+        run_with_function_with_cell_paths(engine_state, stack, call, input, average)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn run_const(
+        &self,
+        working_set: &StateWorkingSet,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        run_with_function_with_cell_paths_const(working_set, stack, call, input, average)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "Compute the average of a list of numbers",
+                description: "Compute the average of a list of numbers.",
                 example: "[-50 100.0 25] | math avg",
                 result: Some(Value::test_float(25.0)),
             },
             Example {
-                description: "Compute the average of a list of durations",
+                description: "Compute the average of a list of durations.",
                 example: "[2sec 1min] | math avg",
                 result: Some(Value::test_duration(31 * NS_PER_SEC)),
             },
             Example {
-                description: "Compute the average of each column in a table",
+                description: "Compute the average of each column in a table.",
                 example: "[[a b]; [1 2] [3 4]] | math avg",
                 result: Some(Value::test_record(record! {
                     "a" => Value::test_int(2),
                     "b" => Value::test_int(3),
+                })),
+            },
+            Example {
+                description: "Compute the average of list-valued columns in a record.",
+                example: "{alice: [1 2 3], bob: [4 5 6]} | math avg",
+                result: Some(Value::test_record(record! {
+                    "alice" => Value::test_int(2),
+                    "bob" => Value::test_int(5),
+                })),
+            },
+            Example {
+                description: "Compute the average of a single column using a cell path.",
+                example: "{alice: [1 2 3], bob: [4 5 6]} | math avg alice",
+                result: Some(Value::test_record(record! {
+                    "alice" => Value::test_int(2),
+                    "bob" => Value::list(
+                        vec![Value::test_int(4), Value::test_int(5), Value::test_int(6)],
+                        Span::test_data(),
+                    ),
                 })),
             },
         ]
@@ -79,7 +115,7 @@ pub fn average(values: &[Value], span: Span, head: Span) -> Result<Value, ShellE
     let total = &sum(Value::int(0, head), values.to_vec(), span, head)?;
     let span = total.span();
     match total {
-        Value::Filesize { val, .. } => Ok(Value::filesize(val / values.len() as i64, span)),
+        Value::Filesize { val, .. } => Ok(Value::filesize(val.get() / values.len() as i64, span)),
         Value::Duration { val, .. } => Ok(Value::duration(val / values.len() as i64, span)),
         _ => total.div(head, &Value::int(values.len() as i64, head), head),
     }
@@ -90,9 +126,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_examples() {
-        use crate::test_examples;
-
-        test_examples(SubCommand {})
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(MathAvg)
     }
 }

@@ -1,14 +1,15 @@
-use super::helper::ReconstructVal;
-use crate::{record, Config, ShellError, Span, Value};
-use serde::{Deserialize, Serialize};
-use std::str::FromStr;
+use std::{num::NonZeroU16, time::Duration};
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+use super::{config_update_string_enum, prelude::*};
+use crate::{self as nu_protocol, ConfigError, FromValue};
+
+#[derive(Clone, Copy, Debug, Default, IntoValue, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TableMode {
     Basic,
     Thin,
     Light,
     Compact,
+    Frameless,
     WithLove,
     CompactDouble,
     #[default]
@@ -22,6 +23,8 @@ pub enum TableMode {
     Restructured,
     AsciiRounded,
     BasicCompact,
+    Single,
+    Double,
 }
 
 impl FromStr for TableMode {
@@ -33,6 +36,7 @@ impl FromStr for TableMode {
             "thin" => Ok(Self::Thin),
             "light" => Ok(Self::Light),
             "compact" => Ok(Self::Compact),
+            "frameless" => Ok(Self::Frameless),
             "with_love" => Ok(Self::WithLove),
             "compact_double" => Ok(Self::CompactDouble),
             "default" => Ok(TableMode::default()),
@@ -46,38 +50,67 @@ impl FromStr for TableMode {
             "restructured" => Ok(Self::Restructured),
             "ascii_rounded" => Ok(Self::AsciiRounded),
             "basic_compact" => Ok(Self::BasicCompact),
-            _ => Err("expected either 'basic', 'thin', 'light', 'compact', 'with_love', 'compact_double', 'rounded', 'reinforced', 'heavy', 'none', 'psql', 'markdown', 'dots', 'restructured', 'ascii_rounded', or 'basic_compact'"),
+            "single" => Ok(Self::Single),
+            "double" => Ok(Self::Double),
+            _ => Err(
+                "'basic', 'thin', 'light', 'compact', 'frameless', 'with_love', 'compact_double', 'rounded', 'reinforced', 'heavy', 'none', 'psql', 'markdown', 'dots', 'restructured', 'ascii_rounded', 'basic_compact', 'single', or 'double'",
+            ),
         }
     }
 }
 
-impl ReconstructVal for TableMode {
-    fn reconstruct_value(&self, span: Span) -> Value {
-        Value::string(
-            match self {
-                TableMode::Basic => "basic",
-                TableMode::Thin => "thin",
-                TableMode::Light => "light",
-                TableMode::Compact => "compact",
-                TableMode::WithLove => "with_love",
-                TableMode::CompactDouble => "compact_double",
-                TableMode::Rounded => "rounded",
-                TableMode::Reinforced => "reinforced",
-                TableMode::Heavy => "heavy",
-                TableMode::None => "none",
-                TableMode::Psql => "psql",
-                TableMode::Markdown => "markdown",
-                TableMode::Dots => "dots",
-                TableMode::Restructured => "restructured",
-                TableMode::AsciiRounded => "ascii_rounded",
-                TableMode::BasicCompact => "basic_compact",
-            },
-            span,
-        )
+impl TableMode {
+    /// Every name `table --theme` and `$env.config.table.mode` accept.
+    pub const NAMES: &'static [&'static str] = &[
+        "basic",
+        "compact",
+        "compact_double",
+        "default",
+        "frameless",
+        "heavy",
+        "light",
+        "none",
+        "reinforced",
+        "rounded",
+        "thin",
+        "with_love",
+        "psql",
+        "markdown",
+        "dots",
+        "restructured",
+        "ascii_rounded",
+        "basic_compact",
+        "single",
+        "double",
+    ];
+
+    /// The names a `tui` border (`--border`, `$env.config.tui.border_type`)
+    /// accepts: every [`Self::NAMES`] entry but `none`, since a tui border
+    /// always takes one cell, and `default`, which is `rounded` for `table`
+    /// while tui borders default to `single`.
+    pub fn tui_border_names() -> impl Iterator<Item = &'static str> {
+        Self::NAMES
+            .iter()
+            .copied()
+            .filter(|name| !matches!(*name, "none" | "default"))
+    }
+
+    /// Parse a `tui` border name, ignoring case like [`TableMode::from_str`].
+    /// `None` when `name` is not one of [`Self::tui_border_names`].
+    pub fn from_tui_border(name: &str) -> Option<Self> {
+        Self::tui_border_names()
+            .find(|valid| valid.eq_ignore_ascii_case(name))
+            .and_then(|valid| valid.parse().ok())
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+impl UpdateFromValue for TableMode {
+    fn update(&mut self, value: &Value, path: &mut ConfigPath, errors: &mut ConfigErrors) {
+        config_update_string_enum(self, value, path, errors)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FooterMode {
     /// Never show the footer
     Never,
@@ -85,7 +118,7 @@ pub enum FooterMode {
     Always,
     /// Only show the footer if there are more than RowCount rows
     RowCount(u64),
-    /// Calculate the screen height, calculate row count, if display will be bigger than screen, add the footer
+    /// Calculate the screen height and row count, if screen height is larger than row count, don't show footer
     Auto,
 }
 
@@ -97,32 +130,46 @@ impl FromStr for FooterMode {
             "always" => Ok(FooterMode::Always),
             "never" => Ok(FooterMode::Never),
             "auto" => Ok(FooterMode::Auto),
-            x => {
-                if let Ok(count) = x.parse() {
-                    Ok(FooterMode::RowCount(count))
-                } else {
-                    Err("expected either 'never', 'always', 'auto' or a row count")
-                }
-            }
+            _ => Err("'never', 'always', 'auto', or int"),
         }
     }
 }
 
-impl ReconstructVal for FooterMode {
-    fn reconstruct_value(&self, span: Span) -> Value {
-        Value::string(
-            match self {
-                FooterMode::Always => "always".to_string(),
-                FooterMode::Never => "never".to_string(),
-                FooterMode::Auto => "auto".to_string(),
-                FooterMode::RowCount(c) => c.to_string(),
+impl UpdateFromValue for FooterMode {
+    fn update(&mut self, value: &Value, path: &mut ConfigPath, errors: &mut ConfigErrors) {
+        match value {
+            Value::String { val, .. } => match val.parse() {
+                Ok(val) => *self = val,
+                Err(err) => errors.invalid_value(path, err.to_string(), value),
             },
-            span,
-        )
+            &Value::Int { val, .. } => {
+                if val >= 0 {
+                    *self = Self::RowCount(val as u64);
+                } else {
+                    errors.invalid_value(path, "a non-negative integer", value);
+                }
+            }
+            _ => errors.type_mismatch(
+                path,
+                Type::custom("'never', 'always', 'auto', or int"),
+                value,
+            ),
+        }
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+impl IntoValue for FooterMode {
+    fn into_value(self, span: Span) -> Value {
+        match self {
+            FooterMode::Always => "always".into_value(span),
+            FooterMode::Never => "never".into_value(span),
+            FooterMode::Auto => "auto".into_value(span),
+            FooterMode::RowCount(c) => (c as i64).into_value(span),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, IntoValue, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TableIndexMode {
     /// Always show indexes
     Always,
@@ -140,27 +187,20 @@ impl FromStr for TableIndexMode {
             "always" => Ok(TableIndexMode::Always),
             "never" => Ok(TableIndexMode::Never),
             "auto" => Ok(TableIndexMode::Auto),
-            _ => Err("expected either 'never', 'always' or 'auto'"),
+            _ => Err("'never', 'always' or 'auto'"),
         }
     }
 }
 
-impl ReconstructVal for TableIndexMode {
-    fn reconstruct_value(&self, span: Span) -> Value {
-        Value::string(
-            match self {
-                TableIndexMode::Always => "always",
-                TableIndexMode::Never => "never",
-                TableIndexMode::Auto => "auto",
-            },
-            span,
-        )
+impl UpdateFromValue for TableIndexMode {
+    fn update(&mut self, value: &Value, path: &mut ConfigPath, errors: &mut ConfigErrors) {
+        config_update_string_enum(self, value, path, errors)
     }
 }
 
 /// A Table view configuration, for a situation where
 /// we need to limit cell width in order to adjust for a terminal size.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrimStrategy {
     /// Wrapping strategy.
     ///
@@ -196,138 +236,268 @@ impl TrimStrategy {
 
 impl Default for TrimStrategy {
     fn default() -> Self {
-        TrimStrategy::Wrap {
+        Self::Wrap {
             try_to_keep_words: true,
         }
     }
 }
 
-pub(super) fn try_parse_trim_strategy(
-    value: &Value,
-    errors: &mut Vec<ShellError>,
-) -> Result<TrimStrategy, ShellError> {
-    let map = value.as_record().map_err(|e| ShellError::GenericError {
-        error: "Error while applying config changes".into(),
-        msg: "$env.config.table.trim is not a record".into(),
-        span: Some(value.span()),
-        help: Some("Please consult the documentation for configuring Nushell.".into()),
-        inner: vec![e],
-    })?;
-
-    let mut methodology = match map.get("methodology") {
-        Some(value) => match try_parse_trim_methodology(value) {
-            Some(methodology) => methodology,
-            None => return Ok(TrimStrategy::default()),
-        },
-        None => {
-            errors.push(ShellError::GenericError {
-                error: "Error while applying config changes".into(),
-                msg: "$env.config.table.trim.methodology was not provided".into(),
-                span: Some(value.span()),
-                help: Some("Please consult the documentation for configuring Nushell.".into()),
-                inner: vec![],
-            });
-            return Ok(TrimStrategy::default());
-        }
-    };
-
-    match &mut methodology {
-        TrimStrategy::Wrap { try_to_keep_words } => {
-            if let Some(value) = map.get("wrapping_try_keep_words") {
-                if let Ok(b) = value.as_bool() {
-                    *try_to_keep_words = b;
-                } else {
-                    errors.push(ShellError::GenericError {
-                        error: "Error while applying config changes".into(),
-                        msg: "$env.config.table.trim.wrapping_try_keep_words is not a bool".into(),
-                        span: Some(value.span()),
-                        help: Some(
-                            "Please consult the documentation for configuring Nushell.".into(),
-                        ),
-                        inner: vec![],
-                    });
+impl IntoValue for TrimStrategy {
+    fn into_value(self, span: Span) -> Value {
+        match self {
+            TrimStrategy::Wrap { try_to_keep_words } => {
+                record! {
+                    "methodology" => "wrapping".into_value(span),
+                    "wrapping_try_keep_words" => try_to_keep_words.into_value(span),
+                }
+            }
+            TrimStrategy::Truncate { suffix } => {
+                record! {
+                    "methodology" => "truncating".into_value(span),
+                    "truncating_suffix" => suffix.into_value(span),
                 }
             }
         }
-        TrimStrategy::Truncate { suffix } => {
-            if let Some(value) = map.get("truncating_suffix") {
-                if let Ok(v) = value.as_string() {
-                    *suffix = Some(v);
+        .into_value(span)
+    }
+}
+
+impl UpdateFromValue for TrimStrategy {
+    fn update<'a>(
+        &mut self,
+        value: &'a Value,
+        path: &mut ConfigPath<'a>,
+        errors: &mut ConfigErrors,
+    ) {
+        let Value::Record { val: record, .. } = value else {
+            errors.type_mismatch(path, Type::record(), value);
+            return;
+        };
+
+        let Some(methodology) = record.get("methodology") else {
+            errors.missing_column(path, "methodology", value.span());
+            return;
+        };
+
+        match methodology.as_str() {
+            Ok("wrapping") => {
+                let mut try_to_keep_words = if let &mut Self::Wrap { try_to_keep_words } = self {
+                    try_to_keep_words
                 } else {
-                    errors.push(ShellError::GenericError {
-                        error: "Error while applying config changes".into(),
-                        msg: "$env.config.table.trim.truncating_suffix is not a string".into(),
-                        span: Some(value.span()),
-                        help: Some(
-                            "Please consult the documentation for configuring Nushell.".into(),
-                        ),
-                        inner: vec![],
-                    });
+                    false
+                };
+                for (col, val) in record.iter() {
+                    let path = &mut path.push(col);
+                    match col.as_str() {
+                        "wrapping_try_keep_words" => try_to_keep_words.update(val, path, errors),
+                        "methodology" | "truncating_suffix" => (),
+                        _ => errors.unknown_option(path, val),
+                    }
                 }
+                *self = Self::Wrap { try_to_keep_words };
             }
+            Ok("truncating") => {
+                let mut suffix = if let Self::Truncate { suffix } = self {
+                    suffix.take()
+                } else {
+                    None
+                };
+                for (col, val) in record.iter() {
+                    let path = &mut path.push(col);
+                    match col.as_str() {
+                        "truncating_suffix" => match val {
+                            Value::Nothing { .. } => suffix = None,
+                            Value::String { val, .. } => suffix = Some(val.clone()),
+                            _ => errors.type_mismatch(path, Type::String, val),
+                        },
+                        "methodology" | "wrapping_try_keep_words" => (),
+                        _ => errors.unknown_option(path, val),
+                    }
+                }
+                *self = Self::Truncate { suffix };
+            }
+            Ok(_) => errors.invalid_value(
+                &path.push("methodology"),
+                "'wrapping' or 'truncating'",
+                methodology,
+            ),
+            Err(_) => errors.type_mismatch(&path.push("methodology"), Type::String, methodology),
         }
     }
-
-    Ok(methodology)
 }
 
-fn try_parse_trim_methodology(value: &Value) -> Option<TrimStrategy> {
-    if let Ok(value) = value.as_string() {
-        match value.to_lowercase().as_str() {
-        "wrapping" => {
-            return Some(TrimStrategy::Wrap {
-                try_to_keep_words: false,
-            });
-        }
-        "truncating" => return Some(TrimStrategy::Truncate { suffix: None }),
-        _ => eprintln!("unrecognized $config.table.trim.methodology value; expected either 'truncating' or 'wrapping'"),
-    }
-    } else {
-        eprintln!("$env.config.table.trim.methodology is not a string")
-    }
-
-    None
-}
-
-pub(super) fn reconstruct_trim_strategy(config: &Config, span: Span) -> Value {
-    match &config.trim_strategy {
-        TrimStrategy::Wrap { try_to_keep_words } => Value::record(
-            record! {
-                "methodology" => Value::string("wrapping", span),
-                "wrapping_try_keep_words" => Value::bool(*try_to_keep_words, span),
-            },
-            span,
-        ),
-        TrimStrategy::Truncate { suffix } => Value::record(
-            match suffix {
-                Some(s) => record! {
-                    "methodology" => Value::string("truncating", span),
-                    "truncating_suffix" => Value::string(s.clone(), span),
-                },
-                None => record! {
-                    "methodology" => Value::string("truncating", span),
-                    "truncating_suffix" => Value::nothing(span),
-                },
-            },
-            span,
-        ),
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableIndent {
     pub left: usize,
     pub right: usize,
 }
 
-pub(super) fn reconstruct_padding(config: &Config, span: Span) -> Value {
-    // For better completions always reconstruct the record version even though unsigned int would
-    // be supported, `as` conversion is sane as it came from an i64 original
-    Value::record(
-        record!(
-            "left" => Value::int(config.table_indent.left as i64, span),
-            "right" => Value::int(config.table_indent.right as i64, span),
-        ),
-        span,
-    )
+impl TableIndent {
+    pub fn new(left: usize, right: usize) -> Self {
+        Self { left, right }
+    }
+}
+
+impl IntoValue for TableIndent {
+    fn into_value(self, span: Span) -> Value {
+        record! {
+            "left" => (self.left as i64).into_value(span),
+            "right" => (self.right as i64).into_value(span),
+        }
+        .into_value(span)
+    }
+}
+
+impl Default for TableIndent {
+    fn default() -> Self {
+        Self { left: 1, right: 1 }
+    }
+}
+
+impl UpdateFromValue for TableIndent {
+    fn update<'a>(
+        &mut self,
+        value: &'a Value,
+        path: &mut ConfigPath<'a>,
+        errors: &mut ConfigErrors,
+    ) {
+        match value {
+            &Value::Int { val, .. } => {
+                if let Ok(val) = val.try_into() {
+                    self.left = val;
+                    self.right = val;
+                } else {
+                    errors.invalid_value(path, "a non-negative integer", value);
+                }
+            }
+            Value::Record { val: record, .. } => {
+                for (col, val) in record.iter() {
+                    let path = &mut path.push(col);
+                    match col.as_str() {
+                        "left" => self.left.update(val, path, errors),
+                        "right" => self.right.update(val, path, errors),
+                        _ => errors.unknown_option(path, val),
+                    }
+                }
+            }
+            _ => errors.type_mismatch(path, Type::custom("int or record"), value),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableConfig {
+    pub mode: TableMode,
+    pub index_mode: TableIndexMode,
+    pub show_empty: bool,
+    pub padding: TableIndent,
+    pub trim: TrimStrategy,
+    pub header_on_separator: bool,
+    pub abbreviated_row_count: Option<usize>,
+    pub footer_inheritance: bool,
+    pub missing_value_symbol: String,
+    pub batch_duration: Duration,
+    pub stream_page_size: NonZeroU16,
+}
+
+impl IntoValue for TableConfig {
+    fn into_value(self, span: Span) -> Value {
+        let abbv_count = self
+            .abbreviated_row_count
+            .map(|t| t as i64)
+            .into_value(span);
+
+        record! {
+            "mode" => self.mode.into_value(span),
+            "index_mode" => self.index_mode.into_value(span),
+            "show_empty" => self.show_empty.into_value(span),
+            "padding" => self.padding.into_value(span),
+            "trim" => self.trim.into_value(span),
+            "header_on_separator" => self.header_on_separator.into_value(span),
+            "abbreviated_row_count" => abbv_count,
+            "footer_inheritance" => self.footer_inheritance.into_value(span),
+            "missing_value_symbol" => self.missing_value_symbol.into_value(span),
+            "batch_duration" => self.batch_duration.into_value(span),
+            "stream_page_size" => self.stream_page_size.get().into_value(span),
+        }
+        .into_value(span)
+    }
+}
+
+impl Default for TableConfig {
+    fn default() -> Self {
+        Self {
+            mode: TableMode::Rounded,
+            index_mode: TableIndexMode::Always,
+            show_empty: true,
+            trim: TrimStrategy::default(),
+            header_on_separator: false,
+            padding: TableIndent::default(),
+            abbreviated_row_count: None,
+            footer_inheritance: false,
+            missing_value_symbol: "❎".into(),
+            batch_duration: Duration::from_secs(1),
+            stream_page_size: const { NonZeroU16::new(1000).expect("Non zero integer") },
+        }
+    }
+}
+
+impl UpdateFromValue for TableConfig {
+    fn update<'a>(
+        &mut self,
+        value: &'a Value,
+        path: &mut ConfigPath<'a>,
+        errors: &mut ConfigErrors,
+    ) {
+        let Value::Record { val: record, .. } = value else {
+            errors.type_mismatch(path, Type::record(), value);
+            return;
+        };
+
+        for (col, val) in record.iter() {
+            let path = &mut path.push(col);
+            match col.as_str() {
+                "mode" => self.mode.update(val, path, errors),
+                "index_mode" => self.index_mode.update(val, path, errors),
+                "show_empty" => self.show_empty.update(val, path, errors),
+                "trim" => self.trim.update(val, path, errors),
+                "header_on_separator" => self.header_on_separator.update(val, path, errors),
+                "padding" => self.padding.update(val, path, errors),
+                "abbreviated_row_count" => match val {
+                    Value::Nothing { .. } => self.abbreviated_row_count = None,
+                    &Value::Int { val: count, .. } => {
+                        if let Ok(count) = count.try_into() {
+                            self.abbreviated_row_count = Some(count);
+                        } else {
+                            errors.invalid_value(path, "a non-negative integer", val);
+                        }
+                    }
+                    _ => errors.type_mismatch(path, Type::custom("int or nothing"), val),
+                },
+                "footer_inheritance" => self.footer_inheritance.update(val, path, errors),
+                "missing_value_symbol" => match val.as_str() {
+                    Ok(val) => self.missing_value_symbol = val.to_string(),
+                    Err(_) => errors.type_mismatch(path, Type::String, val),
+                },
+                "batch_duration" => {
+                    match Duration::from_value(val.clone()).map_err(ConfigError::from) {
+                        Ok(val) => self.batch_duration = val,
+                        Err(err) => errors.error(err),
+                    }
+                }
+                "stream_page_size" => {
+                    let Ok(n) = val.as_int() else {
+                        errors.type_mismatch(path, Type::Int, val);
+                        continue;
+                    };
+                    let Some(n) = u16::try_from(n).ok().and_then(NonZeroU16::new) else {
+                        errors.invalid_value(path, "a positive value", val);
+                        continue;
+                    };
+                    self.stream_page_size = n;
+                }
+                _ => errors.unknown_option(path, val),
+            }
+        }
+    }
 }

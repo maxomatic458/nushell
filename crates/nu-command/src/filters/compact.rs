@@ -1,8 +1,4 @@
-use nu_engine::CallExt;
-use nu_protocol::{
-    ast::Call, engine::Command, engine::EngineState, engine::Stack, record, Category, Example,
-    PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value,
-};
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
 pub struct Compact;
@@ -14,13 +10,13 @@ impl Command for Compact {
 
     fn signature(&self) -> Signature {
         Signature::build("compact")
-            .input_output_types(vec![(
-                Type::List(Box::new(Type::Any)),
-                Type::List(Box::new(Type::Any)),
-            )])
+            .input_output_types(vec![
+                (Type::record(), Type::record()),
+                (Type::list(Type::Any), Type::list(Type::Any)),
+            ])
             .switch(
                 "empty",
-                "also compact empty items like \"\", {}, and []",
+                "Also compact empty items like \"\", {}, and [].",
                 Some('e'),
             )
             .rest(
@@ -31,8 +27,16 @@ impl Command for Compact {
             .category(Category::Filters)
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Creates a table with non-empty rows."
+    }
+
+    fn extra_description(&self) -> &str {
+        "Can be used to remove `null` or empty values from lists and records too."
+    }
+
+    fn search_terms(&self) -> Vec<&str> {
+        vec!["empty", "remove"]
     }
 
     fn run(
@@ -40,13 +44,24 @@ impl Command for Compact {
         engine_state: &EngineState,
         stack: &mut Stack,
         call: &Call,
-        input: PipelineData,
+        mut input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let empty = call.has_flag(engine_state, stack, "empty")?;
-        compact(engine_state, stack, call, input, empty)
+        let columns: Vec<String> = call.rest(engine_state, stack, 0)?;
+
+        match input {
+            PipelineData::Value(Value::Record { ref mut val, .. }, ..) => {
+                val.to_mut().retain(|_, val| do_keep_value(val, empty));
+                Ok(input)
+            }
+            _ => input.filter(
+                move |item| do_keep_row(item, empty, columns.as_slice()),
+                engine_state.signals(),
+            ),
+        }
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
                 description: "Filter out all records where 'Hello' is null",
@@ -63,7 +78,7 @@ impl Command for Compact {
             },
             Example {
                 description: "Filter out all instances of null from a list",
-                example: r#"[1, null, 2] | compact"#,
+                example: "[1, null, 2] | compact",
                 result: Some(Value::test_list(vec![
                     Value::test_int(1),
                     Value::test_int(2),
@@ -80,69 +95,35 @@ impl Command for Compact {
                     Value::test_int(5),
                 ])),
             },
+            Example {
+                description: "Filter out all instances of null from a record",
+                example: "{a: 1, b: null, c: 3} | compact",
+                result: Some(Value::test_record(record! {
+                    "a" => Value::test_int(1),
+                    "c" =>  Value::test_int(3),
+                })),
+            },
         ]
     }
 }
 
-pub fn compact(
-    engine_state: &EngineState,
-    stack: &mut Stack,
-    call: &Call,
-    input: PipelineData,
-    compact_empties: bool,
-) -> Result<PipelineData, ShellError> {
-    let columns: Vec<String> = call.rest(engine_state, stack, 0)?;
-    let metadata = input.metadata();
-    input
-        .filter(
-            move |item| {
-                match item {
-                    // Nothing is filtered out
-                    Value::Nothing { .. } => false,
-                    Value::Record { val, .. } => {
-                        for column in columns.iter() {
-                            match val.get(column) {
-                                None => return false,
-                                Some(x) => {
-                                    if let Value::Nothing { .. } = x {
-                                        return false;
-                                    }
-                                    if compact_empties {
-                                        if let Value::String { val, .. } = x {
-                                            if val.is_empty() {
-                                                return false;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+fn do_keep_value(value: &Value, compact_empties: bool) -> bool {
+    let remove = match compact_empties {
+        true => value.is_empty(),
+        false => value.is_nothing(),
+    };
+    !remove
+}
 
-                        if compact_empties && val.is_empty() {
-                            return false;
-                        }
-                        // No defined columns contained Nothing
-                        true
-                    }
-                    Value::List { vals, .. } => {
-                        if compact_empties && vals.is_empty() {
-                            return false;
-                        }
-                        true
-                    }
-                    Value::String { val, .. } => {
-                        if compact_empties && val.is_empty() {
-                            return false;
-                        }
-                        true
-                    }
-                    // Any non-Nothing, non-record should be kept
-                    _ => true,
-                }
-            },
-            engine_state.ctrlc.clone(),
-        )
-        .map(|m| m.set_metadata(metadata))
+fn do_keep_row(row: &Value, compact_empties: bool, columns: &[impl AsRef<str>]) -> bool {
+    let do_keep = move |value| do_keep_value(value, compact_empties);
+
+    do_keep(row)
+        && row.as_record().map_or(true, |record| {
+            columns
+                .iter()
+                .all(|col| record.get(col).map(do_keep).unwrap_or(false))
+        })
 }
 
 #[cfg(test)]
@@ -150,8 +131,7 @@ mod tests {
     use super::Compact;
 
     #[test]
-    fn examples_work_as_expected() {
-        use crate::test_examples;
-        test_examples(Compact {})
+    fn examples_work_as_expected() -> nu_test_support::Result {
+        nu_test_support::test().examples(Compact)
     }
 }

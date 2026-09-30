@@ -1,12 +1,5 @@
-use crate::help::highlight_search_in_table;
-use nu_color_config::StyleComputer;
-use nu_engine::{scope::ScopeData, CallExt};
-use nu_protocol::{
-    ast::Call,
-    engine::{Command, EngineState, Stack},
-    span, Category, Example, IntoInterruptiblePipelineData, IntoPipelineData, PipelineData,
-    ShellError, Signature, Span, Spanned, SyntaxShape, Type, Value,
-};
+use crate::filters::find_internal;
+use nu_engine::{command_prelude::*, get_full_help, scope::ScopeData};
 
 #[derive(Clone)]
 pub struct HelpAliases;
@@ -16,7 +9,7 @@ impl Command for HelpAliases {
         "help aliases"
     }
 
-    fn usage(&self) -> &str {
+    fn description(&self) -> &str {
         "Show help on nushell aliases."
     }
 
@@ -31,27 +24,27 @@ impl Command for HelpAliases {
             .named(
                 "find",
                 SyntaxShape::String,
-                "string to find in alias names and usage",
+                "String to find in alias names and descriptions.",
                 Some('f'),
             )
-            .input_output_types(vec![(Type::Nothing, Type::Table(vec![]))])
+            .input_output_types(vec![(Type::Nothing, Type::table())])
             .allow_variants_without_examples(true)
     }
 
-    fn examples(&self) -> Vec<Example> {
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                description: "show all aliases",
+                description: "Show all aliases.",
                 example: "help aliases",
                 result: None,
             },
             Example {
-                description: "show help for single alias",
+                description: "Show help for single alias.",
                 example: "help aliases my-alias",
                 result: None,
             },
             Example {
-                description: "search for string in alias names and usages",
+                description: "Search for string in alias names and descriptions.",
                 example: "help aliases --find my-alias",
                 result: None,
             },
@@ -78,36 +71,21 @@ pub fn help_aliases(
     let find: Option<Spanned<String>> = call.get_flag(engine_state, stack, "find")?;
     let rest: Vec<Spanned<String>> = call.rest(engine_state, stack, 0)?;
 
-    // 🚩The following two-lines are copied from filters/find.rs:
-    let style_computer = StyleComputer::from_config(engine_state, stack);
-    // Currently, search results all use the same style.
-    // Also note that this sample string is passed into user-written code (the closure that may or may not be
-    // defined for "string").
-    let string_style = style_computer.compute("string", &Value::string("search result", head));
-    let highlight_style =
-        style_computer.compute("search_result", &Value::string("search result", head));
-
     if let Some(f) = find {
         let all_cmds_vec = build_help_aliases(engine_state, stack, head);
-        let found_cmds_vec = highlight_search_in_table(
+        return find_internal(
             all_cmds_vec,
+            engine_state,
+            stack,
             &f.item,
-            &["name", "usage"],
-            &string_style,
-            &highlight_style,
-        )?;
-
-        return Ok(found_cmds_vec
-            .into_iter()
-            .into_pipeline_data(engine_state.ctrlc.clone()));
+            &["name", "description"],
+            true,
+            head,
+        );
     }
 
     if rest.is_empty() {
-        let found_cmds_vec = build_help_aliases(engine_state, stack, head);
-
-        Ok(found_cmds_vec
-            .into_iter()
-            .into_pipeline_data(engine_state.ctrlc.clone()))
+        Ok(build_help_aliases(engine_state, stack, head))
     } else {
         let mut name = String::new();
 
@@ -120,62 +98,36 @@ pub fn help_aliases(
 
         let Some(alias) = engine_state.find_decl(name.as_bytes(), &[]) else {
             return Err(ShellError::AliasNotFound {
-                span: span(&rest.iter().map(|r| r.span).collect::<Vec<Span>>()),
+                span: Span::merge_many(rest.iter().map(|s| s.span)),
             });
         };
 
-        let Some(alias) = engine_state.get_decl(alias).as_alias() else {
+        let alias = engine_state.get_decl(alias);
+
+        if alias.as_alias().is_none() {
             return Err(ShellError::AliasNotFound {
-                span: span(&rest.iter().map(|r| r.span).collect::<Vec<Span>>()),
+                span: Span::merge_many(rest.iter().map(|s| s.span)),
             });
         };
 
-        let alias_expansion =
-            String::from_utf8_lossy(engine_state.get_span_contents(alias.wrapped_call.span));
-        let usage = alias.usage();
-        let extra_usage = alias.extra_usage();
+        let help = get_full_help(alias, engine_state, stack, call.head);
 
-        // TODO: merge this into documentation.rs at some point
-        const G: &str = "\x1b[32m"; // green
-        const C: &str = "\x1b[36m"; // cyan
-        const RESET: &str = "\x1b[0m"; // reset
-
-        let mut long_desc = String::new();
-
-        long_desc.push_str(usage);
-        long_desc.push_str("\n\n");
-
-        if !extra_usage.is_empty() {
-            long_desc.push_str(extra_usage);
-            long_desc.push_str("\n\n");
-        }
-
-        long_desc.push_str(&format!("{G}Alias{RESET}: {C}{name}{RESET}"));
-        long_desc.push_str("\n\n");
-        long_desc.push_str(&format!("{G}Expansion{RESET}:\n  {alias_expansion}"));
-
-        let config = engine_state.get_config();
-        if !config.use_ansi_coloring {
-            long_desc = nu_utils::strip_ansi_string_likely(long_desc);
-        }
-
-        Ok(Value::string(long_desc, call.head).into_pipeline_data())
+        Ok(Value::string(help, call.head).into_pipeline_data())
     }
 }
 
-fn build_help_aliases(engine_state: &EngineState, stack: &Stack, span: Span) -> Vec<Value> {
+fn build_help_aliases(engine_state: &EngineState, stack: &Stack, span: Span) -> PipelineData {
     let mut scope_data = ScopeData::new(engine_state, stack);
     scope_data.populate_decls();
 
-    scope_data.collect_aliases(span)
+    Value::list(scope_data.collect_aliases(span), span).into_pipeline_data()
 }
 
 #[cfg(test)]
 mod test {
     #[test]
-    fn test_examples() {
+    fn test_examples() -> nu_test_support::Result {
         use super::HelpAliases;
-        use crate::test_examples;
-        test_examples(HelpAliases {})
+        nu_test_support::test().examples(HelpAliases)
     }
 }
